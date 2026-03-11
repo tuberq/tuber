@@ -2,7 +2,7 @@
 
 ## Overview
 
-beanstalkd-rs is a Rust rewrite of [beanstalkd](https://beanstalkd.github.io/), a simple
+tuber is a Rust rewrite of [beanstalkd](https://beanstalkd.github.io/), a simple
 fast work queue. It is wire-compatible with existing beanstalkd clients.
 
 ## Core Concepts
