@@ -1078,6 +1078,259 @@ mod tests {
         assert_eq!(estimated, actual);
     }
 
+    // --- Corruption / edge-case tests ---
+
+    #[test]
+    fn test_truncated_full_job_header() {
+        // Only 5 bytes — not enough for the 13-byte header
+        let data = vec![RECORD_TYPE_FULL_JOB, 1, 2, 3, 4];
+        assert!(matches!(
+            deserialize_record(&data),
+            Err(WalError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn test_truncated_full_job_payload() {
+        // Valid header claiming a large payload, but data is short
+        let mut data = vec![RECORD_TYPE_FULL_JOB];
+        data.extend_from_slice(&42u64.to_le_bytes()); // job_id
+        data.extend_from_slice(&1000u32.to_le_bytes()); // payload_len = 1000
+        // Only 13 bytes total, nowhere near 1000 + 4 CRC
+        assert!(matches!(
+            deserialize_record(&data),
+            Err(WalError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn test_corrupted_full_job_crc() {
+        let job = make_test_job(1, b"hello");
+        let mut record = serialize_full_job(&job);
+        // Corrupt the last byte (CRC)
+        let len = record.len();
+        record[len - 1] ^= 0xFF;
+        assert!(matches!(
+            deserialize_record(&record),
+            Err(WalError::BadCrc)
+        ));
+    }
+
+    #[test]
+    fn test_corrupted_full_job_body() {
+        let job = make_test_job(1, b"hello");
+        let mut record = serialize_full_job(&job);
+        // Corrupt a payload byte (not the CRC itself)
+        record[20] ^= 0xFF;
+        assert!(matches!(
+            deserialize_record(&record),
+            Err(WalError::BadCrc)
+        ));
+    }
+
+    #[test]
+    fn test_truncated_state_change() {
+        // Too short for STATE_CHANGE_RECORD_SIZE
+        let data = vec![RECORD_TYPE_STATE_CHANGE, 0, 0, 0];
+        assert!(matches!(
+            deserialize_record(&data),
+            Err(WalError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn test_corrupted_state_change_crc() {
+        let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0);
+        let len = record.len();
+        record[len - 2] ^= 0xFF;
+        assert!(matches!(
+            deserialize_record(&record),
+            Err(WalError::BadCrc)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_state_byte_in_full_job() {
+        let job = make_test_job(1, b"x");
+        let mut record = serialize_full_job(&job);
+        // The state byte is at payload offset 4+8+8+8 = 28 from payload start.
+        // Payload starts at byte 13 of the record. So state byte is at 13+28 = 41.
+        let state_offset = 13 + 4 + 8 + 8 + 8; // = 41
+        record[state_offset] = 0xEE; // invalid state
+        // Recompute CRC: everything before last 4 bytes
+        let crc_offset = record.len() - 4;
+        let crc = crc32fast::hash(&record[..crc_offset]);
+        record[crc_offset..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            deserialize_record(&record),
+            Err(WalError::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_state_byte_in_state_change() {
+        let mut record = serialize_state_change(1, Some(JobState::Ready), 0, 0);
+        // State byte is at offset 13 in state change record
+        record[13] = 0xEE; // invalid state (not 0-3 or 0xFF)
+        // Recompute CRC
+        let crc_offset = record.len() - 4;
+        let crc = crc32fast::hash(&record[..crc_offset]);
+        record[crc_offset..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            deserialize_record(&record),
+            Err(WalError::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn test_unknown_record_type() {
+        let data = vec![0xFF; STATE_CHANGE_RECORD_SIZE];
+        assert!(matches!(
+            deserialize_record(&data),
+            Err(WalError::UnknownRecordType(0xFF))
+        ));
+    }
+
+    #[test]
+    fn test_empty_data() {
+        assert!(matches!(
+            deserialize_record(&[]),
+            Err(WalError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn test_bad_version_header() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(WAL_MAGIC);
+        buf.extend_from_slice(&99u32.to_le_bytes());
+        assert!(matches!(read_header(&buf), Err(WalError::BadVersion(99))));
+    }
+
+    #[test]
+    fn test_truncated_header() {
+        assert!(matches!(read_header(&[b'T', b'W']), Err(WalError::Truncated)));
+    }
+
+    #[test]
+    fn test_replay_skips_corrupted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Write two valid jobs, then corrupt the file by appending garbage
+        {
+            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+
+            let mut job1 = Job::new(
+                1, 10, Duration::ZERO, Duration::from_secs(60),
+                b"body1".to_vec(), "default".to_string(),
+            );
+            wal.write_put(&mut job1).unwrap();
+
+            let mut job2 = Job::new(
+                2, 20, Duration::ZERO, Duration::from_secs(60),
+                b"body2".to_vec(), "default".to_string(),
+            );
+            wal.write_put(&mut job2).unwrap();
+        }
+
+        // Append garbage to the WAL file to simulate a partial/corrupted write
+        let wal_file = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(FILE_PREFIX))
+            .unwrap();
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(wal_file.path())
+                .unwrap();
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]).unwrap();
+        }
+
+        // Replay should recover both valid jobs, skip the garbage
+        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let (jobs, next_id) = wal.replay().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.contains_key(&1));
+        assert!(jobs.contains_key(&2));
+        assert!(next_id >= 3);
+    }
+
+    #[test]
+    fn test_replay_skips_file_with_bad_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Write one valid job
+        {
+            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut job1 = Job::new(
+                1, 10, Duration::ZERO, Duration::from_secs(60),
+                b"body1".to_vec(), "default".to_string(),
+            );
+            wal.write_put(&mut job1).unwrap();
+        }
+
+        // Overwrite the WAL file header with garbage
+        let wal_file = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(FILE_PREFIX))
+            .unwrap();
+        {
+            let mut data = fs::read(wal_file.path()).unwrap();
+            data[0..4].copy_from_slice(b"BAAD");
+            fs::write(wal_file.path(), &data).unwrap();
+        }
+
+        // Replay should skip the bad file, recover nothing
+        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let (jobs, _) = wal.replay().unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn test_replay_truncated_record_mid_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Write two jobs
+        {
+            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut job1 = Job::new(
+                1, 10, Duration::ZERO, Duration::from_secs(60),
+                b"body1".to_vec(), "default".to_string(),
+            );
+            wal.write_put(&mut job1).unwrap();
+            let mut job2 = Job::new(
+                2, 20, Duration::ZERO, Duration::from_secs(60),
+                b"body2".to_vec(), "default".to_string(),
+            );
+            wal.write_put(&mut job2).unwrap();
+        }
+
+        // Truncate file to cut off the second job mid-record
+        let wal_file = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(FILE_PREFIX))
+            .unwrap();
+        {
+            let data = fs::read(wal_file.path()).unwrap();
+            // Keep header + first job + a few bytes of the second
+            let truncated_len = data.len() - 10;
+            fs::write(wal_file.path(), &data[..truncated_len]).unwrap();
+        }
+
+        // Should recover job 1 only
+        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let (jobs, next_id) = wal.replay().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs.contains_key(&1));
+        assert!(next_id >= 2);
+    }
+
     #[test]
     fn test_wal_write_and_replay() {
         let dir = tempfile::tempdir().unwrap();
