@@ -2520,23 +2520,9 @@ async fn test_drain_mode_reserve_and_delete_work() {
     c.mustsend("a\r\n").await;
     c.ckresp("INSERTED 1\r\n").await;
 
-    // Get the server PID from stats
-    c.mustsend("stats\r\n").await;
-    let body = c.read_ok_body().await;
-    let pid: i32 = body
-        .lines()
-        .find(|l| l.starts_with("pid:"))
-        .unwrap()
-        .split(':')
-        .nth(1)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-
-    // Send SIGUSR1 to enter drain mode
-    unsafe { libc::kill(pid, libc::SIGUSR1) };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Enter drain mode via protocol command
+    c.mustsend("drain\r\n").await;
+    c.ckresp("DRAINING\r\n").await;
 
     // put should fail
     c.mustsend("put 0 0 60 1\r\n").await;

@@ -375,6 +375,10 @@ impl ServerState {
             Command::ListTubesWatched => self.cmd_list_tubes_watched(conn_id),
             Command::PauseTube { tube, delay } => self.cmd_pause_tube(&tube, delay),
             Command::FlushTube { tube } => self.cmd_flush_tube(&tube),
+            Command::Drain => {
+                self.drain_mode = true;
+                Response::Draining
+            }
             Command::Quit => Response::Deleted, // handled at connection level
         }
     }

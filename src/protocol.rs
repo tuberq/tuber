@@ -79,6 +79,7 @@ pub enum Command {
     FlushTube {
         tube: String,
     },
+    Drain,
     Quit,
 }
 
@@ -236,6 +237,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_pause_tube(line.strip_prefix("pause-tube").unwrap())
     } else if let Some(rest) = line.strip_prefix("flush-tube ") {
         parse_flush_tube(rest)
+    } else if line == "drain" {
+        Ok(Command::Drain)
     } else {
         Err(Response::UnknownCommand)
     }
