@@ -118,27 +118,6 @@ impl Job {
         (self.priority, self.id)
     }
 
-    /// Returns the delay sort key for the delay heap: (deadline_nanos, id).
-    /// Soonest deadline first. Ties broken by lower id.
-    pub fn delay_key(&self) -> (i128, u64) {
-        // Use elapsed from a fixed point. Since we compare Instants via
-        // duration_since which can panic if ordering is wrong, we store
-        // the raw deadline and compare those.
-        // For the heap, we use the deadline_at's duration from created_at epoch.
-        // Actually, we'll convert to a comparable i128 nanosecond value.
-        // Instants don't give us absolute nanos, so we'll use the offset
-        // from the job's own created_at. But that doesn't compare across jobs.
-        //
-        // Better approach: store deadline as Duration from a shared epoch.
-        // For now, since all Instants on the same system are comparable via
-        // Ord, we can just use the Instant directly in the heap key.
-        // But our IndexHeap needs Ord+Copy, and Instant is Copy.
-        //
-        // Let's just panic-guard here -- in practice deadline_at is always
-        // set for delayed jobs.
-        (0, self.id) // placeholder -- we use Instant-based keys in tube.rs
-    }
-
     pub fn is_urgent(&self) -> bool {
         self.priority < URGENT_THRESHOLD
     }

@@ -85,8 +85,6 @@ struct ServerState {
     tubes: HashMap<String, Tube>,
     conns: HashMap<u64, ConnState>,
     next_job_id: u64,
-    #[allow(dead_code)]
-    next_conn_id: u64,
     max_job_size: u32,
     drain_mode: bool,
     ready_ct: u64,
@@ -169,7 +167,7 @@ impl ServerState {
             tubes,
             conns: HashMap::new(),
             next_job_id: 1,
-            next_conn_id: 1,
+
             max_job_size,
             drain_mode: false,
             ready_ct: 0,
@@ -185,21 +183,6 @@ impl ServerState {
             groups: HashMap::new(),
             concurrency_keys: HashMap::new(),
         }
-    }
-
-    #[allow(dead_code)]
-    fn register_conn(&mut self) -> u64 {
-        let id = self.next_conn_id;
-        self.next_conn_id += 1;
-        self.conns.insert(id, ConnState::new(id));
-        self.stats.total_connections += 1;
-        // Ensure default tube exists and bump watching_ct
-        self.ensure_tube("default");
-        if let Some(t) = self.tubes.get_mut("default") {
-            t.watching_ct += 1;
-            t.using_ct += 1;
-        }
-        id
     }
 
     fn unregister_conn(&mut self, conn_id: u64) {
@@ -2507,7 +2490,16 @@ mod tests {
     }
 
     fn register(state: &mut ServerState) -> u64 {
-        state.register_conn()
+        static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.conns.insert(id, ConnState::new(id));
+        state.stats.total_connections += 1;
+        state.ensure_tube("default");
+        if let Some(t) = state.tubes.get_mut("default") {
+            t.watching_ct += 1;
+            t.using_ct += 1;
+        }
+        id
     }
 
     fn put_cmd(pri: u32, delay: u32, ttr: u32, bytes: u32) -> Command {

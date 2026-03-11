@@ -22,6 +22,18 @@ pub async fn serve(listen_addr: IpAddr, port: u16, beanstalk_addr: String) -> io
     }
 }
 
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+}
+
 async fn handle_http(socket: tokio::net::TcpStream, beanstalk_addr: &str) -> io::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -42,41 +54,24 @@ async fn handle_http(socket: tokio::net::TcpStream, beanstalk_addr: &str) -> io:
             Ok(b) => b,
             Err(e) => {
                 let msg = format!("error gathering metrics: {e}");
-                let resp = format!(
-                    "HTTP/1.1 503 Service Unavailable\r\n\
-                     Content-Type: text/plain\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {msg}",
-                    msg.len()
-                );
-                writer.write_all(resp.as_bytes()).await?;
+                writer
+                    .write_all(
+                        http_response("503 Service Unavailable", "text/plain", &msg).as_bytes(),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            body.len()
-        );
-        writer.write_all(resp.as_bytes()).await?;
-        writer.write_all(body.as_bytes()).await?;
+        writer
+            .write_all(
+                http_response("200 OK", "text/plain; version=0.0.4; charset=utf-8", &body)
+                    .as_bytes(),
+            )
+            .await?;
     } else {
-        let body = "404 Not Found\n";
-        let resp = format!(
-            "HTTP/1.1 404 Not Found\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {body}",
-            body.len()
-        );
-        writer.write_all(resp.as_bytes()).await?;
+        writer
+            .write_all(http_response("404 Not Found", "text/plain", "404 Not Found\n").as_bytes())
+            .await?;
     }
 
     Ok(())
@@ -252,38 +247,43 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         for name in &tube_names {
             if let Ok(tube_yaml) = client.stats_tube(name).await {
                 let ts = parse_yaml_map(&tube_yaml);
-                let t = name;
                 tube_metric(
                     &mut out,
                     "tuber_tube_ready_jobs",
-                    t,
+                    name,
                     &ts,
                     "current-jobs-ready",
                 );
                 tube_metric(
                     &mut out,
                     "tuber_tube_delayed_jobs",
-                    t,
+                    name,
                     &ts,
                     "current-jobs-delayed",
                 );
                 tube_metric(
                     &mut out,
                     "tuber_tube_buried_jobs",
-                    t,
+                    name,
                     &ts,
                     "current-jobs-buried",
                 );
                 tube_metric(
                     &mut out,
                     "tuber_tube_reserved_jobs",
-                    t,
+                    name,
                     &ts,
                     "current-jobs-reserved",
                 );
-                tube_metric(&mut out, "tuber_tube_waiting", t, &ts, "current-waiting");
-                tube_metric(&mut out, "tuber_tube_jobs_total", t, &ts, "total-jobs");
-                tube_metric(&mut out, "tuber_tube_deletes_total", t, &ts, "cmd-delete");
+                tube_metric(&mut out, "tuber_tube_waiting", name, &ts, "current-waiting");
+                tube_metric(&mut out, "tuber_tube_jobs_total", name, &ts, "total-jobs");
+                tube_metric(
+                    &mut out,
+                    "tuber_tube_deletes_total",
+                    name,
+                    &ts,
+                    "cmd-delete",
+                );
             }
         }
         out.push('\n');

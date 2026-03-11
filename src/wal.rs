@@ -1110,10 +1110,7 @@ mod tests {
         // Corrupt the last byte (CRC)
         let len = record.len();
         record[len - 1] ^= 0xFF;
-        assert!(matches!(
-            deserialize_record(&record),
-            Err(WalError::BadCrc)
-        ));
+        assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
     }
 
     #[test]
@@ -1122,10 +1119,7 @@ mod tests {
         let mut record = serialize_full_job(&job);
         // Corrupt a payload byte (not the CRC itself)
         record[20] ^= 0xFF;
-        assert!(matches!(
-            deserialize_record(&record),
-            Err(WalError::BadCrc)
-        ));
+        assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
     }
 
     #[test]
@@ -1143,10 +1137,7 @@ mod tests {
         let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0);
         let len = record.len();
         record[len - 2] ^= 0xFF;
-        assert!(matches!(
-            deserialize_record(&record),
-            Err(WalError::BadCrc)
-        ));
+        assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
     }
 
     #[test]
@@ -1193,10 +1184,7 @@ mod tests {
 
     #[test]
     fn test_empty_data() {
-        assert!(matches!(
-            deserialize_record(&[]),
-            Err(WalError::Truncated)
-        ));
+        assert!(matches!(deserialize_record(&[]), Err(WalError::Truncated)));
     }
 
     #[test]
@@ -1209,7 +1197,10 @@ mod tests {
 
     #[test]
     fn test_truncated_header() {
-        assert!(matches!(read_header(&[b'T', b'W']), Err(WalError::Truncated)));
+        assert!(matches!(
+            read_header(&[b'T', b'W']),
+            Err(WalError::Truncated)
+        ));
     }
 
     #[test]
@@ -1222,14 +1213,22 @@ mod tests {
             let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
 
             let mut job1 = Job::new(
-                1, 10, Duration::ZERO, Duration::from_secs(60),
-                b"body1".to_vec(), "default".to_string(),
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body1".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job1).unwrap();
 
             let mut job2 = Job::new(
-                2, 20, Duration::ZERO, Duration::from_secs(60),
-                b"body2".to_vec(), "default".to_string(),
+                2,
+                20,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body2".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job2).unwrap();
         }
@@ -1266,8 +1265,12 @@ mod tests {
         {
             let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
             let mut job1 = Job::new(
-                1, 10, Duration::ZERO, Duration::from_secs(60),
-                b"body1".to_vec(), "default".to_string(),
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body1".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job1).unwrap();
         }
@@ -1299,13 +1302,21 @@ mod tests {
         {
             let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
             let mut job1 = Job::new(
-                1, 10, Duration::ZERO, Duration::from_secs(60),
-                b"body1".to_vec(), "default".to_string(),
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body1".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job1).unwrap();
             let mut job2 = Job::new(
-                2, 20, Duration::ZERO, Duration::from_secs(60),
-                b"body2".to_vec(), "default".to_string(),
+                2,
+                20,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body2".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job2).unwrap();
         }

@@ -114,6 +114,14 @@ pub enum Response {
     JobTooBig,
 }
 
+/// Serialize a response header + body payload (header\r\nbody\r\n).
+fn serialize_with_body(header: String, body: &[u8]) -> Vec<u8> {
+    let mut out = header.into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
 impl Response {
     /// Serialize the response to bytes for sending over TCP.
     pub fn serialize(&self) -> Vec<u8> {
@@ -123,10 +131,7 @@ impl Response {
             Response::Buried => b"BURIED\r\n".to_vec(),
             Response::Using(name) => format!("USING {name}\r\n").into_bytes(),
             Response::Reserved { id, body } => {
-                let mut out = format!("RESERVED {id} {}\r\n", body.len()).into_bytes();
-                out.extend_from_slice(body);
-                out.extend_from_slice(b"\r\n");
-                out
+                serialize_with_body(format!("RESERVED {id} {}\r\n", body.len()), body)
             }
             Response::DeadlineSoon => b"DEADLINE_SOON\r\n".to_vec(),
             Response::TimedOut => b"TIMED_OUT\r\n".to_vec(),
@@ -136,20 +141,12 @@ impl Response {
             Response::Kicked(n) => format!("KICKED {n}\r\n").into_bytes(),
             Response::KickedOne => b"KICKED\r\n".to_vec(),
             Response::Found { id, body } => {
-                let mut out = format!("FOUND {id} {}\r\n", body.len()).into_bytes();
-                out.extend_from_slice(body);
-                out.extend_from_slice(b"\r\n");
-                out
+                serialize_with_body(format!("FOUND {id} {}\r\n", body.len()), body)
             }
             Response::NotFound => b"NOT_FOUND\r\n".to_vec(),
             Response::Watching(n) => format!("WATCHING {n}\r\n").into_bytes(),
             Response::NotIgnored => b"NOT_IGNORED\r\n".to_vec(),
-            Response::Ok(data) => {
-                let mut out = format!("OK {}\r\n", data.len()).into_bytes();
-                out.extend_from_slice(data);
-                out.extend_from_slice(b"\r\n");
-                out
-            }
+            Response::Ok(data) => serialize_with_body(format!("OK {}\r\n", data.len()), data),
             Response::Paused => b"PAUSED\r\n".to_vec(),
             Response::Flushed(n) => format!("FLUSHED {n}\r\n").into_bytes(),
             Response::OutOfMemory => b"OUT_OF_MEMORY\r\n".to_vec(),
@@ -202,19 +199,19 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
     } else if line == "reserve" {
         Ok(Command::Reserve)
     } else if let Some(rest) = line.strip_prefix("delete ") {
-        parse_u64(rest).map(|id| Command::Delete { id })
+        parse_uint(rest).map(|id| Command::Delete { id })
     } else if let Some(rest) = line.strip_prefix("release ") {
         parse_release(rest)
     } else if let Some(rest) = line.strip_prefix("bury ") {
         parse_bury(rest)
     } else if let Some(rest) = line.strip_prefix("kick-job ") {
-        parse_u64(rest).map(|id| Command::KickJob { id })
+        parse_uint(rest).map(|id| Command::KickJob { id })
     } else if let Some(rest) = line.strip_prefix("kick ") {
-        parse_u32(rest).map(|bound| Command::Kick { bound })
+        parse_uint(rest).map(|bound| Command::Kick { bound })
     } else if let Some(rest) = line.strip_prefix("touch ") {
-        parse_u64(rest).map(|id| Command::Touch { id })
+        parse_uint(rest).map(|id| Command::Touch { id })
     } else if let Some(rest) = line.strip_prefix("stats-job ") {
-        parse_u64(rest).map(|id| Command::StatsJob { id })
+        parse_uint(rest).map(|id| Command::StatsJob { id })
     } else if let Some(rest) = line.strip_prefix("stats-tube ") {
         parse_stats_tube(rest)
     } else if line == "stats" {
@@ -244,15 +241,7 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
     }
 }
 
-fn parse_u64(s: &str) -> Result<u64, Response> {
-    let s = s.trim();
-    if s.is_empty() || s.starts_with('-') {
-        return Err(Response::BadFormat);
-    }
-    s.parse().map_err(|_| Response::BadFormat)
-}
-
-fn parse_u32(s: &str) -> Result<u32, Response> {
+fn parse_uint<T: std::str::FromStr>(s: &str) -> Result<T, Response> {
     let s = s.trim();
     if s.is_empty() || s.starts_with('-') {
         return Err(Response::BadFormat);
@@ -318,15 +307,15 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_peek(rest: &str) -> Result<Command, Response> {
-    parse_u64(rest).map(|id| Command::Peek { id })
+    parse_uint(rest).map(|id| Command::Peek { id })
 }
 
 fn parse_reserve_with_timeout(rest: &str) -> Result<Command, Response> {
-    parse_u32(rest).map(|timeout| Command::ReserveWithTimeout { timeout })
+    parse_uint(rest).map(|timeout| Command::ReserveWithTimeout { timeout })
 }
 
 fn parse_reserve_job(rest: &str) -> Result<Command, Response> {
-    parse_u64(rest).map(|id| Command::ReserveJob { id })
+    parse_uint(rest).map(|id| Command::ReserveJob { id })
 }
 
 fn parse_release(rest: &str) -> Result<Command, Response> {

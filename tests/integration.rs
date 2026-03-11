@@ -2788,11 +2788,7 @@ async fn test_reserve_timeout_tube_specific() {
     producer.ckresp("INSERTED 1\r\n").await;
 
     // Verify consumer is still waiting (no response yet)
-    let no_response = tokio::time::timeout(
-        Duration::from_millis(300),
-        consumer.readline(),
-    )
-    .await;
+    let no_response = tokio::time::timeout(Duration::from_millis(300), consumer.readline()).await;
     assert!(no_response.is_err(), "consumer should still be waiting");
 
     // Put on "jobs" tube — should wake the consumer
