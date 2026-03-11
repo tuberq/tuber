@@ -2064,3 +2064,280 @@ async fn test_group_stats_job_fields() {
     assert!(body.contains("group: mygrp"), "group missing: {}", body);
     assert!(body.contains("after-group: othergrp"), "after-group missing: {}", body);
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency key (con:) tests
+// ---------------------------------------------------------------------------
+
+/// Basic concurrency enforcement: reserve first con:key job succeeds, second is hidden.
+#[tokio::test]
+async fn test_concurrency_basic_enforcement() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put two jobs with same concurrency key
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve first succeeds
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Second is blocked — no ready jobs visible
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Delete first, second becomes available
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+}
+
+/// Different concurrency keys don't interfere with each other.
+#[tokio::test]
+async fn test_concurrency_different_keys() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 con:keyA\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:keyB\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Both can be reserved simultaneously
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+}
+
+/// Release frees the concurrency slot.
+#[tokio::test]
+async fn test_concurrency_release_frees_slot() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve first
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Release first (back to ready with no delay)
+    c.mustsend("release 1 0 0\r\n").await;
+    c.ckresp("RELEASED\r\n").await;
+
+    // Now another con:mykey job is reservable (job 1 is back to ready but not reserved)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+}
+
+/// Bury frees the concurrency slot.
+#[tokio::test]
+async fn test_concurrency_bury_frees_slot() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve and bury first
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // Second becomes reservable
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+}
+
+/// reserve-job respects concurrency: returns NOT_FOUND when key is taken.
+#[tokio::test]
+async fn test_concurrency_reserve_job_blocked() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve first
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Try to reserve-job the second one by ID — blocked
+    c.mustsend("reserve-job 2\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+/// Jobs without con: are unaffected by concurrency enforcement.
+#[tokio::test]
+async fn test_concurrency_no_key_unaffected() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a con: job and a plain job
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c.mustsend("c\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve con:mykey job
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Plain job (no con:) is still reservable despite con:mykey being taken
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+
+    // Third job (con:mykey) is blocked
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+}
+
+/// Stats-job shows concurrency-key field.
+#[tokio::test]
+async fn test_concurrency_stats_job_field() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 con:testkey\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("stats-job 1\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("concurrency-key: testkey"),
+        "concurrency-key missing: {}",
+        body
+    );
+}
+
+/// Global stats shows current-concurrency-keys count.
+#[tokio::test]
+async fn test_concurrency_stats_global() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Initially 0 concurrency keys active
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-concurrency-keys: 0"),
+        "expected 0 keys: {}",
+        body
+    );
+
+    // Put and reserve a con: job
+    c.mustsend("put 0 0 60 1 con:k1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("x\r\n").await;
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-concurrency-keys: 1"),
+        "expected 1 key: {}",
+        body
+    );
+
+    // Delete the job, key should be freed
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-concurrency-keys: 0"),
+        "expected 0 keys after delete: {}",
+        body
+    );
+}
+
+/// Disconnect frees concurrency slot.
+#[tokio::test]
+async fn test_concurrency_disconnect_frees_slot() {
+    let srv = TestServer::start().await;
+
+    // Put two con:mykey jobs
+    let mut c1 = srv.connect().await;
+    c1.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c1.mustsend("a\r\n").await;
+    c1.ckresp("INSERTED 1\r\n").await;
+
+    c1.mustsend("put 0 0 60 1 con:mykey\r\n").await;
+    c1.mustsend("b\r\n").await;
+    c1.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve on c1
+    c1.mustsend("reserve-with-timeout 0\r\n").await;
+    c1.ckresp("RESERVED 1 1\r\n").await;
+    c1.ckresp("a\r\n").await;
+
+    // Drop c1 (disconnect) — should release the slot
+    drop(c1);
+    // Small delay to let the server process the disconnect
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // New connection should be able to reserve
+    let mut c2 = srv.connect().await;
+    c2.mustsend("reserve-with-timeout 0\r\n").await;
+    // Either job 1 (re-enqueued) or job 2 could be returned
+    let line = c2.readline().await;
+    assert!(
+        line.starts_with("RESERVED "),
+        "expected RESERVED after disconnect, got: {}",
+        line
+    );
+}

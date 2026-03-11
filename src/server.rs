@@ -105,6 +105,8 @@ struct ServerState {
     platform: String,
     /// Job group tracking for grp:/aft: features.
     groups: HashMap<String, GroupState>,
+    /// Active reservation count per concurrency key.
+    concurrency_keys: HashMap<String, u32>,
 }
 
 impl ServerState {
@@ -181,6 +183,7 @@ impl ServerState {
             os,
             platform,
             groups: HashMap::new(),
+            concurrency_keys: HashMap::new(),
         }
     }
 
@@ -218,6 +221,7 @@ impl ServerState {
 
             // Re-enqueue reserved jobs
             for job_id in conn.reserved_jobs {
+                self.release_concurrency_key(job_id);
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.state = JobState::Ready;
                     job.reserver_id = None;
@@ -246,6 +250,70 @@ impl ServerState {
             self.tubes.insert(name.to_string(), Tube::new(name));
         }
         true
+    }
+
+    /// Check if a job's concurrency key already has an active reservation.
+    fn is_concurrency_blocked(&self, job_id: u64) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|j| j.concurrency_key.as_ref())
+            .and_then(|key| self.concurrency_keys.get(key))
+            .map(|&count| count > 0)
+            .unwrap_or(false)
+    }
+
+    /// Increment the concurrency counter for a job's key.
+    fn acquire_concurrency_key(&mut self, job_id: u64) {
+        if let Some(key) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|j| j.concurrency_key.clone())
+        {
+            *self.concurrency_keys.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Decrement and clean up the concurrency counter for a job's key.
+    fn release_concurrency_key(&mut self, job_id: u64) {
+        if let Some(key) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|j| j.concurrency_key.clone())
+        {
+            if let Some(count) = self.concurrency_keys.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.concurrency_keys.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Find the best unblocked ready job from a tube.
+    /// Fast path: if top job is not blocked, return it.
+    /// Slow path: scan heap entries for first unblocked job.
+    fn find_best_unblocked_ready(&self, tube: &Tube) -> Option<((u32, u64), u64)> {
+        if let Some(&entry) = tube.ready.peek() {
+            if !self.is_concurrency_blocked(entry.1) {
+                return Some(entry);
+            }
+            // Slow path: collect, sort, find first unblocked
+            let mut entries: Vec<((u32, u64), u64)> = tube
+                .ready
+                .entries()
+                .iter()
+                .map(|&(k, id)| (k, id))
+                .collect();
+            entries.sort();
+            for entry in entries {
+                if !self.is_concurrency_blocked(entry.1) {
+                    return Some(entry);
+                }
+            }
+            None
+        } else {
+            None
+        }
     }
 
     fn handle_command(&mut self, conn_id: u64, cmd: Command, body: Option<Vec<u8>>) -> Response {
@@ -540,6 +608,11 @@ impl ServerState {
             return Response::NotFound;
         }
 
+        // Check concurrency constraint
+        if self.is_concurrency_blocked(id) {
+            return Response::NotFound;
+        }
+
         let state = job.state;
         let tube_name = job.tube_name.clone();
 
@@ -619,6 +692,7 @@ impl ServerState {
             job.deadline_at = Some(Instant::now() + ttr);
             job.reserve_ct += 1;
         }
+        self.acquire_concurrency_key(job_id);
         if let Some(job) = self.jobs.get(&job_id) {
             if let Some(tube) = self.tubes.get_mut(&job.tube_name) {
                 tube.stat.reserved_ct += 1;
@@ -669,6 +743,7 @@ impl ServerState {
                 if job.reserver_id != Some(conn_id) {
                     return Response::NotFound;
                 }
+                self.release_concurrency_key(id);
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
                     conn.reserved_jobs.retain(|&jid| jid != id);
                 }
@@ -887,6 +962,7 @@ impl ServerState {
         let tube_name = job.tube_name.clone();
 
         // Remove from reserved
+        self.release_concurrency_key(id);
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.reserved_jobs.retain(|&jid| jid != id);
         }
@@ -957,6 +1033,7 @@ impl ServerState {
         let tube_name = job.tube_name.clone();
 
         // Remove from reserved
+        self.release_concurrency_key(id);
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.reserved_jobs.retain(|&jid| jid != id);
         }
@@ -1502,6 +1579,7 @@ impl ServerState {
              binlog-records-migrated: 0\n\
              binlog-records-written: 0\n\
              binlog-max-size: {}\n\
+             current-concurrency-keys: {}\n\
              draining: {}\n\
              id: {}\n\
              hostname: {}\n\
@@ -1552,6 +1630,7 @@ impl ServerState {
             binlog_oldest,
             binlog_current,
             binlog_max_size,
+            self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
             self.instance_id,
             self.hostname,
@@ -1629,19 +1708,20 @@ impl ServerState {
 
     fn find_ready_job_for_conn(&self, conn_id: u64) -> Option<u64> {
         let conn = self.conns.get(&conn_id)?;
-        let mut best: Option<(u32, u64, u64)> = None; // (pri, job_id, job_id)
+        let mut best: Option<((u32, u64), u64)> = None; // (key, job_id)
 
         for w in &conn.watched {
             if let Some(tube) = self.tubes.get(&w.name) {
                 if tube.is_paused() {
                     continue;
                 }
-                if let Some(&((pri, jid), _)) = tube.ready.peek() {
+                if let Some(entry) = self.find_best_unblocked_ready(tube) {
+                    let (key, jid) = entry;
                     match &best {
-                        None => best = Some((pri, jid, jid)),
-                        Some((bp, bid, _)) => {
-                            if pri < *bp || (pri == *bp && jid < *bid) {
-                                best = Some((pri, jid, jid));
+                        None => best = Some((key, jid)),
+                        Some((bk, _)) => {
+                            if key < *bk {
+                                best = Some((key, jid));
                             }
                         }
                     }
@@ -1649,7 +1729,7 @@ impl ServerState {
             }
         }
 
-        best.map(|(_, _, id)| id)
+        best.map(|(_, id)| id)
     }
 
     fn select_weighted_job(&mut self, conn_id: u64) -> Option<u64> {
@@ -1664,7 +1744,7 @@ impl ServerState {
                 if tube.is_paused() || !tube.has_ready() {
                     continue;
                 }
-                if let Some(&(_, job_id)) = tube.ready.peek() {
+                if let Some((_, job_id)) = self.find_best_unblocked_ready(tube) {
                     total_weight += w.weight;
                     candidates.push((job_id, w.weight));
                 }
@@ -1801,22 +1881,23 @@ impl ServerState {
         }
     }
 
-    /// Same as find_ready_job_for_conn but doesn't need &self only - uses inner state directly.
+    /// Same as find_ready_job_for_conn but uses inner state directly.
     fn find_ready_job_for_conn_inner(&self, conn_id: u64) -> Option<u64> {
         let conn = self.conns.get(&conn_id)?;
-        let mut best: Option<(u32, u64)> = None;
+        let mut best: Option<((u32, u64), u64)> = None;
 
         for w in &conn.watched {
             if let Some(tube) = self.tubes.get(&w.name) {
                 if tube.is_paused() {
                     continue;
                 }
-                if let Some(&((pri, jid), _)) = tube.ready.peek() {
+                if let Some(entry) = self.find_best_unblocked_ready(tube) {
+                    let (key, jid) = entry;
                     match &best {
-                        None => best = Some((pri, jid)),
-                        Some((bp, bid)) => {
-                            if pri < *bp || (pri == *bp && jid < *bid) {
-                                best = Some((pri, jid));
+                        None => best = Some((key, jid)),
+                        Some((bk, _)) => {
+                            if key < *bk {
+                                best = Some((key, jid));
                             }
                         }
                     }
@@ -1967,6 +2048,7 @@ impl ServerState {
 
             for job_id in expired_jobs {
                 // Remove from connection's reserved list
+                self.release_concurrency_key(job_id);
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
                     conn.reserved_jobs.retain(|&jid| jid != job_id);
                 }

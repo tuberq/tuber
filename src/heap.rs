@@ -71,6 +71,12 @@ impl<K: Ord + Copy> IndexHeap<K> {
         self.data.iter().map(|&(_, id)| id).collect()
     }
 
+    /// Returns a reference to the underlying data for scanning.
+    /// Note: data is heap-ordered, not fully sorted.
+    pub fn entries(&self) -> &[(K, u64)] {
+        &self.data
+    }
+
     /// Removes all entries from the heap.
     pub fn clear(&mut self) {
         self.data.clear();
