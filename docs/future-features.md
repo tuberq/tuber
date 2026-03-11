@@ -2,7 +2,7 @@
 
 Ideas sourced from open issues and pain points in the original [beanstalkd](https://github.com/beanstalkd/beanstalkd).
 
-## New Protocol Commands
+## Done
 
 ### `flush-tube <tube>`
 
@@ -14,19 +14,7 @@ flush-tube <tube>\r\n
 
 Response: `FLUSHED <count>\r\n`
 
-### `list-jobs <tube> [state]`
-
-([#45](https://github.com/beanstalkd/beanstalkd/issues/45)) — Enumerate jobs in a tube, optionally filtered by state (ready, delayed, buried, reserved). Replaces the limited `peek-buried` / `peek-ready` / `peek-delayed` which only return one job each.
-
-```
-list-jobs <tube> [ready|delayed|buried|reserved]\r\n
-```
-
-### Bulk Retrieval
-
-([#427](https://github.com/beanstalkd/beanstalkd/issues/427)) — Reserve/peek multiple jobs at once. Needs a concrete command design (e.g. `reserve-batch <count>`, `peek-batch <tube> <state> <count>`).
-
-## `put` Parameter Extensions
+### `put` Parameter Extensions
 
 Optional trailing parameters on `put`, using a `prefix:value` convention. All are order-independent and backwards compatible — existing clients simply omit them.
 
@@ -57,7 +45,6 @@ put 100 0 60 11 idp:my-key\r\n
 
 - Key lives as long as the job; removed on delete
 - Second put with same key returns `INSERTED <original-id>` (not an error — truly idempotent)
-- Consider: tombstone with TTL for post-completion idempotency
 
 ### `grp:` and `aft:` — Job Groups (Fan-out/Fan-in)
 
@@ -88,68 +75,59 @@ put 100 0 60 14 aft:batch-a grp:batch-b\r\n
 
 ### `con:` — Concurrency Keys
 
-Referenced in the feature table but not yet designed in detail. Intent: limit concurrent reserved jobs sharing a key (e.g. one-at-a-time per API endpoint).
+Limit concurrent reserved jobs sharing a key (e.g. one-at-a-time per API endpoint). Jobs with a `con:` key are skipped during reserve if another job with the same key is already reserved.
 
-## Operational Improvements
+### `reserve-mode <default|weighted>`
+
+Switch between priority-first and weighted-random reserve strategies. Used with optional weight parameter on `watch`.
 
 ### Job Processing Duration Tracking
 
-Add `reserved_at: Option<Instant>` to `Job`. Set on reserve, clear on release/bury. On `delete` (successful completion), compute processing time (`reserved_at.elapsed()`) and total latency (`created_at` to deletion). Expose "time-reserved-so-far" via `stats-job` while a job is still reserved. Feed completed durations into per-tube aggregate stats.
+`reserved_at: Option<Instant>` on `Job`. Set on reserve, cleared on release/bury. On `delete`, computes processing time and total latency. Feeds into per-tube aggregate stats.
 
 ### Per-Tube Throughput Counters
 
-Extend `TubeStats` with additional counters incremented at state transition points:
-
-- `total_reserve_ct` — reserves from this tube
-- `total_timeout_ct` — TTR timeouts
-- `total_bury_ct` — total buries
-
-These are simple `+= 1` additions at existing transition points in `server.rs`.
+`TubeStats` tracks `total_reserve_ct`, `total_timeout_ct`, and `total_bury_ct`, incremented at state transition points.
 
 ### Per-Tube Processing Time Stats (EWMA)
 
-Track min/max/average processing time per tube using an exponentially weighted moving average. Updated on each successful delete:
-
-```rust
-ewma = alpha * sample + (1.0 - alpha) * ewma
-```
-
-No allocations or sliding windows — just a single `f64` field per tube, updated on each job completion. Provides tube-level throughput insight with negligible overhead.
-
-### Command Counters
-
-Wire up the existing `cmd-put`, `cmd-reserve`, `cmd-delete`, etc. fields in the `stats` command output. Each command handler increments its counter on entry. Useful for operational debugging (e.g. many reserves but few deletes = stuck workers).
+Tracks min/max/average processing time per tube using an exponentially weighted moving average. Updated on each successful delete.
 
 ### Enhanced `stats-tube` Output
 
-([#37](https://github.com/beanstalkd/beanstalkd/issues/37)) — Add tube latency, oldest job age, and the new processing time stats (EWMA, min, max) and throughput counters to `stats-tube` output. Data already available from job creation timestamps and the new per-tube tracking fields.
+([#37](https://github.com/beanstalkd/beanstalkd/issues/37)) — Includes processing time stats (EWMA, min, max, samples) and throughput counters.
 
 ### Prometheus Metrics Endpoint
 
-Expose a `/metrics` HTTP endpoint in standard Prometheus text format for dashboard/Grafana integration.
+`/metrics` HTTP endpoint in Prometheus text format. Enabled via `--metrics-port <port>`. Exposes job gauges, tube stats, connection count, and uptime.
 
-- Enabled via optional flag: `-m <port>` (e.g. `-m 9100`)
-- Serves on a separate HTTP port from the main beanstalkd protocol port
-- Uses `metrics` + `metrics-exporter-prometheus` Rust crates
-- Data already available internally from existing `stats` tracking
+## Partially Done
 
-**Key metrics to expose:**
+### Command Counters
 
-- `tuber_jobs_total{state}` — gauge per state (ready, reserved, buried, delayed)
-- `tuber_tube_jobs{tube, state}` — gauge per tube per state
-- `tuber_cmd_total{cmd}` — counter per command type (put, reserve, delete, etc.)
-- `tuber_connections` — current connection count
-- `tuber_uptime_seconds` — server uptime
-
-**Alternative considered:** sidecar exporter that connects via the text protocol and scrapes `stats`/`stats-tube`. Zero server changes but an extra process to deploy. Built-in is better for a greenfield Rust implementation.
+Structure exists (`op_ct` array in `GlobalStats`) and is wired into `stats` output, but counters are not yet incremented in command handlers.
 
 ### WAL Fsync Mode
 
-Configurable disk sync strategy for the write-ahead log, trading durability against throughput. Beanstalkd's original `-f` flag controlled fsync frequency. Options to consider:
+WAL uses fsync, but there's no configurable mode (`-f 0`, `-f <ms>`, no fsync). Currently always fsyncs.
 
-- **`-f 0`** — fsync after every write (maximum durability, slowest)
-- **`-f <ms>`** — fsync periodically on a timer (default, balances safety and speed)
-- **No fsync** — rely on OS page cache (fastest, risk of data loss on crash)
+## Future
+
+### `list-jobs <tube> [state]`
+
+([#45](https://github.com/beanstalkd/beanstalkd/issues/45)) — Enumerate jobs in a tube, optionally filtered by state (ready, delayed, buried, reserved). Replaces the limited `peek-buried` / `peek-ready` / `peek-delayed` which only return one job each.
+
+```
+list-jobs <tube> [ready|delayed|buried|reserved]\r\n
+```
+
+### Bulk Retrieval
+
+([#427](https://github.com/beanstalkd/beanstalkd/issues/427)) — Reserve/peek multiple jobs at once. Needs a concrete command design (e.g. `reserve-batch <count>`, `peek-batch <tube> <state> <count>`).
+
+### Idempotency Tombstones
+
+Post-completion idempotency via tombstone with TTL — prevents re-insertion of a recently completed job.
 
 ## Known Pain Points (C version) That Rust Helps With
 
