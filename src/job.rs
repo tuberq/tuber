@@ -97,6 +97,7 @@ impl Job {
             created_at: now,
             deadline_at,
             reserver_id: None,
+            reserved_at: None,
             reserve_ct: 0,
             timeout_ct: 0,
             release_ct: 0,
@@ -265,6 +266,12 @@ mod tests {
         assert_eq!(JobState::Reserved.as_str(), "reserved");
         assert_eq!(JobState::Delayed.as_str(), "delayed");
         assert_eq!(JobState::Buried.as_str(), "buried");
+    }
+
+    #[test]
+    fn test_job_reserved_at_none_on_creation() {
+        let j = make_test_job(1, 10);
+        assert!(j.reserved_at.is_none());
     }
 
     #[test]

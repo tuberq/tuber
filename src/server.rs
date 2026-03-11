@@ -48,6 +48,37 @@ struct GlobalStats {
     total_connections: u64,
 }
 
+/// State for a job group (grp:/aft: feature).
+#[derive(Debug)]
+struct GroupState {
+    /// Number of jobs with `grp:<id>` that haven't been deleted yet.
+    pending: u64,
+    /// Number of jobs with `grp:<id>` that are currently buried.
+    buried: u64,
+    /// Job IDs with `aft:<id>` that are held waiting for group completion.
+    waiting_jobs: Vec<u64>,
+}
+
+impl GroupState {
+    fn new() -> Self {
+        GroupState {
+            pending: 0,
+            buried: 0,
+            waiting_jobs: Vec::new(),
+        }
+    }
+
+    /// Group is complete when all members are deleted and none are buried.
+    fn is_complete(&self) -> bool {
+        self.pending == 0 && self.buried == 0
+    }
+
+    /// Group can be cleaned up when complete and no after-jobs waiting.
+    fn is_idle(&self) -> bool {
+        self.is_complete() && self.waiting_jobs.is_empty()
+    }
+}
+
 /// All server state, owned by the engine task.
 struct ServerState {
     jobs: HashMap<u64, Job>,
@@ -72,6 +103,8 @@ struct ServerState {
     hostname: String,
     os: String,
     platform: String,
+    /// Job group tracking for grp:/aft: features.
+    groups: HashMap<String, GroupState>,
 }
 
 impl ServerState {
@@ -147,6 +180,7 @@ impl ServerState {
             hostname,
             os,
             platform,
+            groups: HashMap::new(),
         }
     }
 
@@ -373,6 +407,22 @@ impl ServerState {
             tube.idempotency_keys.insert(key.clone(), id);
         }
 
+        // Track group membership
+        let group_name = self.jobs.get(&id).and_then(|j| j.group.clone());
+        if let Some(ref grp) = group_name {
+            let gs = self.groups.entry(grp.clone()).or_insert_with(GroupState::new);
+            gs.pending += 1;
+        }
+
+        // Check if this is an after-group job that should be held
+        let after_group_name = self.jobs.get(&id).and_then(|j| j.after_group.clone());
+        let hold_for_group = if let Some(ref ag) = after_group_name {
+            let gs = self.groups.entry(ag.clone()).or_insert_with(GroupState::new);
+            !gs.is_complete()
+        } else {
+            false
+        };
+
         // Enqueue
         if delay > 0 {
             let deadline = Instant::now() + Duration::from_secs(delay as u64);
@@ -382,6 +432,18 @@ impl ServerState {
             }
             if let Some(tube) = self.tubes.get_mut(&tube_name) {
                 tube.delay.insert((deadline, id), id);
+            }
+        } else if hold_for_group {
+            // Hold this after-job: mark as delayed with no deadline (held indefinitely)
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.state = JobState::Delayed;
+                job.deadline_at = None;
+            }
+            // Add to group's waiting list (will be promoted when group completes)
+            if let Some(ref ag) = after_group_name {
+                if let Some(gs) = self.groups.get_mut(ag) {
+                    gs.waiting_jobs.push(id);
+                }
             }
         } else {
             if let Some(job) = self.jobs.get(&id) {
@@ -553,12 +615,14 @@ impl ServerState {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.state = JobState::Reserved;
             job.reserver_id = Some(conn_id);
+            job.reserved_at = Some(Instant::now());
             job.deadline_at = Some(Instant::now() + ttr);
             job.reserve_ct += 1;
         }
         if let Some(job) = self.jobs.get(&job_id) {
             if let Some(tube) = self.tubes.get_mut(&job.tube_name) {
                 tube.stat.reserved_ct += 1;
+                tube.stat.total_reserve_ct += 1;
             }
         }
         self.stats.reserved_ct += 1;
@@ -597,6 +661,7 @@ impl ServerState {
         let state = job.state;
         let tube_name = job.tube_name.clone();
         let pri = job.priority;
+        let reserved_at = job.reserved_at;
 
         match state {
             JobState::Reserved => {
@@ -640,6 +705,24 @@ impl ServerState {
 
         if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.stat.total_delete_ct += 1;
+
+            if state == JobState::Reserved {
+                if let Some(ra) = reserved_at {
+                    let secs = Instant::now().duration_since(ra).as_secs_f64();
+                    tube.stat.processing_time_samples += 1;
+                    if tube.stat.processing_time_samples == 1 {
+                        tube.stat.processing_time_ewma = secs;
+                    } else {
+                        const ALPHA: f64 = 0.1;
+                        tube.stat.processing_time_ewma =
+                            ALPHA * secs + (1.0 - ALPHA) * tube.stat.processing_time_ewma;
+                    }
+                    tube.stat.processing_time_min =
+                        Some(tube.stat.processing_time_min.map_or(secs, |m| m.min(secs)));
+                    tube.stat.processing_time_max =
+                        Some(tube.stat.processing_time_max.map_or(secs, |m| m.max(secs)));
+                }
+            }
         }
         self.stats.total_delete_ct += 1;
 
@@ -651,10 +734,26 @@ impl ServerState {
             tube.idempotency_keys.remove(key);
         }
 
+        // Group tracking: decrement pending count and check completion
+        let group_name = self.jobs.get(&id).and_then(|j| j.group.clone());
+        if let Some(ref grp) = group_name {
+            if let Some(gs) = self.groups.get_mut(grp) {
+                gs.pending = gs.pending.saturating_sub(1);
+                if state == JobState::Buried {
+                    gs.buried = gs.buried.saturating_sub(1);
+                }
+            }
+        }
+
         // WAL: write delete state change
         self.wal_write_state_change(id, None, 0, Duration::ZERO);
 
         self.jobs.remove(&id);
+
+        // Check if any group completed and promote waiting after-jobs
+        if let Some(ref grp) = group_name {
+            self.check_group_completion(grp);
+        }
 
         Response::Deleted
     }
@@ -737,10 +836,39 @@ impl ServerState {
         self.stats.buried_ct = self.stats.buried_ct.saturating_sub(buried_removed);
         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(reserved_removed);
 
+        // Group tracking: decrement pending/buried counts for flushed jobs
+        let mut affected_groups: Vec<String> = Vec::new();
+        for &id in &job_ids {
+            if let Some(job) = self.jobs.get(&id) {
+                if let Some(ref grp) = job.group {
+                    if let Some(gs) = self.groups.get_mut(grp) {
+                        gs.pending = gs.pending.saturating_sub(1);
+                        if job.state == JobState::Buried {
+                            gs.buried = gs.buried.saturating_sub(1);
+                        }
+                        if !affected_groups.contains(grp) {
+                            affected_groups.push(grp.clone());
+                        }
+                    }
+                }
+                // Also remove held after-jobs from group waiting lists
+                if let Some(ref ag) = job.after_group {
+                    if let Some(gs) = self.groups.get_mut(ag) {
+                        gs.waiting_jobs.retain(|&jid| jid != id);
+                    }
+                }
+            }
+        }
+
         // WAL: write delete for each job, then remove from jobs map
         for &id in &job_ids {
             self.wal_write_state_change(id, None, 0, Duration::ZERO);
             self.jobs.remove(&id);
+        }
+
+        // Check if any affected groups completed
+        for grp in &affected_groups {
+            self.check_group_completion(grp);
         }
 
         Response::Flushed(count)
@@ -773,6 +901,7 @@ impl ServerState {
             job.delay = Duration::from_secs(delay as u64);
             job.release_ct += 1;
             job.reserver_id = None;
+            job.reserved_at = None;
         }
 
         // Enqueue
@@ -840,6 +969,7 @@ impl ServerState {
             job.priority = pri;
             job.state = JobState::Buried;
             job.reserver_id = None;
+            job.reserved_at = None;
             job.deadline_at = None;
             job.bury_ct += 1;
         }
@@ -847,8 +977,18 @@ impl ServerState {
         if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.buried.push_back(id);
             tube.stat.buried_ct += 1;
+            tube.stat.total_bury_ct += 1;
         }
         self.stats.buried_ct += 1;
+
+        // Group tracking: buried jobs block group completion
+        if let Some(job) = self.jobs.get(&id) {
+            if let Some(ref grp) = job.group {
+                if let Some(gs) = self.groups.get_mut(grp) {
+                    gs.buried += 1;
+                }
+            }
+        }
 
         // WAL: write bury state change
         self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO);
@@ -1010,6 +1150,15 @@ impl ServerState {
                 };
                 self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
 
+                // Group tracking: un-bury decrements buried count
+                if let Some(job) = self.jobs.get(&job_id) {
+                    if let Some(ref grp) = job.group {
+                        if let Some(gs) = self.groups.get_mut(grp) {
+                            gs.buried = gs.buried.saturating_sub(1);
+                        }
+                    }
+                }
+
                 // Re-enqueue as ready
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.state = JobState::Ready;
@@ -1089,6 +1238,15 @@ impl ServerState {
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
                 self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
+
+                // Group tracking: un-bury decrements buried count
+                if let Some(job) = self.jobs.get(&id) {
+                    if let Some(ref grp) = job.group {
+                        if let Some(gs) = self.groups.get_mut(grp) {
+                            gs.buried = gs.buried.saturating_sub(1);
+                        }
+                    }
+                }
             }
             JobState::Delayed => {
                 if let Some(tube) = self.tubes.get_mut(&tube_name) {
@@ -1158,6 +1316,14 @@ impl ServerState {
             _ => 0,
         };
 
+        let time_reserved = if job.state == JobState::Reserved {
+            job.reserved_at
+                .map(|ra| now.duration_since(ra).as_secs() as i64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let yaml = format!(
             "---\n\
              id: {}\n\
@@ -1168,6 +1334,7 @@ impl ServerState {
              delay: {}\n\
              ttr: {}\n\
              time-left: {}\n\
+             time-reserved: {}\n\
              file: {}\n\
              reserves: {}\n\
              timeouts: {}\n\
@@ -1186,6 +1353,7 @@ impl ServerState {
             job.delay.as_secs(),
             job.ttr.as_secs(),
             time_left,
+            time_reserved,
             job.wal_file_seq.unwrap_or(0),
             job.reserve_ct,
             job.timeout_ct,
@@ -1233,7 +1401,14 @@ impl ServerState {
              cmd-delete: {}\n\
              cmd-pause-tube: {}\n\
              pause: {}\n\
-             pause-time-left: {}\n",
+             pause-time-left: {}\n\
+             total-reserves: {}\n\
+             total-timeouts: {}\n\
+             total-buries: {}\n\
+             processing-time-ewma: {:.6}\n\
+             processing-time-min: {:.6}\n\
+             processing-time-max: {:.6}\n\
+             processing-time-samples: {}\n",
             tube.name,
             tube.stat.urgent_ct,
             tube.ready.len(),
@@ -1248,6 +1423,13 @@ impl ServerState {
             tube.stat.pause_ct,
             tube.pause.as_secs(),
             pause_time_left,
+            tube.stat.total_reserve_ct,
+            tube.stat.total_timeout_ct,
+            tube.stat.total_bury_ct,
+            tube.stat.processing_time_ewma,
+            tube.stat.processing_time_min.unwrap_or(0.0),
+            tube.stat.processing_time_max.unwrap_or(0.0),
+            tube.stat.processing_time_samples,
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -1512,6 +1694,61 @@ impl ServerState {
         candidates.last().map(|(id, _)| *id)
     }
 
+    /// Check if a group is complete and promote any waiting after-jobs to ready.
+    fn check_group_completion(&mut self, group_name: &str) {
+        let is_complete = self
+            .groups
+            .get(group_name)
+            .map(|gs| gs.is_complete())
+            .unwrap_or(false);
+
+        if !is_complete {
+            return;
+        }
+
+        // Take waiting jobs out of the group
+        let waiting_jobs = self
+            .groups
+            .get_mut(group_name)
+            .map(|gs| std::mem::take(&mut gs.waiting_jobs))
+            .unwrap_or_default();
+
+        // Promote each waiting after-job to ready
+        for job_id in &waiting_jobs {
+            if let Some(job) = self.jobs.get_mut(job_id) {
+                if job.state == JobState::Delayed && job.deadline_at.is_none() {
+                    job.state = JobState::Ready;
+                    let key = job.ready_key();
+                    let tn = job.tube_name.clone();
+                    if let Some(tube) = self.tubes.get_mut(&tn) {
+                        tube.ready.insert(key, *job_id);
+                    }
+                    self.ready_ct += 1;
+                    if key.0 < URGENT_THRESHOLD {
+                        self.stats.urgent_ct += 1;
+                        if let Some(tube) = self.tubes.get_mut(&tn) {
+                            tube.stat.urgent_ct += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up idle groups
+        if self
+            .groups
+            .get(group_name)
+            .map(|gs| gs.is_idle())
+            .unwrap_or(false)
+        {
+            self.groups.remove(group_name);
+        }
+
+        if !waiting_jobs.is_empty() {
+            self.process_queue();
+        }
+    }
+
     /// Try to match waiting connections with ready jobs.
     fn process_queue(&mut self) {
         let now = Instant::now();
@@ -1659,7 +1896,26 @@ impl ServerState {
                     .and_then(|t| t.delay.pop().map(|(_, id)| id));
 
                 if let Some(job_id) = job_id {
-                    if let Some(job) = self.jobs.get_mut(&job_id) {
+                    // Check if this is an aft: job whose group isn't complete yet
+                    let hold_for_group = self
+                        .jobs
+                        .get(&job_id)
+                        .and_then(|j| j.after_group.as_ref())
+                        .and_then(|ag| self.groups.get(ag))
+                        .map(|gs| !gs.is_complete())
+                        .unwrap_or(false);
+
+                    if hold_for_group {
+                        // Keep as delayed with no deadline; add to group waiting list
+                        if let Some(job) = self.jobs.get_mut(&job_id) {
+                            job.deadline_at = None;
+                        }
+                        if let Some(ag) = self.jobs.get(&job_id).and_then(|j| j.after_group.clone()) {
+                            if let Some(gs) = self.groups.get_mut(&ag) {
+                                gs.waiting_jobs.push(job_id);
+                            }
+                        }
+                    } else if let Some(job) = self.jobs.get_mut(&job_id) {
                         job.state = JobState::Ready;
                         job.deadline_at = None;
                         let key = job.ready_key();
@@ -1722,11 +1978,13 @@ impl ServerState {
                     job.timeout_ct += 1;
                     job.state = JobState::Ready;
                     job.reserver_id = None;
+                    job.reserved_at = None;
                     job.deadline_at = None;
                     let key = job.ready_key();
                     let tube_name = job.tube_name.clone();
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
+                        tube.stat.total_timeout_ct += 1;
                         tube.ready.insert(key, job_id);
                     }
                     self.ready_ct += 1;
@@ -1795,11 +2053,16 @@ impl ServerState {
     fn restore_jobs(&mut self, jobs: HashMap<u64, Job>, next_job_id: u64) {
         self.next_job_id = next_job_id;
 
+        // Collect after_group job IDs for a second pass
+        let mut after_group_jobs: Vec<u64> = Vec::new();
+
         for (id, job) in jobs {
             let tube_name = job.tube_name.clone();
             let state = job.state;
             let pri = job.priority;
             let idempotency_key = job.idempotency_key.clone();
+            let group = job.group.clone();
+            let after_group = job.after_group.clone();
 
             self.ensure_tube(&tube_name);
 
@@ -1865,6 +2128,58 @@ impl ServerState {
                 && let Some(tube) = self.tubes.get_mut(&tube_name)
             {
                 tube.idempotency_keys.insert(key.clone(), id);
+            }
+
+            // Rebuild group state
+            if let Some(ref grp) = group {
+                let gs = self.groups.entry(grp.clone()).or_insert_with(GroupState::new);
+                gs.pending += 1;
+                if state == JobState::Buried {
+                    gs.buried += 1;
+                }
+            }
+
+            if after_group.is_some() {
+                after_group_jobs.push(id);
+            }
+        }
+
+        // Second pass: check after-group jobs and hold if group is not complete
+        for job_id in after_group_jobs {
+            let ag = self.jobs.get(&job_id).and_then(|j| j.after_group.clone());
+            if let Some(ag) = ag {
+                let group_incomplete = self
+                    .groups
+                    .get(&ag)
+                    .map(|gs| !gs.is_complete())
+                    .unwrap_or(false);
+
+                if group_incomplete {
+                    // If the job is currently ready, move it to held (delayed with no deadline)
+                    if let Some(job) = self.jobs.get(&job_id) {
+                        if job.state == JobState::Ready {
+                            let tube_name = job.tube_name.clone();
+                            let pri = job.priority;
+                            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                                tube.ready.remove_by_id(job_id);
+                            }
+                            self.ready_ct = self.ready_ct.saturating_sub(1);
+                            if pri < URGENT_THRESHOLD {
+                                self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
+                                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                                    tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
+                                }
+                            }
+                            if let Some(job) = self.jobs.get_mut(&job_id) {
+                                job.state = JobState::Delayed;
+                                job.deadline_at = None;
+                            }
+                        }
+                    }
+                    // Add to group waiting list
+                    let gs = self.groups.entry(ag).or_insert_with(GroupState::new);
+                    gs.waiting_jobs.push(job_id);
+                }
             }
         }
     }

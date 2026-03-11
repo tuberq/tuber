@@ -1720,3 +1720,347 @@ async fn test_idempotency_flush_clears_keys() {
     c.mustsend("world\r\n").await;
     c.ckresp("INSERTED 2\r\n").await;
 }
+
+// ---------------------------------------------------------------------------
+// Job processing stats tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stats_tube_processing_reserve_delete() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put, reserve, then delete a job
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve\r\n").await;
+    let line = c.readline().await;
+    assert!(line.starts_with("RESERVED 1"));
+    c.ckresp("x\r\n").await;
+
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("total-reserves: 1"), "total-reserves missing: {}", body);
+    assert!(body.contains("processing-time-samples: 1"), "processing-time-samples missing: {}", body);
+    // EWMA should be non-zero (job was reserved for some duration)
+    assert!(!body.contains("processing-time-ewma: 0.000000"), "ewma should be non-zero: {}", body);
+}
+
+#[tokio::test]
+async fn test_stats_tube_delete_ready_no_ewma() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put and immediately delete (from ready state, never reserved)
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("total-reserves: 0"), "total-reserves should be 0: {}", body);
+    assert!(body.contains("processing-time-samples: 0"), "samples should be 0: {}", body);
+    assert!(body.contains("processing-time-ewma: 0.000000"), "ewma should be 0: {}", body);
+}
+
+#[tokio::test]
+async fn test_stats_tube_bury_counter() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put, reserve, then bury
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve\r\n").await;
+    let line = c.readline().await;
+    assert!(line.starts_with("RESERVED 1"));
+    c.ckresp("x\r\n").await;
+
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("total-buries: 1"), "total-buries missing: {}", body);
+    // EWMA unchanged (bury doesn't count as successful completion)
+    assert!(body.contains("processing-time-samples: 0"), "samples should be 0 after bury: {}", body);
+}
+
+#[tokio::test]
+async fn test_stats_job_time_reserved() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve\r\n").await;
+    let line = c.readline().await;
+    assert!(line.starts_with("RESERVED 1"));
+    c.ckresp("x\r\n").await;
+
+    c.mustsend("stats-job 1\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("time-reserved: 0"), "time-reserved missing: {}", body);
+}
+
+// ---------------------------------------------------------------------------
+// Job group (grp:/aft:) tests
+// ---------------------------------------------------------------------------
+
+/// After-job fires immediately when group has no pending members (empty group).
+#[tokio::test]
+async fn test_group_after_fires_immediately_empty_group() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put an after-job for a group that has no members
+    c.mustsend("put 0 0 60 1 aft:batch-1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Should be immediately ready since there are no pending group members
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("x\r\n").await;
+}
+
+/// After-job is held until all group members are deleted.
+#[tokio::test]
+async fn test_group_after_held_until_complete() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put two child jobs in the group
+    c.mustsend("put 0 0 60 1 grp:batch-1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 grp:batch-1\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Put after-job (should be held)
+    c.mustsend("put 0 0 60 1 aft:batch-1\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve and delete first child
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // After-job should still not be available (one child remains)
+    // The only reservable job should be child 2
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Now the after-job should be ready
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// Buried job blocks group completion.
+#[tokio::test]
+async fn test_group_buried_blocks_completion() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a child job
+    c.mustsend("put 0 0 60 1 grp:batch-2\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Put after-job
+    c.mustsend("put 0 0 60 1 aft:batch-2\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve and bury the child
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // After-job should not be available (child is buried)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Kick the buried job back to ready
+    c.mustsend("kick 1\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+
+    // After-job still not ready (child is back to ready, not deleted)
+    // Reserve child first
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Delete the child — now group should complete
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // After-job should now be ready
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// Multiple after-jobs per group.
+#[tokio::test]
+async fn test_group_multiple_after_jobs() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // One child
+    c.mustsend("put 0 0 60 1 grp:batch-3\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Two after-jobs
+    c.mustsend("put 0 0 60 1 aft:batch-3\r\n").await;
+    c.mustsend("y\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("put 0 0 60 1 aft:batch-3\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve and delete child
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Both after-jobs should now be ready
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("y\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// Chaining: after-job for group A is also a member of group B.
+#[tokio::test]
+async fn test_group_chaining() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Group A child
+    c.mustsend("put 0 0 60 1 grp:grpA\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // After grpA, member of grpB (chaining)
+    c.mustsend("put 0 0 60 1 aft:grpA grp:grpB\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // After grpB
+    c.mustsend("put 0 0 60 1 aft:grpB\r\n").await;
+    c.mustsend("c\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Delete child of grpA — should release job 2 (aft:grpA)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Job 2 should now be ready (aft:grpA completed)
+    // But job 3 should still be held (grpB has pending member: job 2)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+
+    // Job 3 not yet available
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Delete job 2 — grpB completes, job 3 should be released
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("c\r\n").await;
+}
+
+/// Adding children to a group after an after-job is already waiting.
+#[tokio::test]
+async fn test_group_add_children_after_after_job() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put one child
+    c.mustsend("put 0 0 60 1 grp:batch-4\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Put after-job (held: 1 pending)
+    c.mustsend("put 0 0 60 1 aft:batch-4\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Add another child to the group
+    c.mustsend("put 0 0 60 1 grp:batch-4\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Delete first child — after-job still held (second child pending)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Reserve second child
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("b\r\n").await;
+    c.mustsend("delete 3\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Now after-job should be ready
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// Stats-job shows group and after-group fields.
+#[tokio::test]
+async fn test_group_stats_job_fields() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:mygrp aft:othergrp\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("stats-job 1\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("group: mygrp"), "group missing: {}", body);
+    assert!(body.contains("after-group: othergrp"), "after-group missing: {}", body);
+}

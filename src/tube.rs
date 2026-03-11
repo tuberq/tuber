@@ -18,6 +18,17 @@ pub struct TubeStats {
     pub pause_ct: u64,
     pub total_delete_ct: u64,
     pub total_jobs_ct: u64,
+
+    // Throughput counters
+    pub total_reserve_ct: u64,
+    pub total_timeout_ct: u64,
+    pub total_bury_ct: u64,
+
+    // Processing time stats
+    pub processing_time_ewma: f64,
+    pub processing_time_min: Option<f64>,
+    pub processing_time_max: Option<f64>,
+    pub processing_time_samples: u64,
 }
 
 #[derive(Debug)]
@@ -169,6 +180,18 @@ mod tests {
         assert_eq!(watch.pop_front().as_deref(), Some("b"));
         assert_eq!(watch.pop_front().as_deref(), Some("c"));
         assert!(watch.is_empty());
+    }
+
+    #[test]
+    fn test_tube_stats_defaults() {
+        let stats = TubeStats::default();
+        assert_eq!(stats.total_reserve_ct, 0);
+        assert_eq!(stats.total_timeout_ct, 0);
+        assert_eq!(stats.total_bury_ct, 0);
+        assert_eq!(stats.processing_time_samples, 0);
+        assert_eq!(stats.processing_time_ewma, 0.0);
+        assert!(stats.processing_time_min.is_none());
+        assert!(stats.processing_time_max.is_none());
     }
 
     #[test]
