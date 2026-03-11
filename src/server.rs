@@ -881,8 +881,9 @@ impl ServerState {
             }
         }
 
-        // Remove reserved jobs from owning connections
+        // Remove reserved jobs from owning connections and release concurrency keys
         for &id in &reserved_ids {
+            self.release_concurrency_key(id);
             if let Some(job) = self.jobs.get(&id)
                 && let Some(reserver_id) = job.reserver_id
                 && let Some(conn) = self.conns.get_mut(&reserver_id)

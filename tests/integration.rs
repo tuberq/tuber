@@ -2341,3 +2341,353 @@ async fn test_concurrency_disconnect_frees_slot() {
         line
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cross-tube group tests
+// ---------------------------------------------------------------------------
+
+/// Group members can span multiple tubes; after-job fires when all are deleted.
+#[tokio::test]
+async fn test_group_cross_tube() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put child on tube "alpha"
+    c.mustsend("use alpha\r\n").await;
+    c.ckresp("USING alpha\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:cross\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Put child on tube "beta"
+    c.mustsend("use beta\r\n").await;
+    c.ckresp("USING beta\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:cross\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Put after-job on tube "gamma"
+    c.mustsend("use gamma\r\n").await;
+    c.ckresp("USING gamma\r\n").await;
+    c.mustsend("put 0 0 60 1 aft:cross\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Watch all tubes
+    c.mustsend("watch alpha\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("watch beta\r\n").await;
+    c.ckresp("WATCHING 3\r\n").await;
+    c.mustsend("watch gamma\r\n").await;
+    c.ckresp("WATCHING 4\r\n").await;
+
+    // Reserve and delete child from alpha
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // After-job should still be held (child on beta remains)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Now the after-job on gamma should be ready
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// Cyclic group dependencies hold jobs indefinitely without crashing.
+#[tokio::test]
+async fn test_group_cycle_holds_indefinitely() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Seed both groups so they have pending members before adding the aft: jobs.
+    // Without this, the first aft: would fire immediately (empty group = complete).
+    c.mustsend("put 0 0 60 1 grp:cycleA\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 grp:cycleB\r\n").await;
+    c.mustsend("y\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Now create the cycle: each after-job depends on the other group
+    c.mustsend("put 0 0 60 1 grp:cycleA aft:cycleB\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    c.mustsend("put 0 0 60 1 grp:cycleB aft:cycleA\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 4\r\n").await;
+
+    // Reserve and delete the seed jobs — groups still won't complete
+    // because jobs 3 and 4 are also group members (held, but still pending)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("x\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("y\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Neither cyclic job should be reservable — deadlocked
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Server is still functional — put and reserve a normal job
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("c\r\n").await;
+    c.ckresp("INSERTED 5\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 5 1\r\n").await;
+    c.ckresp("c\r\n").await;
+
+    // Cyclic jobs are still there (peek confirms they exist)
+    c.mustsend("peek 3\r\n").await;
+    c.ckresp("FOUND 3 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    c.mustsend("peek 4\r\n").await;
+    c.ckresp("FOUND 4 1\r\n").await;
+    c.ckresp("b\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency key: kick interaction
+// ---------------------------------------------------------------------------
+
+/// Kick on a buried con: job does not leave the concurrency slot taken.
+#[tokio::test]
+async fn test_concurrency_kick_frees_and_re_reserves() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 con:kkey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:kkey\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve and bury job 1
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // Job 2 should now be reservable (bury freed the slot)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Kick the buried job back to ready
+    c.mustsend("kick 1\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+
+    // Job 1 should be reservable again
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
+// Drain mode: reserve/delete still work
+// ---------------------------------------------------------------------------
+
+/// In drain mode, reserve and delete still work — only put is blocked.
+#[tokio::test]
+async fn test_drain_mode_reserve_and_delete_work() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a job before draining
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Get the server PID from stats
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    let pid: i32 = body
+        .lines()
+        .find(|l| l.starts_with("pid:"))
+        .unwrap()
+        .split(':')
+        .nth(1)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Send SIGUSR1 to enter drain mode
+    unsafe { libc::kill(pid, libc::SIGUSR1) };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // put should fail
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("DRAINING\r\n").await;
+
+    // reserve should still work
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // delete should still work
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // bury, kick, stats, etc. should all still work
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("draining: true"));
+}
+
+// ---------------------------------------------------------------------------
+// reserve-job edge cases
+// ---------------------------------------------------------------------------
+
+/// reserve-job on nonexistent job returns NOT_FOUND.
+#[tokio::test]
+async fn test_reserve_job_not_found() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("reserve-job 999\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+/// reserve-job on a deleted job returns NOT_FOUND.
+#[tokio::test]
+async fn test_reserve_job_deleted() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
+// flush-tube interaction with groups and concurrency
+// ---------------------------------------------------------------------------
+
+/// flush-tube clears group pending counts so after-jobs fire.
+#[tokio::test]
+async fn test_flush_tube_clears_group_state() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put group children on default tube
+    c.mustsend("put 0 0 60 1 grp:flushgrp\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 grp:flushgrp\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Put after-job on a different tube so flush doesn't delete it
+    c.mustsend("use other\r\n").await;
+    c.ckresp("USING other\r\n").await;
+    c.mustsend("put 0 0 60 1 aft:flushgrp\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Flush the default tube (deletes the group children)
+    c.mustsend("flush-tube default\r\n").await;
+    c.ckresp("FLUSHED 2\r\n").await;
+
+    // Watch the other tube — after-job should now be ready
+    c.mustsend("watch other\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// flush-tube clears concurrency key reservations.
+#[tokio::test]
+async fn test_flush_tube_clears_concurrency_keys() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put two con: jobs
+    c.mustsend("put 0 0 60 1 con:fkey\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:fkey\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve first (blocks second)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Flush — should clear everything including the concurrency state
+    c.mustsend("flush-tube default\r\n").await;
+    c.ckresp("FLUSHED 2\r\n").await;
+
+    // Stats should show 0 concurrency keys
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-concurrency-keys: 0"),
+        "concurrency keys should be cleared after flush: {}",
+        body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Weighted reserve: mode switching
+// ---------------------------------------------------------------------------
+
+/// Switching between weighted and FIFO modes within the same connection.
+#[tokio::test]
+async fn test_reserve_mode_switch() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Start in FIFO (default), switch to weighted, switch back
+    c.mustsend("reserve-mode weighted\r\n").await;
+    c.ckresp("USING weighted\r\n").await;
+
+    c.mustsend("reserve-mode fifo\r\n").await;
+    c.ckresp("USING fifo\r\n").await;
+
+    // Put a job and verify FIFO reserve still works
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+}
