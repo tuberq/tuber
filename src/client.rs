@@ -60,7 +60,8 @@ impl TuberClient {
     }
 
     pub async fn reserve_with_timeout(&mut self, timeout: u32) -> io::Result<ReserveResult> {
-        self.send_line(&format!("reserve-with-timeout {timeout}")).await?;
+        self.send_line(&format!("reserve-with-timeout {timeout}"))
+            .await?;
         let line = self.read_line().await?;
         if line.starts_with("RESERVED") {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -110,7 +111,7 @@ impl TuberClient {
     async fn read_ok_body(&mut self) -> io::Result<String> {
         let line = self.read_line().await?;
         if !line.starts_with("OK ") {
-            return Err(io::Error::new(io::ErrorKind::Other, line));
+            return Err(io::Error::other(line));
         }
         let bytes: usize = line[3..]
             .trim()
@@ -119,8 +120,7 @@ impl TuberClient {
         let mut buf = vec![0u8; bytes + 2]; // +2 for trailing \r\n
         self.reader.read_exact(&mut buf).await?;
         buf.truncate(bytes);
-        String::from_utf8(buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn send_line(&mut self, line: &str) -> io::Result<()> {

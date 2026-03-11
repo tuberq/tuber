@@ -16,10 +16,7 @@ pub async fn run(
     if tube != "default" {
         let resp = client.use_tube(tube).await?;
         if !resp.starts_with("USING") {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("use tube failed: {resp}"),
-            ));
+            return Err(io::Error::other(format!("use tube failed: {resp}")));
         }
     }
 

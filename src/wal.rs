@@ -259,8 +259,9 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
         return Err(WalError::Truncated);
     }
 
-    let job_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
-    let payload_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
+    let job_id = u64::from_le_bytes(data[1..9].try_into().map_err(|_| WalError::Truncated)?);
+    let payload_len =
+        u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?) as usize;
 
     let total_len = 1 + 8 + 4 + payload_len + 4; // +4 for CRC
     if data.len() < total_len {
@@ -268,7 +269,11 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
     }
 
     // Verify CRC
-    let stored_crc = u32::from_le_bytes(data[total_len - 4..total_len].try_into().unwrap());
+    let stored_crc = u32::from_le_bytes(
+        data[total_len - 4..total_len]
+            .try_into()
+            .map_err(|_| WalError::Truncated)?,
+    );
     let computed_crc = crc32fast::hash(&data[..total_len - 4]);
     if stored_crc != computed_crc {
         return Err(WalError::BadCrc);
@@ -283,7 +288,11 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
             if off + 4 > payload.len() {
                 return Err(WalError::Truncated);
             }
-            let v = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+            let v = u32::from_le_bytes(
+                payload[off..off + 4]
+                    .try_into()
+                    .map_err(|_| WalError::Truncated)?,
+            );
             off += 4;
             v
         }};
@@ -293,7 +302,11 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
             if off + 8 > payload.len() {
                 return Err(WalError::Truncated);
             }
-            let v = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
+            let v = u64::from_le_bytes(
+                payload[off..off + 8]
+                    .try_into()
+                    .map_err(|_| WalError::Truncated)?,
+            );
             off += 8;
             v
         }};
@@ -303,7 +316,11 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
             if off + 2 > payload.len() {
                 return Err(WalError::Truncated);
             }
-            let v = u16::from_le_bytes(payload[off..off + 2].try_into().unwrap());
+            let v = u16::from_le_bytes(
+                payload[off..off + 2]
+                    .try_into()
+                    .map_err(|_| WalError::Truncated)?,
+            );
             off += 2;
             v
         }};
@@ -383,14 +400,14 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
         return Err(WalError::Truncated);
     }
 
-    let job_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
-    let _payload_len = u32::from_le_bytes(data[9..13].try_into().unwrap());
+    let job_id = u64::from_le_bytes(data[1..9].try_into().map_err(|_| WalError::Truncated)?);
+    let _payload_len = u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?);
 
     // Verify CRC
     let stored_crc = u32::from_le_bytes(
         data[STATE_CHANGE_RECORD_SIZE - 4..STATE_CHANGE_RECORD_SIZE]
             .try_into()
-            .unwrap(),
+            .map_err(|_| WalError::Truncated)?,
     );
     let computed_crc = crc32fast::hash(&data[..STATE_CHANGE_RECORD_SIZE - 4]);
     if stored_crc != computed_crc {
@@ -403,8 +420,10 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
     } else {
         Some(u8_to_state(state_byte).ok_or(WalError::InvalidData)?)
     };
-    let new_priority = u32::from_le_bytes(data[14..18].try_into().unwrap());
-    let new_delay_nanos = u64::from_le_bytes(data[18..26].try_into().unwrap());
+    let new_priority =
+        u32::from_le_bytes(data[14..18].try_into().map_err(|_| WalError::Truncated)?);
+    let new_delay_nanos =
+        u64::from_le_bytes(data[18..26].try_into().map_err(|_| WalError::Truncated)?);
 
     Ok((
         WalRecord::StateChange {
@@ -430,7 +449,7 @@ fn read_header(data: &[u8]) -> Result<(), WalError> {
     if &data[0..4] != WAL_MAGIC {
         return Err(WalError::BadMagic);
     }
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let version = u32::from_le_bytes(data[4..8].try_into().map_err(|_| WalError::Truncated)?);
     if version != WAL_VERSION {
         return Err(WalError::BadVersion(version));
     }

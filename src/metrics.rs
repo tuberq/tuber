@@ -91,31 +91,131 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     let stats = parse_yaml_map(&stats_yaml);
 
     // Gauges
-    prom_gauge(&mut out, "tuber_jobs_urgent", "Current urgent jobs", &stats, "current-jobs-urgent");
-    prom_gauge(&mut out, "tuber_jobs_ready", "Current ready jobs", &stats, "current-jobs-ready");
-    prom_gauge(&mut out, "tuber_jobs_reserved", "Current reserved jobs", &stats, "current-jobs-reserved");
-    prom_gauge(&mut out, "tuber_jobs_delayed", "Current delayed jobs", &stats, "current-jobs-delayed");
-    prom_gauge(&mut out, "tuber_jobs_buried", "Current buried jobs", &stats, "current-jobs-buried");
-    prom_gauge(&mut out, "tuber_connections_current", "Current connections", &stats, "current-connections");
-    prom_gauge(&mut out, "tuber_producers_current", "Current producers", &stats, "current-producers");
-    prom_gauge(&mut out, "tuber_workers_current", "Current workers", &stats, "current-workers");
-    prom_gauge(&mut out, "tuber_waiting_current", "Current waiting connections", &stats, "current-waiting");
-    prom_gauge(&mut out, "tuber_tubes_current", "Current number of tubes", &stats, "current-tubes");
-    prom_gauge(&mut out, "tuber_uptime_seconds", "Server uptime in seconds", &stats, "uptime");
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_urgent",
+        "Current urgent jobs",
+        &stats,
+        "current-jobs-urgent",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_ready",
+        "Current ready jobs",
+        &stats,
+        "current-jobs-ready",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_reserved",
+        "Current reserved jobs",
+        &stats,
+        "current-jobs-reserved",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_delayed",
+        "Current delayed jobs",
+        &stats,
+        "current-jobs-delayed",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_buried",
+        "Current buried jobs",
+        &stats,
+        "current-jobs-buried",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_connections_current",
+        "Current connections",
+        &stats,
+        "current-connections",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_producers_current",
+        "Current producers",
+        &stats,
+        "current-producers",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_workers_current",
+        "Current workers",
+        &stats,
+        "current-workers",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_waiting_current",
+        "Current waiting connections",
+        &stats,
+        "current-waiting",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_tubes_current",
+        "Current number of tubes",
+        &stats,
+        "current-tubes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_uptime_seconds",
+        "Server uptime in seconds",
+        &stats,
+        "uptime",
+    );
 
     // Counters
-    prom_counter(&mut out, "tuber_jobs_total", "Total jobs created", &stats, "total-jobs");
-    prom_counter(&mut out, "tuber_job_timeouts_total", "Total job timeouts", &stats, "job-timeouts");
-    prom_counter(&mut out, "tuber_connections_total", "Total connections", &stats, "total-connections");
+    prom_counter(
+        &mut out,
+        "tuber_jobs_total",
+        "Total jobs created",
+        &stats,
+        "total-jobs",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_job_timeouts_total",
+        "Total job timeouts",
+        &stats,
+        "job-timeouts",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_connections_total",
+        "Total connections",
+        &stats,
+        "total-connections",
+    );
 
     // Command counters (labeled)
     let cmd_keys = [
-        "cmd-put", "cmd-peek", "cmd-peek-ready", "cmd-peek-delayed", "cmd-peek-buried",
-        "cmd-reserve", "cmd-reserve-with-timeout", "cmd-reserve-mode",
-        "cmd-delete", "cmd-release", "cmd-bury", "cmd-kick", "cmd-touch",
-        "cmd-use", "cmd-watch", "cmd-ignore",
-        "cmd-stats", "cmd-stats-job", "cmd-stats-tube",
-        "cmd-list-tubes", "cmd-list-tube-used", "cmd-list-tubes-watched",
+        "cmd-put",
+        "cmd-peek",
+        "cmd-peek-ready",
+        "cmd-peek-delayed",
+        "cmd-peek-buried",
+        "cmd-reserve",
+        "cmd-reserve-with-timeout",
+        "cmd-reserve-mode",
+        "cmd-delete",
+        "cmd-release",
+        "cmd-bury",
+        "cmd-kick",
+        "cmd-touch",
+        "cmd-use",
+        "cmd-watch",
+        "cmd-ignore",
+        "cmd-stats",
+        "cmd-stats-job",
+        "cmd-stats-tube",
+        "cmd-list-tubes",
+        "cmd-list-tube-used",
+        "cmd-list-tubes-watched",
         "cmd-pause-tube",
     ];
 
@@ -153,10 +253,34 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
             if let Ok(tube_yaml) = client.stats_tube(name).await {
                 let ts = parse_yaml_map(&tube_yaml);
                 let t = name;
-                tube_metric(&mut out, "tuber_tube_ready_jobs", t, &ts, "current-jobs-ready");
-                tube_metric(&mut out, "tuber_tube_delayed_jobs", t, &ts, "current-jobs-delayed");
-                tube_metric(&mut out, "tuber_tube_buried_jobs", t, &ts, "current-jobs-buried");
-                tube_metric(&mut out, "tuber_tube_reserved_jobs", t, &ts, "current-jobs-reserved");
+                tube_metric(
+                    &mut out,
+                    "tuber_tube_ready_jobs",
+                    t,
+                    &ts,
+                    "current-jobs-ready",
+                );
+                tube_metric(
+                    &mut out,
+                    "tuber_tube_delayed_jobs",
+                    t,
+                    &ts,
+                    "current-jobs-delayed",
+                );
+                tube_metric(
+                    &mut out,
+                    "tuber_tube_buried_jobs",
+                    t,
+                    &ts,
+                    "current-jobs-buried",
+                );
+                tube_metric(
+                    &mut out,
+                    "tuber_tube_reserved_jobs",
+                    t,
+                    &ts,
+                    "current-jobs-reserved",
+                );
                 tube_metric(&mut out, "tuber_tube_waiting", t, &ts, "current-waiting");
                 tube_metric(&mut out, "tuber_tube_jobs_total", t, &ts, "total-jobs");
                 tube_metric(&mut out, "tuber_tube_deletes_total", t, &ts, "cmd-delete");
@@ -170,13 +294,17 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
 
 fn prom_gauge(out: &mut String, name: &str, help: &str, stats: &HashMap<&str, &str>, key: &str) {
     if let Some(val) = stats.get(key) {
-        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n\n"));
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n\n"
+        ));
     }
 }
 
 fn prom_counter(out: &mut String, name: &str, help: &str, stats: &HashMap<&str, &str>, key: &str) {
     if let Some(val) = stats.get(key) {
-        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {val}\n\n"));
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {val}\n\n"
+        ));
     }
 }
 

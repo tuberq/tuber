@@ -121,9 +121,14 @@ async fn main() {
             tracing_subscriber::fmt().with_max_level(level).init();
             tracing::info!("tuber listening on {listen}:{port}");
 
-            if let Err(e) =
-                tuber::server::run(&listen, port, max_job_size, binlog_dir.as_deref(), metrics_port)
-                    .await
+            if let Err(e) = tuber::server::run(
+                &listen,
+                port,
+                max_job_size,
+                binlog_dir.as_deref(),
+                metrics_port,
+            )
+            .await
             {
                 tracing::error!("server error: {e}");
                 std::process::exit(1);
@@ -138,8 +143,7 @@ async fn main() {
             idp,
             addr,
         } => {
-            if let Err(e) =
-                tuber::cmd_put::run(&addr, &tube, priority, delay, ttr, body, idp).await
+            if let Err(e) = tuber::cmd_put::run(&addr, &tube, priority, delay, ttr, body, idp).await
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);

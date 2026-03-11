@@ -1745,10 +1745,22 @@ async fn test_stats_tube_processing_reserve_delete() {
 
     c.mustsend("stats-tube default\r\n").await;
     let body = c.read_ok_body().await;
-    assert!(body.contains("total-reserves: 1"), "total-reserves missing: {}", body);
-    assert!(body.contains("processing-time-samples: 1"), "processing-time-samples missing: {}", body);
+    assert!(
+        body.contains("total-reserves: 1"),
+        "total-reserves missing: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-samples: 1"),
+        "processing-time-samples missing: {}",
+        body
+    );
     // EWMA should be non-zero (job was reserved for some duration)
-    assert!(!body.contains("processing-time-ewma: 0.000000"), "ewma should be non-zero: {}", body);
+    assert!(
+        !body.contains("processing-time-ewma: 0.000000"),
+        "ewma should be non-zero: {}",
+        body
+    );
 }
 
 #[tokio::test]
@@ -1766,9 +1778,21 @@ async fn test_stats_tube_delete_ready_no_ewma() {
 
     c.mustsend("stats-tube default\r\n").await;
     let body = c.read_ok_body().await;
-    assert!(body.contains("total-reserves: 0"), "total-reserves should be 0: {}", body);
-    assert!(body.contains("processing-time-samples: 0"), "samples should be 0: {}", body);
-    assert!(body.contains("processing-time-ewma: 0.000000"), "ewma should be 0: {}", body);
+    assert!(
+        body.contains("total-reserves: 0"),
+        "total-reserves should be 0: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-samples: 0"),
+        "samples should be 0: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-ewma: 0.000000"),
+        "ewma should be 0: {}",
+        body
+    );
 }
 
 #[tokio::test]
@@ -1791,9 +1815,17 @@ async fn test_stats_tube_bury_counter() {
 
     c.mustsend("stats-tube default\r\n").await;
     let body = c.read_ok_body().await;
-    assert!(body.contains("total-buries: 1"), "total-buries missing: {}", body);
+    assert!(
+        body.contains("total-buries: 1"),
+        "total-buries missing: {}",
+        body
+    );
     // EWMA unchanged (bury doesn't count as successful completion)
-    assert!(body.contains("processing-time-samples: 0"), "samples should be 0 after bury: {}", body);
+    assert!(
+        body.contains("processing-time-samples: 0"),
+        "samples should be 0 after bury: {}",
+        body
+    );
 }
 
 #[tokio::test]
@@ -1812,7 +1844,11 @@ async fn test_stats_job_time_reserved() {
 
     c.mustsend("stats-job 1\r\n").await;
     let body = c.read_ok_body().await;
-    assert!(body.contains("time-reserved: 0"), "time-reserved missing: {}", body);
+    assert!(
+        body.contains("time-reserved: 0"),
+        "time-reserved missing: {}",
+        body
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,7 +2098,11 @@ async fn test_group_stats_job_fields() {
     c.mustsend("stats-job 1\r\n").await;
     let body = c.read_ok_body().await;
     assert!(body.contains("group: mygrp"), "group missing: {}", body);
-    assert!(body.contains("after-group: othergrp"), "after-group missing: {}", body);
+    assert!(
+        body.contains("after-group: othergrp"),
+        "after-group missing: {}",
+        body
+    );
 }
 
 // ---------------------------------------------------------------------------

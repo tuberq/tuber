@@ -1,4 +1,4 @@
-use crate::client::{TuberClient, ReserveResult};
+use crate::client::{ReserveResult, TuberClient};
 use std::io;
 use tokio::process::Command;
 use tokio::signal;
