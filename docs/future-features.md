@@ -5,12 +5,12 @@ Ideas sourced from open issues and pain points in the original [beanstalkd](http
 ## Feature Requests from Original Project
 
 - **`flush-tube`** ([#25](https://github.com/beanstalkd/beanstalkd/issues/25)) — atomically drain all jobs (ready, delayed, buried) from a tube. Responds `FLUSHED <count>\r\n`
-- **List existing jobs** ([#45](https://github.com/beanstalkd/beanstalkd/issues/45)) — enumerate jobs in a tube
+- **`list-jobs <tube> [state]`** ([#45](https://github.com/beanstalkd/beanstalkd/issues/45)) — enumerate jobs in a tube, optionally filtered by state (ready, delayed, buried, reserved). Replaces the limited `peek-buried` / `peek-ready` / `peek-delayed` which only return one job each
 - **Bulk job retrieval** ([#427](https://github.com/beanstalkd/beanstalkd/issues/427)) — reserve/peek multiple jobs at once
-- **Reserve by ID / put with ID** ([#379](https://github.com/beanstalkd/beanstalkd/issues/379)) — custom job identifiers
+- ~~**Reserve by ID / put with ID** ([#379](https://github.com/beanstalkd/beanstalkd/issues/379))~~ — superseded by `idp:` keys, which give clients a correlation identifier without needing to control internal job IDs
 - ~~**Wait command** ([#560](https://github.com/beanstalkd/beanstalkd/issues/560))~~ — superseded by `aft:` groups, which achieve the same thing without blocking a connection
-- **Tube size limits** ([#56](https://github.com/beanstalkd/beanstalkd/issues/56)) — cap the number of jobs per tube
-- **Tube latency / oldest job age** ([#37](https://github.com/beanstalkd/beanstalkd/issues/37)) — better observability
+- ~~**Tube size limits** ([#56](https://github.com/beanstalkd/beanstalkd/issues/56))~~ — requires tube configuration, which conflicts with ephemeral tube design
+- **Tube latency / oldest job age** ([#37](https://github.com/beanstalkd/beanstalkd/issues/37)) — add to `stats-tube` output and Prometheus metrics. Data already available from job creation timestamps
 
 ## beanstalkd-rs Extensions
 
@@ -53,10 +53,25 @@ put 100 0 60 14 idp:my-key grp:batch-42 aft:batch-a\r\n
 
 **Server state:** `HashMap<String, GroupState>` tracking pending count and waiting jobs.
 
+**Feature interactions:** All four optional parameters are independent — no special-case logic for any combination.
+
+| Feature | Phase | Question it answers |
+|---------|-------|-------------------|
+| `idp:` | put time | "Does this job already exist?" |
+| `grp:` | delete time | "Decrement group counter" |
+| `aft:` | state transition | "Is my group done yet?" |
+| `con:` | reserve time | "Is this resource available?" |
+
+They compose freely. For example, `grp:batch-1 con:grumpy-api` means three jobs in a group will process sequentially through the grumpy API — the `aft:` job fires when all three are deleted. Each feature just does its own bookkeeping at its own phase.
+
+**Immutability:** All prefix keys (`idp:`, `grp:`, `aft:`, `con:`) are set at creation and cannot be changed on `release`. Priority and delay remain the only mutable operational knobs.
+
+**Key constraints:** All key values (`idp:`, `grp:`, `aft:`, `con:`) follow the same rules as tube names: 1-200 characters, same valid character set.
+
 **Design decisions:**
 
 - Group is implicitly created on first tagged `put`
-- If `aft:<id>` is used with no existing children (pending == 0), the job fires immediately
+- If `aft:<id>` is used with no existing children (pending == 0), the job fires immediately. To build DAG structure before adding children, use `delay` on the `aft:` job to hold it while children are added
 - Multiple `after` jobs per group are allowed
 - Buried jobs block group completion (buried = something went wrong, don't run cleanup)
 - Adding more jobs to a group after an `after` job is allowed — counter just increments
