@@ -1,6 +1,6 @@
 # tuber
 
-An experiemental, simple, fast work queue — a Rust rewrite of [beanstalkd](https://github.com/beanstalkd/beanstalkd). Wire-compatible with existing beanstalkd clients.
+An experimental, simple, fast work queue — a Rust rewrite of [beanstalkd](https://github.com/beanstalkd/beanstalkd). Wire-compatible with existing beanstalkd clients.
 
 ## Quick Start
 
