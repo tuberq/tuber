@@ -225,6 +225,60 @@ tuber stats
 tuber stats -t emails
 ```
 
+## Shell Jobs
+
+Tuber's `work` command reserves jobs and executes each job body as a shell command. Combined with `put`, this gives you a simple distributed task runner from the command line.
+
+```bash
+# Start a server and two workers
+tuber server &
+tuber work -j 2 &
+
+# Queue some work
+tuber put "echo 'hello world'"
+tuber put "curl -s https://example.com/api/webhook -d '{\"event\": \"done\"}'"
+```
+
+### Preventing duplicate work with idempotency keys
+
+Use `-i` to ensure a job is only queued once. If a live job with the same key already exists, tuber returns the original job ID instead of creating a duplicate.
+
+```bash
+# Transcode a video — safe to retry without double-processing
+tuber put -i "transcode-video-42" "ffmpeg -i /data/video-42.raw -c:v libx264 /data/video-42.mp4"
+
+# Generate a nightly report — re-running the script won't queue it twice
+tuber put -i "report-2026-03-12" "./generate-report.sh 2026-03-12"
+```
+
+### Serialising work with concurrency keys
+
+Use `-c` to ensure only one job with a given key is processed at a time. Other jobs sharing the key wait in the queue until the current one finishes.
+
+```bash
+# Deploy to each host — one deploy per host at a time, but different hosts in parallel
+tuber put -c "deploy-web1" "./deploy.sh web1"
+tuber put -c "deploy-web1" "./deploy.sh web1"  # waits for the first to finish
+tuber put -c "deploy-web2" "./deploy.sh web2"  # runs in parallel with web1
+
+# Crawl pages from a site without hammering it — serialise per-domain
+tuber put -c "example.com" "curl -o /data/page1.html https://example.com/page1"
+tuber put -c "example.com" "curl -o /data/page2.html https://example.com/page2"
+tuber put -c "other.com"   "curl -o /data/index.html https://other.com/"
+```
+
+### Chaining pipelines with groups
+
+Use `-g` to group related jobs and `--aft` to hold a follow-up until the group completes.
+
+```bash
+# Import rows in parallel, then send a summary when all are done
+tuber put -g import "./import-row.sh 1"
+tuber put -g import "./import-row.sh 2"
+tuber put -g import "./import-row.sh 3"
+tuber put --aft import "./send-import-summary.sh"
+```
+
 ## Protocol Reference
 
 Tuber speaks the [beanstalkd protocol](https://github.com/beanstalkd/beanstalkd/blob/master/doc/protocol.txt), so any beanstalkd client library works out of the box. Commands marked with **⚡** are tuber extensions beyond standard beanstalkd.
