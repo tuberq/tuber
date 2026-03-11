@@ -2717,3 +2717,153 @@ async fn test_reserve_mode_switch() {
     c.ckresp("RESERVED 1 1\r\n").await;
     c.ckresp("a\r\n").await;
 }
+
+// ---------------------------------------------------------------------------
+// Reserve-with-timeout: real waiting behavior
+// ---------------------------------------------------------------------------
+
+/// Waiter blocks, then receives a job when one is put.
+#[tokio::test]
+async fn test_reserve_timeout_waiter_wakes_on_put() {
+    let srv = TestServer::start().await;
+    let mut consumer = srv.connect().await;
+    let mut producer = srv.connect().await;
+
+    // Consumer starts waiting (3s timeout — plenty of room)
+    consumer.mustsend("reserve-with-timeout 3\r\n").await;
+
+    // Small delay to ensure the consumer is registered as a waiter
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Producer puts a job — should wake the consumer
+    producer.mustsend("put 0 0 60 5\r\n").await;
+    producer.mustsend("hello\r\n").await;
+    producer.ckresp("INSERTED 1\r\n").await;
+
+    // Consumer should receive the job (not TIMED_OUT)
+    consumer.ckresp("RESERVED 1 5\r\n").await;
+    consumer.ckresp("hello\r\n").await;
+}
+
+/// Waiter times out when no job arrives.
+#[tokio::test]
+async fn test_reserve_timeout_expires() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let start = tokio::time::Instant::now();
+    c.mustsend("reserve-with-timeout 1\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+    let elapsed = start.elapsed();
+
+    // Should have waited ~1s, not returned instantly
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "timed out too fast: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "timed out too slow: {:?}",
+        elapsed
+    );
+}
+
+/// Multiple waiters: first-come-first-served when a job arrives.
+#[tokio::test]
+async fn test_reserve_timeout_multiple_waiters() {
+    let srv = TestServer::start().await;
+    let mut c1 = srv.connect().await;
+    let mut c2 = srv.connect().await;
+    let mut prod = srv.connect().await;
+
+    // Both consumers start waiting
+    c1.mustsend("reserve-with-timeout 5\r\n").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c2.mustsend("reserve-with-timeout 5\r\n").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Put two jobs back-to-back — each waiter should get one
+    prod.mustsend("put 0 0 60 3\r\n").await;
+    prod.mustsend("one\r\n").await;
+    prod.ckresp("INSERTED 1\r\n").await;
+    prod.mustsend("put 0 0 60 3\r\n").await;
+    prod.mustsend("two\r\n").await;
+    prod.ckresp("INSERTED 2\r\n").await;
+
+    c1.ckresp("RESERVED 1 3\r\n").await;
+    c1.ckresp("one\r\n").await;
+
+    c2.ckresp("RESERVED 2 3\r\n").await;
+    c2.ckresp("two\r\n").await;
+}
+
+/// Waiter on a specific tube gets woken only by jobs on that tube.
+#[tokio::test]
+async fn test_reserve_timeout_tube_specific() {
+    let srv = TestServer::start().await;
+    let mut consumer = srv.connect().await;
+    let mut producer = srv.connect().await;
+
+    // Consumer watches only "jobs" tube, ignores default
+    consumer.mustsend("watch jobs\r\n").await;
+    consumer.ckresp("WATCHING 2\r\n").await;
+    consumer.mustsend("ignore default\r\n").await;
+    consumer.ckresp("WATCHING 1\r\n").await;
+    consumer.mustsend("reserve-with-timeout 2\r\n").await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Put on default tube — should NOT wake the consumer
+    producer.mustsend("put 0 0 60 5\r\n").await;
+    producer.mustsend("wrong\r\n").await;
+    producer.ckresp("INSERTED 1\r\n").await;
+
+    // Verify consumer is still waiting (no response yet)
+    let no_response = tokio::time::timeout(
+        Duration::from_millis(300),
+        consumer.readline(),
+    )
+    .await;
+    assert!(no_response.is_err(), "consumer should still be waiting");
+
+    // Put on "jobs" tube — should wake the consumer
+    producer.mustsend("use jobs\r\n").await;
+    producer.ckresp("USING jobs\r\n").await;
+    producer.mustsend("put 0 0 60 5\r\n").await;
+    producer.mustsend("right\r\n").await;
+    producer.ckresp("INSERTED 2\r\n").await;
+
+    consumer.ckresp("RESERVED 2 5\r\n").await;
+    consumer.ckresp("right\r\n").await;
+}
+
+/// Delayed job becomes ready while waiter is blocking — waiter should receive it.
+#[tokio::test]
+async fn test_reserve_timeout_delayed_job_wakes_waiter() {
+    let srv = TestServer::start().await;
+    let mut consumer = srv.connect().await;
+    let mut producer = srv.connect().await;
+
+    // Consumer starts waiting
+    consumer.mustsend("reserve-with-timeout 3\r\n").await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Producer puts a job with 1s delay
+    producer.mustsend("put 0 1 60 7\r\n").await;
+    producer.mustsend("delayed\r\n").await;
+    producer.ckresp("INSERTED 1\r\n").await;
+
+    // Consumer should get it after ~1s when the delay expires
+    let start = tokio::time::Instant::now();
+    consumer.ckresp("RESERVED 1 7\r\n").await;
+    consumer.ckresp("delayed\r\n").await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "got delayed job too fast: {:?}",
+        elapsed
+    );
+}

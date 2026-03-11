@@ -1835,50 +1835,56 @@ impl ServerState {
     fn process_queue(&mut self) {
         let now = Instant::now();
 
-        // First pass: collect indices of timed-out and fulfillable waiters
+        // First pass: collect indices of timed-out waiters
         let mut timed_out_indices = Vec::new();
-        let mut fulfill_indices = Vec::new();
 
         for (i, waiter) in self.waiters.iter().enumerate() {
             if let Some(deadline) = waiter.deadline
                 && now >= deadline
             {
                 timed_out_indices.push(i);
-                continue;
-            }
-            // Check if there's a ready job for this connection
-            if self.find_ready_job_for_conn_inner(waiter.conn_id).is_some() {
-                fulfill_indices.push(i);
             }
         }
 
-        // Remove from back to front to preserve indices
-        let mut all_remove: Vec<usize> = timed_out_indices
-            .iter()
-            .chain(fulfill_indices.iter())
-            .cloned()
-            .collect();
-        all_remove.sort_unstable();
-        all_remove.dedup();
-
-        let mut removed: Vec<(WaitingReserve, bool)> = Vec::new(); // (waiter, should_fulfill)
-        for &i in all_remove.iter().rev() {
-            let waiter = self.waiters.remove(i);
-            let should_fulfill = fulfill_indices.contains(&i);
-            removed.push((waiter, should_fulfill));
+        // Remove timed-out waiters from back to front
+        let mut timed_out = Vec::new();
+        for &i in timed_out_indices.iter().rev() {
+            timed_out.push(self.waiters.remove(i));
         }
-        removed.reverse();
 
-        for (waiter, should_fulfill) in removed {
-            if should_fulfill {
-                if let Some(job_id) = self.find_ready_job_for_conn_inner(waiter.conn_id) {
-                    let resp = self.do_reserve(waiter.conn_id, job_id);
-                    let _ = waiter.reply_tx.send(resp);
-                } else {
-                    let _ = waiter.reply_tx.send(Response::TimedOut);
-                }
+        for waiter in timed_out {
+            if self.conn_deadline_soon(waiter.conn_id) {
+                let _ = waiter.reply_tx.send(Response::DeadlineSoon);
             } else {
                 let _ = waiter.reply_tx.send(Response::TimedOut);
+            }
+        }
+
+        // Second pass: try to fulfill remaining waiters one at a time.
+        // Each successful reserve changes the ready queue, so we re-check
+        // from the start after each fulfillment.
+        loop {
+            let mut fulfilled_idx = None;
+            for (i, waiter) in self.waiters.iter().enumerate() {
+                if self.find_ready_job_for_conn_inner(waiter.conn_id).is_some() {
+                    fulfilled_idx = Some(i);
+                    break;
+                }
+            }
+
+            match fulfilled_idx {
+                Some(i) => {
+                    let waiter = self.waiters.remove(i);
+                    if let Some(job_id) = self.find_ready_job_for_conn_inner(waiter.conn_id) {
+                        let resp = self.do_reserve(waiter.conn_id, job_id);
+                        let _ = waiter.reply_tx.send(resp);
+                    } else {
+                        // Job was grabbed between check and reserve; re-queue the waiter
+                        self.waiters.insert(i, waiter);
+                        break;
+                    }
+                }
+                None => break,
             }
         }
     }
