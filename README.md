@@ -18,6 +18,76 @@ echo -e "job1\njob2\njob3" | tuber put
 tuber stats
 ```
 
+## Features
+
+All the great hits from beanstalkd, plus:
+
+### Weighted Reserve
+
+By default, `reserve` picks the highest-priority job across all watched tubes (FIFO). Switch to weighted mode and each tube is chosen randomly in proportion to its weight:
+
+```text
+watch email
+watch notifications 2
+watch another-tube 6
+reserve-mode weighted
+reserve
+```
+
+Tubes default to weight 1. Here, `another-tube` is selected 3x as often as `notifications` and 6x as often as `email`.
+
+### Idempotent Jobs
+
+Attach an idempotency key to a `put` to prevent duplicate jobs. If a live job with the same key already exists in the tube, the original job ID is returned instead of creating a new one:
+
+```text
+put 100 0 30 5 idp:my-key
+<body>
+→ INSERTED 1
+
+put 100 0 30 5 idp:my-key
+<body>
+→ INSERTED 1   (same ID, no duplicate created)
+```
+
+The key is scoped to the tube and cleared when the job is deleted, so the same key can be reused afterwards.
+
+### Job Groups
+
+Group related jobs together with `grp:` and chain dependent work with `aft:`. After-jobs are held until every job in the group they depend on has been deleted:
+
+```text
+put 0 0 30 11 grp:import
+import-row-1
+put 0 0 30 11 grp:import
+import-row-2
+put 0 0 60 14 aft:import
+send-summary
+```
+
+The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish.
+
+### Concurrency Keys
+
+Limit parallel processing of related jobs. When a job with a `con:` key is reserved, other ready jobs sharing the same key are hidden from `reserve` until the reservation ends (via delete, release, bury, TTR timeout, or disconnect):
+
+```text
+put 0 0 30 7 con:user-42
+payload1
+put 0 0 30 7 con:user-42
+payload2
+```
+
+Only one `con:user-42` job can be reserved at a time, ensuring serial processing per key.
+
+### Prometheus Metrics
+
+Expose a `/metrics` endpoint for Prometheus scraping:
+
+```bash
+tuber server -l 0.0.0.0 -p 11300 -V --metrics-port 9100
+```
+
 ## Server
 
 ```bash
