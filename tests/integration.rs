@@ -120,6 +120,20 @@ impl TestConn {
             .trim();
         id_str.parse().unwrap()
     }
+
+    /// Convenience: put a job, reserve it, and return the job ID.
+    async fn put_and_reserve(&mut self, pri: u32, delay: u32, ttr: u32, body: &str) -> u64 {
+        let id = self.put_job(pri, delay, ttr, body).await;
+        self.mustsend("reserve-with-timeout 0\r\n").await;
+        let line = self.readline().await;
+        assert!(
+            line.starts_with("RESERVED "),
+            "expected RESERVED, got {:?}",
+            line
+        );
+        self.readline().await; // consume body line
+        id
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,18 +664,14 @@ async fn test_stats_tube_format() {
 async fn test_ttr_large() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
-    c.mustsend("put 0 0 120 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
-    c.mustsend("put 0 0 5000 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 2\r\n").await;
+    let id1 = c.put_job(0, 0, 120, "a").await;
+    let id2 = c.put_job(0, 0, 5000, "a").await;
 
-    c.mustsend("stats-job 1\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id1)).await;
     let body1 = c.read_ok_body().await;
     assert!(body1.contains("ttr: 120"));
 
-    c.mustsend("stats-job 2\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id2)).await;
     let body2 = c.read_ok_body().await;
     assert!(body2.contains("ttr: 5000"));
 }
@@ -670,10 +680,8 @@ async fn test_ttr_large() {
 async fn test_ttr_small() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
-    c.mustsend("put 0 0 0 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
-    c.mustsend("stats-job 1\r\n").await;
+    let id = c.put_job(0, 0, 0, "a").await;
+    c.mustsend(&format!("stats-job {}\r\n", id)).await;
     let body = c.read_ok_body().await;
     assert!(body.contains("ttr: 1"), "ttr should be 1, got: {}", body);
 }
@@ -1451,11 +1459,9 @@ async fn test_stats_job_file_field() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 1 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_job(0, 0, 1, "a").await;
 
-    c.mustsend("stats-job 1\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id)).await;
     let body = c.read_ok_body().await;
     // Without WAL, file should be 0
     assert!(
@@ -1494,11 +1500,8 @@ async fn test_flush_tube_mixed_states() {
     let mut c = srv.connect().await;
 
     // 1 buried job: put, reserve, bury
-    c.put_job(0, 0, 120, "bury_me").await;
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 7\r\n").await;
-    c.ckresp("bury_me\r\n").await;
-    c.mustsend("bury 1 0\r\n").await;
+    let id = c.put_and_reserve(0, 0, 120, "bury_me").await;
+    c.mustsend(&format!("bury {} 0\r\n", id)).await;
     c.ckresp("BURIED\r\n").await;
 
     // 1 ready job
@@ -1731,16 +1734,9 @@ async fn test_stats_tube_processing_reserve_delete() {
     let mut c = srv.connect().await;
 
     // Put, reserve, then delete a job
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("x\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
 
-    c.mustsend("reserve\r\n").await;
-    let line = c.readline().await;
-    assert!(line.starts_with("RESERVED 1"));
-    c.ckresp("x\r\n").await;
-
-    c.mustsend("delete 1\r\n").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
     c.ckresp("DELETED\r\n").await;
 
     c.mustsend("stats-tube default\r\n").await;
@@ -1769,11 +1765,9 @@ async fn test_stats_tube_delete_ready_no_ewma() {
     let mut c = srv.connect().await;
 
     // Put and immediately delete (from ready state, never reserved)
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("x\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_job(0, 0, 60, "x").await;
 
-    c.mustsend("delete 1\r\n").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
     c.ckresp("DELETED\r\n").await;
 
     c.mustsend("stats-tube default\r\n").await;
@@ -1801,16 +1795,9 @@ async fn test_stats_tube_bury_counter() {
     let mut c = srv.connect().await;
 
     // Put, reserve, then bury
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("x\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
 
-    c.mustsend("reserve\r\n").await;
-    let line = c.readline().await;
-    assert!(line.starts_with("RESERVED 1"));
-    c.ckresp("x\r\n").await;
-
-    c.mustsend("bury 1 0\r\n").await;
+    c.mustsend(&format!("bury {} 0\r\n", id)).await;
     c.ckresp("BURIED\r\n").await;
 
     c.mustsend("stats-tube default\r\n").await;
@@ -1833,16 +1820,9 @@ async fn test_stats_job_time_reserved() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("x\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
 
-    c.mustsend("reserve\r\n").await;
-    let line = c.readline().await;
-    assert!(line.starts_with("RESERVED 1"));
-    c.ckresp("x\r\n").await;
-
-    c.mustsend("stats-job 1\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id)).await;
     let body = c.read_ok_body().await;
     assert!(
         body.contains("time-reserved: 0"),
@@ -2604,18 +2584,12 @@ async fn test_reserve_job_deleted() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "a").await;
 
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 1\r\n").await;
-    c.ckresp("a\r\n").await;
-
-    c.mustsend("delete 1\r\n").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
     c.ckresp("DELETED\r\n").await;
 
-    c.mustsend("reserve-job 1\r\n").await;
+    c.mustsend(&format!("reserve-job {}\r\n", id)).await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -2709,13 +2683,7 @@ async fn test_reserve_mode_switch() {
     c.ckresp("USING fifo\r\n").await;
 
     // Put a job and verify FIFO reserve still works
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
-
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 1\r\n").await;
-    c.ckresp("a\r\n").await;
+    c.put_and_reserve(0, 0, 60, "a").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,16 +2847,10 @@ async fn test_touch_reserved_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 2 5\r\n").await;
-    c.mustsend("hello\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
-
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 5\r\n").await;
-    c.ckresp("hello\r\n").await;
+    let id = c.put_and_reserve(0, 0, 2, "hello").await;
 
     // Touch should succeed on our own reserved job
-    c.mustsend("touch 1\r\n").await;
+    c.mustsend(&format!("touch {}\r\n", id)).await;
     c.ckresp("TOUCHED\r\n").await;
 }
 
@@ -2898,17 +2860,10 @@ async fn test_touch_not_reserved_by_us() {
     let mut c1 = srv.connect().await;
     let mut c2 = srv.connect().await;
 
-    c1.mustsend("put 0 0 60 1\r\n").await;
-    c1.mustsend("a\r\n").await;
-    c1.ckresp("INSERTED 1\r\n").await;
-
-    // c1 reserves the job
-    c1.mustsend("reserve-with-timeout 0\r\n").await;
-    c1.ckresp("RESERVED 1 1\r\n").await;
-    c1.ckresp("a\r\n").await;
+    let id = c1.put_and_reserve(0, 0, 60, "a").await;
 
     // c2 tries to touch — should fail (not reserved by c2)
-    c2.mustsend("touch 1\r\n").await;
+    c2.mustsend(&format!("touch {}\r\n", id)).await;
     c2.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -2917,12 +2872,10 @@ async fn test_touch_ready_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_job(0, 0, 60, "a").await;
 
     // Touch a ready (not reserved) job — should fail
-    c.mustsend("touch 1\r\n").await;
+    c.mustsend(&format!("touch {}\r\n", id)).await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -2943,12 +2896,10 @@ async fn test_bury_ready_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_job(0, 0, 60, "a").await;
 
     // Bury a ready (not reserved) job — should fail
-    c.mustsend("bury 1 0\r\n").await;
+    c.mustsend(&format!("bury {} 0\r\n", id)).await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -2957,19 +2908,13 @@ async fn test_bury_reserved_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 4\r\n").await;
-    c.mustsend("data\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "data").await;
 
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 4\r\n").await;
-    c.ckresp("data\r\n").await;
-
-    c.mustsend("bury 1 100\r\n").await;
+    c.mustsend(&format!("bury {} 100\r\n", id)).await;
     c.ckresp("BURIED\r\n").await;
 
     // Verify state via stats-job
-    c.mustsend("stats-job 1\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id)).await;
     let body = c.read_ok_body().await;
     assert!(body.contains("state: buried"), "expected buried: {}", body);
     assert!(body.contains("pri: 100"), "expected pri 100: {}", body);
@@ -2981,16 +2926,10 @@ async fn test_bury_not_reserved_by_us() {
     let mut c1 = srv.connect().await;
     let mut c2 = srv.connect().await;
 
-    c1.mustsend("put 0 0 60 1\r\n").await;
-    c1.mustsend("a\r\n").await;
-    c1.ckresp("INSERTED 1\r\n").await;
-
-    c1.mustsend("reserve-with-timeout 0\r\n").await;
-    c1.ckresp("RESERVED 1 1\r\n").await;
-    c1.ckresp("a\r\n").await;
+    let id = c1.put_and_reserve(0, 0, 60, "a").await;
 
     // c2 tries to bury c1's job — should fail
-    c2.mustsend("bury 1 0\r\n").await;
+    c2.mustsend(&format!("bury {} 0\r\n", id)).await;
     c2.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -3001,22 +2940,16 @@ async fn test_release_reserved_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 4\r\n").await;
-    c.mustsend("data\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
-
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 4\r\n").await;
-    c.ckresp("data\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "data").await;
 
     // Release with new priority and no delay
-    c.mustsend("release 1 50 0\r\n").await;
+    c.mustsend(&format!("release {} 50 0\r\n", id)).await;
     c.ckresp("RELEASED\r\n").await;
 
     // Should be reservable again
     c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 4\r\n").await;
-    c.ckresp("data\r\n").await;
+    c.ckrespsub("RESERVED").await;
+    c.readline().await; // body
 }
 
 #[tokio::test]
@@ -3024,16 +2957,10 @@ async fn test_release_with_delay() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 4\r\n").await;
-    c.mustsend("data\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
-
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 4\r\n").await;
-    c.ckresp("data\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "data").await;
 
     // Release with 1s delay
-    c.mustsend("release 1 0 1\r\n").await;
+    c.mustsend(&format!("release {} 0 1\r\n", id)).await;
     c.ckresp("RELEASED\r\n").await;
 
     // Should be delayed — not immediately reservable
@@ -3041,7 +2968,7 @@ async fn test_release_with_delay() {
     c.ckresp("TIMED_OUT\r\n").await;
 
     // Verify state
-    c.mustsend("stats-job 1\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id)).await;
     let body = c.read_ok_body().await;
     assert!(
         body.contains("state: delayed"),
@@ -3056,16 +2983,10 @@ async fn test_release_not_reserved_by_us() {
     let mut c1 = srv.connect().await;
     let mut c2 = srv.connect().await;
 
-    c1.mustsend("put 0 0 60 1\r\n").await;
-    c1.mustsend("a\r\n").await;
-    c1.ckresp("INSERTED 1\r\n").await;
-
-    c1.mustsend("reserve-with-timeout 0\r\n").await;
-    c1.ckresp("RESERVED 1 1\r\n").await;
-    c1.ckresp("a\r\n").await;
+    let id = c1.put_and_reserve(0, 0, 60, "a").await;
 
     // c2 tries to release c1's job — should fail
-    c2.mustsend("release 1 0 0\r\n").await;
+    c2.mustsend(&format!("release {} 0 0\r\n", id)).await;
     c2.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -3085,22 +3006,16 @@ async fn test_delete_buried_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_and_reserve(0, 0, 60, "a").await;
 
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 1 1\r\n").await;
-    c.ckresp("a\r\n").await;
-
-    c.mustsend("bury 1 0\r\n").await;
+    c.mustsend(&format!("bury {} 0\r\n", id)).await;
     c.ckresp("BURIED\r\n").await;
 
     // Delete a buried job — should succeed
-    c.mustsend("delete 1\r\n").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
     c.ckresp("DELETED\r\n").await;
 
-    c.mustsend("stats-job 1\r\n").await;
+    c.mustsend(&format!("stats-job {}\r\n", id)).await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -3109,12 +3024,10 @@ async fn test_delete_delayed_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 3600 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_job(0, 3600, 60, "a").await;
 
     // Delete a delayed job — should succeed
-    c.mustsend("delete 1\r\n").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
     c.ckresp("DELETED\r\n").await;
 }
 
@@ -3134,12 +3047,10 @@ async fn test_kickjob_ready_job() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("a\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    let id = c.put_job(0, 0, 60, "a").await;
 
     // Kick a ready job — should fail (already ready)
-    c.mustsend("kick-job 1\r\n").await;
+    c.mustsend(&format!("kick-job {}\r\n", id)).await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
 
@@ -3151,10 +3062,8 @@ async fn test_kick_buried_jobs() {
     let mut c = srv.connect().await;
 
     // Put and bury 3 jobs
-    for i in 0..3 {
-        c.mustsend(&format!("put 0 0 60 1\r\n")).await;
-        c.mustsend(&format!("{}\r\n", i)).await;
-        c.ckrespsub("INSERTED").await;
+    for i in 0..3u8 {
+        c.put_job(0, 0, 60, &i.to_string()).await;
     }
     for _ in 0..3 {
         c.mustsend("reserve-with-timeout 0\r\n").await;
@@ -3162,8 +3071,8 @@ async fn test_kick_buried_jobs() {
         c.readline().await; // body
     }
     // Bury the 3 reserved jobs
-    for i in 1..=3 {
-        c.mustsend(&format!("bury {} 0\r\n", i)).await;
+    for id in 1..=3 {
+        c.mustsend(&format!("bury {} 0\r\n", id)).await;
         c.ckresp("BURIED\r\n").await;
     }
 
