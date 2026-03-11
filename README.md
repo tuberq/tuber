@@ -146,6 +146,9 @@ tuber put [OPTIONS] [BODY]
 | `-d`, `--delay` | `0` | Delay in seconds before job becomes ready |
 | `--ttr` | `60` | Time-to-run in seconds |
 | `-i`, `--idp` | — | Idempotency key (prevents duplicate jobs) |
+| `-g`, `--grp` | — | Group name (for job grouping) |
+| `--aft` | — | After-group dependency (wait for this group to complete) |
+| `-c`, `--con` | — | Concurrency key (only one job with this key runs at a time) |
 | `-a`, `--addr` | `localhost:11300` | Server address |
 
 ```bash
@@ -154,6 +157,14 @@ tuber put -t emails --pri 100 "send welcome email"
 
 # Pipe jobs from a file
 cat jobs.txt | tuber put -t batch
+
+# Put a job with a concurrency key
+tuber put -c deploy "deploy-service-a"
+
+# Put grouped jobs with a dependent follow-up
+tuber put -g import "import-row-1"
+tuber put -g import "import-row-2"
+tuber put --aft import "send-summary"
 ```
 
 ## Work

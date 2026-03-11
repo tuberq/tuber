@@ -46,10 +46,22 @@ impl TuberClient {
         ttr: u32,
         body: &[u8],
         idempotency_key: Option<&str>,
+        group: Option<&str>,
+        after_group: Option<&str>,
+        concurrency_key: Option<&str>,
     ) -> io::Result<String> {
         let mut cmd = format!("put {} {} {} {}", pri, delay, ttr, body.len());
         if let Some(key) = idempotency_key {
             cmd.push_str(&format!(" idp:{key}"));
+        }
+        if let Some(key) = group {
+            cmd.push_str(&format!(" grp:{key}"));
+        }
+        if let Some(key) = after_group {
+            cmd.push_str(&format!(" aft:{key}"));
+        }
+        if let Some(key) = concurrency_key {
+            cmd.push_str(&format!(" con:{key}"));
         }
         cmd.push_str("\r\n");
         self.writer.write_all(cmd.as_bytes()).await?;

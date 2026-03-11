@@ -10,6 +10,9 @@ pub async fn run(
     ttr: u32,
     body: Option<String>,
     idempotency_key: Option<String>,
+    group: Option<String>,
+    after_group: Option<String>,
+    concurrency_key: Option<String>,
 ) -> io::Result<()> {
     let mut client = TuberClient::connect(addr).await?;
 
@@ -21,10 +24,13 @@ pub async fn run(
     }
 
     let idp = idempotency_key.as_deref();
+    let grp = group.as_deref();
+    let aft = after_group.as_deref();
+    let con = concurrency_key.as_deref();
 
     if let Some(body) = body {
         let resp = client
-            .put(priority, delay, ttr, body.as_bytes(), idp)
+            .put(priority, delay, ttr, body.as_bytes(), idp, grp, aft, con)
             .await?;
         println!("{resp}");
     } else {
@@ -35,7 +41,7 @@ pub async fn run(
                 continue;
             }
             let resp = client
-                .put(priority, delay, ttr, line.as_bytes(), idp)
+                .put(priority, delay, ttr, line.as_bytes(), idp, grp, aft, con)
                 .await?;
             println!("{resp}");
         }

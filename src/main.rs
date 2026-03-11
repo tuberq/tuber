@@ -61,6 +61,18 @@ enum Commands {
         #[arg(short = 'i', long)]
         idp: Option<String>,
 
+        /// Group name (for job grouping)
+        #[arg(short = 'g', long)]
+        grp: Option<String>,
+
+        /// After-group dependency (wait for this group to complete)
+        #[arg(long)]
+        aft: Option<String>,
+
+        /// Concurrency key (only one job with this key runs at a time)
+        #[arg(short = 'c', long)]
+        con: Option<String>,
+
         /// Server address (host:port)
         #[arg(short = 'a', long, default_value = "localhost:11300")]
         addr: String,
@@ -141,9 +153,14 @@ async fn main() {
             delay,
             ttr,
             idp,
+            grp,
+            aft,
+            con,
             addr,
         } => {
-            if let Err(e) = tuber::cmd_put::run(&addr, &tube, priority, delay, ttr, body, idp).await
+            if let Err(e) =
+                tuber::cmd_put::run(&addr, &tube, priority, delay, ttr, body, idp, grp, aft, con)
+                    .await
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
