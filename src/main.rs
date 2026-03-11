@@ -77,6 +77,13 @@ enum Commands {
         addr: String,
     },
 
+    /// List all tubes with job counts
+    Tubes {
+        /// Server address (host:port)
+        #[arg(short = 'a', long, default_value = "localhost:11300")]
+        addr: String,
+    },
+
     /// Worker mode - reserve and execute jobs as shell commands
     Work {
         /// Tube to watch
@@ -140,6 +147,12 @@ async fn main() {
         }
         Commands::Stats { tube, addr } => {
             if let Err(e) = tuber::cmd_stats::run(&addr, tube).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Tubes { addr } => {
+            if let Err(e) = tuber::cmd_tubes::run(&addr).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }

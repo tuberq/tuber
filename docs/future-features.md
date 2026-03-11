@@ -143,6 +143,14 @@ Expose a `/metrics` HTTP endpoint in standard Prometheus text format for dashboa
 
 **Alternative considered:** sidecar exporter that connects via the text protocol and scrapes `stats`/`stats-tube`. Zero server changes but an extra process to deploy. Built-in is better for a greenfield Rust implementation.
 
+### WAL Fsync Mode
+
+Configurable disk sync strategy for the write-ahead log, trading durability against throughput. Beanstalkd's original `-f` flag controlled fsync frequency. Options to consider:
+
+- **`-f 0`** — fsync after every write (maximum durability, slowest)
+- **`-f <ms>`** — fsync periodically on a timer (default, balances safety and speed)
+- **No fsync** — rely on OS page cache (fastest, risk of data loss on crash)
+
 ## Known Pain Points (C version) That Rust Helps With
 
 - **Monotonic time** ([#166](https://github.com/beanstalkd/beanstalkd/issues/166)) — `tokio::time::Instant` avoids DST/clock-skew issues
