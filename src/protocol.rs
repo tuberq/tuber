@@ -5,31 +5,80 @@ const NAME_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01
 /// Commands parsed from the beanstalkd text protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    Put { pri: u32, delay: u32, ttr: u32, bytes: u32 },
-    Use { tube: String },
+    Put {
+        pri: u32,
+        delay: u32,
+        ttr: u32,
+        bytes: u32,
+        idempotency_key: Option<String>,
+        group: Option<String>,
+        after_group: Option<String>,
+        concurrency_key: Option<String>,
+    },
+    Use {
+        tube: String,
+    },
     Reserve,
-    ReserveWithTimeout { timeout: u32 },
-    ReserveJob { id: u64 },
-    ReserveMode { mode: String },
-    Delete { id: u64 },
-    Release { id: u64, pri: u32, delay: u32 },
-    Bury { id: u64, pri: u32 },
-    Touch { id: u64 },
-    Watch { tube: String, weight: u32 },
-    Ignore { tube: String },
-    Peek { id: u64 },
+    ReserveWithTimeout {
+        timeout: u32,
+    },
+    ReserveJob {
+        id: u64,
+    },
+    ReserveMode {
+        mode: String,
+    },
+    Delete {
+        id: u64,
+    },
+    Release {
+        id: u64,
+        pri: u32,
+        delay: u32,
+    },
+    Bury {
+        id: u64,
+        pri: u32,
+    },
+    Touch {
+        id: u64,
+    },
+    Watch {
+        tube: String,
+        weight: u32,
+    },
+    Ignore {
+        tube: String,
+    },
+    Peek {
+        id: u64,
+    },
     PeekReady,
     PeekDelayed,
     PeekBuried,
-    Kick { bound: u32 },
-    KickJob { id: u64 },
-    StatsJob { id: u64 },
-    StatsTube { tube: String },
+    Kick {
+        bound: u32,
+    },
+    KickJob {
+        id: u64,
+    },
+    StatsJob {
+        id: u64,
+    },
+    StatsTube {
+        tube: String,
+    },
     Stats,
     ListTubes,
     ListTubeUsed,
     ListTubesWatched,
-    PauseTube { tube: String, delay: u32 },
+    PauseTube {
+        tube: String,
+        delay: u32,
+    },
+    FlushTube {
+        tube: String,
+    },
     Quit,
 }
 
@@ -54,6 +103,7 @@ pub enum Response {
     NotIgnored,
     Ok(Vec<u8>),
     Paused,
+    Flushed(u32),
     OutOfMemory,
     InternalError,
     Draining,
@@ -100,6 +150,7 @@ impl Response {
                 out
             }
             Response::Paused => b"PAUSED\r\n".to_vec(),
+            Response::Flushed(n) => format!("FLUSHED {n}\r\n").into_bytes(),
             Response::OutOfMemory => b"OUT_OF_MEMORY\r\n".to_vec(),
             Response::InternalError => b"INTERNAL_ERROR\r\n".to_vec(),
             Response::Draining => b"DRAINING\r\n".to_vec(),
@@ -140,7 +191,9 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
     } else if line == "peek-buried" {
         Ok(Command::PeekBuried)
     } else if let Some(rest) = line.strip_prefix("reserve-mode ") {
-        Ok(Command::ReserveMode { mode: rest.to_string() })
+        Ok(Command::ReserveMode {
+            mode: rest.to_string(),
+        })
     } else if let Some(rest) = line.strip_prefix("reserve-with-timeout ") {
         parse_reserve_with_timeout(rest)
     } else if let Some(rest) = line.strip_prefix("reserve-job ") {
@@ -181,6 +234,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         Ok(Command::Quit)
     } else if line.starts_with("pause-tube") {
         parse_pause_tube(line.strip_prefix("pause-tube").unwrap())
+    } else if let Some(rest) = line.strip_prefix("flush-tube ") {
+        parse_flush_tube(rest)
     } else {
         Err(Response::UnknownCommand)
     }
@@ -202,16 +257,61 @@ fn parse_u32(s: &str) -> Result<u32, Response> {
     s.parse().map_err(|_| Response::BadFormat)
 }
 
+fn is_valid_key(s: &str) -> bool {
+    is_valid_tube_name(s)
+}
+
 fn parse_put(rest: &str) -> Result<Command, Response> {
     let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() != 4 {
+    if parts.len() < 4 {
         return Err(Response::BadFormat);
     }
     let pri = parts[0].parse::<u32>().map_err(|_| Response::BadFormat)?;
     let delay = parts[1].parse::<u32>().map_err(|_| Response::BadFormat)?;
     let ttr = parts[2].parse::<u32>().map_err(|_| Response::BadFormat)?;
     let bytes = parts[3].parse::<u32>().map_err(|_| Response::BadFormat)?;
-    Ok(Command::Put { pri, delay, ttr, bytes })
+
+    let mut idempotency_key = None;
+    let mut group = None;
+    let mut after_group = None;
+    let mut concurrency_key = None;
+
+    for part in &parts[4..] {
+        if let Some(val) = part.strip_prefix("idp:") {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            idempotency_key = Some(val.to_string());
+        } else if let Some(val) = part.strip_prefix("grp:") {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            group = Some(val.to_string());
+        } else if let Some(val) = part.strip_prefix("aft:") {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            after_group = Some(val.to_string());
+        } else if let Some(val) = part.strip_prefix("con:") {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            concurrency_key = Some(val.to_string());
+        } else {
+            return Err(Response::BadFormat);
+        }
+    }
+
+    Ok(Command::Put {
+        pri,
+        delay,
+        ttr,
+        bytes,
+        idempotency_key,
+        group,
+        after_group,
+        concurrency_key,
+    })
 }
 
 fn parse_peek(rest: &str) -> Result<Command, Response> {
@@ -252,7 +352,9 @@ fn parse_use(rest: &str) -> Result<Command, Response> {
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
-    Ok(Command::Use { tube: name.to_string() })
+    Ok(Command::Use {
+        tube: name.to_string(),
+    })
 }
 
 fn parse_watch(rest: &str) -> Result<Command, Response> {
@@ -273,7 +375,10 @@ fn parse_watch(rest: &str) -> Result<Command, Response> {
     } else {
         1
     };
-    Ok(Command::Watch { tube: name.to_string(), weight })
+    Ok(Command::Watch {
+        tube: name.to_string(),
+        weight,
+    })
 }
 
 fn parse_ignore(rest: &str) -> Result<Command, Response> {
@@ -281,7 +386,9 @@ fn parse_ignore(rest: &str) -> Result<Command, Response> {
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
-    Ok(Command::Ignore { tube: name.to_string() })
+    Ok(Command::Ignore {
+        tube: name.to_string(),
+    })
 }
 
 fn parse_stats_tube(rest: &str) -> Result<Command, Response> {
@@ -289,7 +396,19 @@ fn parse_stats_tube(rest: &str) -> Result<Command, Response> {
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
-    Ok(Command::StatsTube { tube: name.to_string() })
+    Ok(Command::StatsTube {
+        tube: name.to_string(),
+    })
+}
+
+fn parse_flush_tube(rest: &str) -> Result<Command, Response> {
+    let name = rest.trim();
+    if !is_valid_tube_name(name) {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::FlushTube {
+        tube: name.to_string(),
+    })
 }
 
 fn parse_pause_tube(rest: &str) -> Result<Command, Response> {
@@ -302,19 +421,98 @@ fn parse_pause_tube(rest: &str) -> Result<Command, Response> {
         return Err(Response::BadFormat);
     }
     let delay = parts[1].parse::<u32>().map_err(|_| Response::BadFormat)?;
-    Ok(Command::PauseTube { tube: name.to_string(), delay })
+    Ok(Command::PauseTube {
+        tube: name.to_string(),
+        delay,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn put_cmd(pri: u32, delay: u32, ttr: u32, bytes: u32) -> Command {
+        Command::Put {
+            pri,
+            delay,
+            ttr,
+            bytes,
+            idempotency_key: None,
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        }
+    }
+
     #[test]
     fn test_parse_put() {
+        assert_eq!(parse_command("put 0 0 10 5").unwrap(), put_cmd(0, 0, 10, 5));
+    }
+
+    #[test]
+    fn test_parse_put_with_idempotency_key() {
         assert_eq!(
-            parse_command("put 0 0 10 5").unwrap(),
-            Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 5 }
+            parse_command("put 0 0 10 5 idp:abc123").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: Some("abc123".into()),
+                group: None,
+                after_group: None,
+                concurrency_key: None,
+            }
         );
+    }
+
+    #[test]
+    fn test_parse_put_with_all_extensions() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 idp:k1 grp:g1 aft:g0 con:c1").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: Some("k1".into()),
+                group: Some("g1".into()),
+                after_group: Some("g0".into()),
+                concurrency_key: Some("c1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_extensions_order_independent() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 con:c1 idp:k1").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: Some("k1".into()),
+                group: None,
+                after_group: None,
+                concurrency_key: Some("c1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_unknown_tag_rejected() {
+        assert!(parse_command("put 0 0 10 5 foo:bar").is_err());
+    }
+
+    #[test]
+    fn test_parse_put_invalid_key_rejected() {
+        // Leading dash is invalid
+        assert!(parse_command("put 0 0 10 5 idp:-bad").is_err());
+        // Empty value
+        assert!(parse_command("put 0 0 10 5 idp:").is_err());
+        // Space in value (would be split into separate parts, unknown tag)
+        assert!(parse_command("put 0 0 10 5 idp:has space").is_err());
     }
 
     #[test]
@@ -350,7 +548,11 @@ mod tests {
     fn test_parse_release() {
         assert_eq!(
             parse_command("release 123 0 0").unwrap(),
-            Command::Release { id: 123, pri: 0, delay: 0 }
+            Command::Release {
+                id: 123,
+                pri: 0,
+                delay: 0
+            }
         );
     }
 
@@ -374,7 +576,10 @@ mod tests {
     fn test_parse_watch() {
         assert_eq!(
             parse_command("watch foo").unwrap(),
-            Command::Watch { tube: "foo".into(), weight: 1 }
+            Command::Watch {
+                tube: "foo".into(),
+                weight: 1
+            }
         );
     }
 
@@ -382,7 +587,10 @@ mod tests {
     fn test_parse_watch_with_weight() {
         assert_eq!(
             parse_command("watch foo 5").unwrap(),
-            Command::Watch { tube: "foo".into(), weight: 5 }
+            Command::Watch {
+                tube: "foo".into(),
+                weight: 5
+            }
         );
     }
 
@@ -456,19 +664,28 @@ mod tests {
 
     #[test]
     fn test_parse_list_tube_used() {
-        assert_eq!(parse_command("list-tube-used").unwrap(), Command::ListTubeUsed);
+        assert_eq!(
+            parse_command("list-tube-used").unwrap(),
+            Command::ListTubeUsed
+        );
     }
 
     #[test]
     fn test_parse_list_tubes_watched() {
-        assert_eq!(parse_command("list-tubes-watched").unwrap(), Command::ListTubesWatched);
+        assert_eq!(
+            parse_command("list-tubes-watched").unwrap(),
+            Command::ListTubesWatched
+        );
     }
 
     #[test]
     fn test_parse_pause_tube() {
         assert_eq!(
             parse_command("pause-tube foo 60").unwrap(),
-            Command::PauseTube { tube: "foo".into(), delay: 60 }
+            Command::PauseTube {
+                tube: "foo".into(),
+                delay: 60
+            }
         );
     }
 
@@ -476,8 +693,24 @@ mod tests {
     fn test_parse_reserve_mode() {
         assert_eq!(
             parse_command("reserve-mode weighted").unwrap(),
-            Command::ReserveMode { mode: "weighted".into() }
+            Command::ReserveMode {
+                mode: "weighted".into()
+            }
         );
+    }
+
+    #[test]
+    fn test_parse_flush_tube() {
+        assert_eq!(
+            parse_command("flush-tube foo").unwrap(),
+            Command::FlushTube { tube: "foo".into() }
+        );
+    }
+
+    #[test]
+    fn test_parse_flush_tube_bad_name() {
+        assert!(parse_command("flush-tube -bad").is_err());
+        assert!(parse_command("flush-tube").is_err());
     }
 
     #[test]

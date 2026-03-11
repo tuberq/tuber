@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::heap::IndexHeap;
@@ -28,6 +28,7 @@ pub struct Tube {
     pub buried: VecDeque<u64>,
     pub waiting_conns: Vec<u64>,
     pub stat: TubeStats,
+    pub idempotency_keys: HashMap<String, u64>,
     pub using_ct: u32,
     pub watching_ct: u32,
     pub pause: Duration,
@@ -42,6 +43,7 @@ impl Tube {
             delay: IndexHeap::new(),
             buried: VecDeque::new(),
             waiting_conns: Vec::new(),
+            idempotency_keys: HashMap::new(),
             stat: TubeStats::default(),
             using_ct: 0,
             watching_ct: 0,
@@ -76,6 +78,7 @@ impl Tube {
             && self.delay.is_empty()
             && self.buried.is_empty()
             && self.waiting_conns.is_empty()
+            && self.idempotency_keys.is_empty()
             && self.using_ct == 0
             && self.watching_ct == 0
     }

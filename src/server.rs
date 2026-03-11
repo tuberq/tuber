@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -10,6 +11,7 @@ use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{Job, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, Response};
 use crate::tube::Tube;
+use crate::wal::Wal;
 
 /// Message from a connection task to the engine.
 struct EngineMsg {
@@ -52,20 +54,80 @@ struct ServerState {
     tubes: HashMap<String, Tube>,
     conns: HashMap<u64, ConnState>,
     next_job_id: u64,
+    #[allow(dead_code)]
     next_conn_id: u64,
     max_job_size: u32,
     drain_mode: bool,
     ready_ct: u64,
     started_at: Instant,
+    rng_state: u64,
     stats: GlobalStats,
     /// Connections waiting for a job via reserve.
     waiters: Vec<WaitingReserve>,
+    /// Optional write-ahead log for persistence.
+    wal: Option<Wal>,
+    /// Hex-encoded random instance ID (16 chars).
+    instance_id: String,
+    /// Cached system info from uname.
+    hostname: String,
+    os: String,
+    platform: String,
 }
 
 impl ServerState {
     fn new(max_job_size: u32) -> Self {
         let mut tubes = HashMap::new();
         tubes.insert("default".to_string(), Tube::new("default"));
+
+        // Generate instance_id from /dev/urandom (fallback: pid + timestamp)
+        let instance_id = {
+            let mut bytes = [0u8; 8];
+            let got_random = std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+                .is_ok();
+            if !got_random {
+                let pid = std::process::id() as u64;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                bytes[..8].copy_from_slice(&(pid ^ ts).to_le_bytes());
+            }
+            let mut hex = String::with_capacity(16);
+            for b in &bytes {
+                use std::fmt::Write;
+                let _ = write!(hex, "{:02x}", b);
+            }
+            hex
+        };
+
+        // Cache system info from uname
+        let (hostname, os, platform) = {
+            let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::uname(&mut utsname) };
+            if ret == 0 {
+                let to_string = |arr: &[libc::c_char]| {
+                    unsafe { std::ffi::CStr::from_ptr(arr.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                (
+                    to_string(&utsname.nodename),
+                    format!(
+                        "{} {}",
+                        to_string(&utsname.sysname),
+                        to_string(&utsname.release)
+                    ),
+                    to_string(&utsname.machine),
+                )
+            } else {
+                (
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                )
+            }
+        };
 
         ServerState {
             jobs: HashMap::new(),
@@ -77,11 +139,18 @@ impl ServerState {
             drain_mode: false,
             ready_ct: 0,
             started_at: Instant::now(),
+            rng_state: 0,
             stats: GlobalStats::default(),
             waiters: Vec::new(),
+            wal: None,
+            instance_id,
+            hostname,
+            os,
+            platform,
         }
     }
 
+    #[allow(dead_code)]
     fn register_conn(&mut self) -> u64 {
         let id = self.next_conn_id;
         self.next_conn_id += 1;
@@ -145,12 +214,7 @@ impl ServerState {
         true
     }
 
-    fn handle_command(
-        &mut self,
-        conn_id: u64,
-        cmd: Command,
-        body: Option<Vec<u8>>,
-    ) -> Response {
+    fn handle_command(&mut self, conn_id: u64, cmd: Command, body: Option<Vec<u8>>) -> Response {
         // Auto-register connection if not known
         if !self.conns.contains_key(&conn_id) {
             self.conns.insert(conn_id, ConnState::new(conn_id));
@@ -163,20 +227,34 @@ impl ServerState {
         }
 
         match cmd {
-            Command::Put { pri, delay, ttr, bytes } => {
-                self.cmd_put(conn_id, pri, delay, ttr, bytes, body)
-            }
+            Command::Put {
+                pri,
+                delay,
+                ttr,
+                bytes,
+                idempotency_key,
+                group,
+                after_group,
+                concurrency_key,
+            } => self.cmd_put(
+                conn_id,
+                pri,
+                delay,
+                ttr,
+                bytes,
+                body,
+                idempotency_key,
+                group,
+                after_group,
+                concurrency_key,
+            ),
             Command::Use { tube } => self.cmd_use(conn_id, &tube),
             Command::Reserve => self.cmd_reserve(conn_id, None),
-            Command::ReserveWithTimeout { timeout } => {
-                self.cmd_reserve(conn_id, Some(timeout))
-            }
+            Command::ReserveWithTimeout { timeout } => self.cmd_reserve(conn_id, Some(timeout)),
             Command::ReserveJob { id } => self.cmd_reserve_job(conn_id, id),
             Command::ReserveMode { mode } => self.cmd_reserve_mode(conn_id, &mode),
             Command::Delete { id } => self.cmd_delete(conn_id, id),
-            Command::Release { id, pri, delay } => {
-                self.cmd_release(conn_id, id, pri, delay)
-            }
+            Command::Release { id, pri, delay } => self.cmd_release(conn_id, id, pri, delay),
             Command::Bury { id, pri } => self.cmd_bury(conn_id, id, pri),
             Command::Touch { id } => self.cmd_touch(conn_id, id),
             Command::Watch { tube, weight } => self.cmd_watch(conn_id, &tube, weight),
@@ -194,12 +272,14 @@ impl ServerState {
             Command::ListTubeUsed => self.cmd_list_tube_used(conn_id),
             Command::ListTubesWatched => self.cmd_list_tubes_watched(conn_id),
             Command::PauseTube { tube, delay } => self.cmd_pause_tube(&tube, delay),
+            Command::FlushTube { tube } => self.cmd_flush_tube(&tube),
             Command::Quit => Response::Deleted, // handled at connection level
         }
     }
 
     // --- Command implementations ---
 
+    #[allow(clippy::too_many_arguments)]
     fn cmd_put(
         &mut self,
         conn_id: u64,
@@ -208,6 +288,10 @@ impl ServerState {
         ttr: u32,
         _bytes: u32,
         body: Option<Vec<u8>>,
+        idempotency_key: Option<String>,
+        group: Option<String>,
+        after_group: Option<String>,
+        concurrency_key: Option<String>,
     ) -> Response {
         if self.drain_mode {
             return Response::Draining;
@@ -226,11 +310,38 @@ impl ServerState {
         // Minimum TTR is 1 second
         let ttr = ttr.max(1);
 
-        let tube_name = self.conns.get(&conn_id)
+        let tube_name = self
+            .conns
+            .get(&conn_id)
             .map(|c| c.use_tube.clone())
             .unwrap_or_else(|| "default".to_string());
 
         self.ensure_tube(&tube_name);
+
+        // Idempotency dedup: if key already exists for a live job, return original ID
+        if let Some(ref key) = idempotency_key
+            && let Some(tube) = self.tubes.get(&tube_name)
+            && let Some(&existing_id) = tube.idempotency_keys.get(key)
+            && self.jobs.contains_key(&existing_id)
+        {
+            return Response::Inserted(existing_id);
+        }
+
+        // WAL: check space reservation
+        if let Some(wal) = &self.wal {
+            // Estimate record size for reservation check
+            let est_size = crate::wal::estimate_full_job_size_raw(
+                &tube_name,
+                body.len(),
+                &idempotency_key,
+                &group,
+                &after_group,
+                &concurrency_key,
+            );
+            if !wal.reserve_put(est_size) {
+                return Response::OutOfMemory;
+            }
+        }
 
         let id = self.next_job_id;
         self.next_job_id += 1;
@@ -245,6 +356,22 @@ impl ServerState {
         );
 
         self.jobs.insert(id, job);
+
+        // Set extension fields
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.idempotency_key = idempotency_key;
+            job.group = group;
+            job.after_group = after_group;
+            job.concurrency_key = concurrency_key;
+        }
+
+        // Register idempotency key in tube index
+        if let Some(job) = self.jobs.get(&id)
+            && let Some(ref key) = job.idempotency_key
+            && let Some(tube) = self.tubes.get_mut(&tube_name)
+        {
+            tube.idempotency_keys.insert(key.clone(), id);
+        }
 
         // Enqueue
         if delay > 0 {
@@ -276,6 +403,9 @@ impl ServerState {
         if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.stat.total_jobs_ct += 1;
         }
+
+        // WAL: write put record
+        self.wal_write_put(id);
 
         self.process_queue();
 
@@ -409,8 +539,16 @@ impl ServerState {
     }
 
     fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64) -> Response {
-        let ttr = self.jobs.get(&job_id).map(|j| j.ttr).unwrap_or(Duration::from_secs(1));
-        let body = self.jobs.get(&job_id).map(|j| j.body.clone()).unwrap_or_default();
+        let ttr = self
+            .jobs
+            .get(&job_id)
+            .map(|j| j.ttr)
+            .unwrap_or(Duration::from_secs(1));
+        let body = self
+            .jobs
+            .get(&job_id)
+            .map(|j| j.body.clone())
+            .unwrap_or_default();
 
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.state = JobState::Reserved;
@@ -504,18 +642,111 @@ impl ServerState {
             tube.stat.total_delete_ct += 1;
         }
         self.stats.total_delete_ct += 1;
+
+        // Remove idempotency key from tube index
+        if let Some(job) = self.jobs.get(&id)
+            && let Some(ref key) = job.idempotency_key
+            && let Some(tube) = self.tubes.get_mut(&tube_name)
+        {
+            tube.idempotency_keys.remove(key);
+        }
+
+        // WAL: write delete state change
+        self.wal_write_state_change(id, None, 0, Duration::ZERO);
+
         self.jobs.remove(&id);
 
         Response::Deleted
     }
 
-    fn cmd_release(
-        &mut self,
-        conn_id: u64,
-        id: u64,
-        pri: u32,
-        delay: u32,
-    ) -> Response {
+    fn cmd_flush_tube(&mut self, tube_name: &str) -> Response {
+        let tube = match self.tubes.get(tube_name) {
+            Some(t) => t,
+            None => return Response::NotFound,
+        };
+
+        // Collect all job IDs from ready, delay, and buried queues
+        let mut job_ids: Vec<u64> = Vec::new();
+        job_ids.extend(tube.ready.ids());
+        job_ids.extend(tube.delay.ids());
+        job_ids.extend(tube.buried.iter());
+
+        // Find reserved jobs belonging to this tube
+        let reserved_ids: Vec<u64> = self
+            .jobs
+            .values()
+            .filter(|j| j.tube_name == tube_name && j.state == JobState::Reserved)
+            .map(|j| j.id)
+            .collect();
+        job_ids.extend(&reserved_ids);
+
+        let count = job_ids.len() as u32;
+        if count == 0 {
+            return Response::Flushed(0);
+        }
+
+        // Track stats adjustments
+        let mut ready_removed = 0u64;
+        let mut urgent_removed = 0u64;
+        let mut buried_removed = 0u64;
+        let mut reserved_removed = 0u64;
+        // Categorize jobs by state for stats
+        for &id in &job_ids {
+            if let Some(job) = self.jobs.get(&id) {
+                match job.state {
+                    JobState::Ready => {
+                        ready_removed += 1;
+                        if job.priority < URGENT_THRESHOLD {
+                            urgent_removed += 1;
+                        }
+                    }
+                    JobState::Reserved => reserved_removed += 1,
+                    JobState::Buried => buried_removed += 1,
+                    JobState::Delayed => {}
+                }
+            }
+        }
+
+        // Remove reserved jobs from owning connections
+        for &id in &reserved_ids {
+            if let Some(job) = self.jobs.get(&id)
+                && let Some(reserver_id) = job.reserver_id
+                && let Some(conn) = self.conns.get_mut(&reserver_id)
+            {
+                conn.reserved_jobs.retain(|&jid| jid != id);
+            }
+        }
+
+        // Clear tube queues
+        let tube = self.tubes.get_mut(tube_name).unwrap();
+        tube.ready.clear();
+        tube.delay.clear();
+        tube.buried.clear();
+        tube.idempotency_keys.clear();
+
+        // Update tube stats
+        tube.stat.total_delete_ct += count as u64;
+        tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(reserved_removed);
+        tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(buried_removed);
+        tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(urgent_removed);
+
+        // Update global stats
+        self.stats.total_delete_ct += count as u64;
+        self.ready_ct = self.ready_ct.saturating_sub(ready_removed);
+        self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(urgent_removed);
+        self.stats.buried_ct = self.stats.buried_ct.saturating_sub(buried_removed);
+        self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(reserved_removed);
+
+        // WAL: write delete for each job, then remove from jobs map
+        for &id in &job_ids {
+            self.wal_write_state_change(id, None, 0, Duration::ZERO);
+            self.jobs.remove(&id);
+        }
+
+        Response::Flushed(count)
+    }
+
+    fn cmd_release(&mut self, conn_id: u64, id: u64, pri: u32, delay: u32) -> Response {
         let job = match self.jobs.get(&id) {
             Some(j) => j,
             None => return Response::NotFound,
@@ -572,6 +803,14 @@ impl ServerState {
             }
         }
 
+        // WAL: write release state change
+        let wal_state = if delay > 0 {
+            JobState::Delayed
+        } else {
+            JobState::Ready
+        };
+        self.wal_write_state_change(id, Some(wal_state), pri, Duration::from_secs(delay as u64));
+
         self.process_queue();
         Response::Released
     }
@@ -610,6 +849,9 @@ impl ServerState {
             tube.stat.buried_ct += 1;
         }
         self.stats.buried_ct += 1;
+
+        // WAL: write bury state change
+        self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO);
 
         Response::Buried
     }
@@ -670,19 +912,27 @@ impl ServerState {
 
     fn cmd_peek(&self, id: u64) -> Response {
         match self.jobs.get(&id) {
-            Some(job) => Response::Found { id, body: job.body.clone() },
+            Some(job) => Response::Found {
+                id,
+                body: job.body.clone(),
+            },
             None => Response::NotFound,
         }
     }
 
     fn cmd_peek_ready(&self, conn_id: u64) -> Response {
-        let tube_name = self.conns.get(&conn_id)
+        let tube_name = self
+            .conns
+            .get(&conn_id)
             .map(|c| c.use_tube.as_str())
             .unwrap_or("default");
         if let Some(tube) = self.tubes.get(tube_name) {
             if let Some(&(_, job_id)) = tube.ready.peek() {
                 if let Some(job) = self.jobs.get(&job_id) {
-                    return Response::Found { id: job_id, body: job.body.clone() };
+                    return Response::Found {
+                        id: job_id,
+                        body: job.body.clone(),
+                    };
                 }
             }
         }
@@ -690,13 +940,18 @@ impl ServerState {
     }
 
     fn cmd_peek_delayed(&self, conn_id: u64) -> Response {
-        let tube_name = self.conns.get(&conn_id)
+        let tube_name = self
+            .conns
+            .get(&conn_id)
             .map(|c| c.use_tube.as_str())
             .unwrap_or("default");
         if let Some(tube) = self.tubes.get(tube_name) {
             if let Some(&(_, job_id)) = tube.delay.peek() {
                 if let Some(job) = self.jobs.get(&job_id) {
-                    return Response::Found { id: job_id, body: job.body.clone() };
+                    return Response::Found {
+                        id: job_id,
+                        body: job.body.clone(),
+                    };
                 }
             }
         }
@@ -704,13 +959,18 @@ impl ServerState {
     }
 
     fn cmd_peek_buried(&self, conn_id: u64) -> Response {
-        let tube_name = self.conns.get(&conn_id)
+        let tube_name = self
+            .conns
+            .get(&conn_id)
             .map(|c| c.use_tube.as_str())
             .unwrap_or("default");
         if let Some(tube) = self.tubes.get(tube_name) {
             if let Some(&job_id) = tube.buried.front() {
                 if let Some(job) = self.jobs.get(&job_id) {
-                    return Response::Found { id: job_id, body: job.body.clone() };
+                    return Response::Found {
+                        id: job_id,
+                        body: job.body.clone(),
+                    };
                 }
             }
         }
@@ -718,14 +978,18 @@ impl ServerState {
     }
 
     fn cmd_kick(&mut self, conn_id: u64, bound: u32) -> Response {
-        let tube_name = self.conns.get(&conn_id)
+        let tube_name = self
+            .conns
+            .get(&conn_id)
             .map(|c| c.use_tube.clone())
             .unwrap_or_else(|| "default".to_string());
 
         let mut kicked = 0u32;
 
         // Kick buried first, then delayed
-        let has_buried = self.tubes.get(&tube_name)
+        let has_buried = self
+            .tubes
+            .get(&tube_name)
             .map(|t| !t.buried.is_empty())
             .unwrap_or(false);
 
@@ -764,6 +1028,8 @@ impl ServerState {
                         }
                     }
                 }
+                // WAL: write kick state change
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO);
                 kicked += 1;
             }
         } else {
@@ -797,6 +1063,8 @@ impl ServerState {
                         }
                     }
                 }
+                // WAL: write kick state change
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO);
                 kicked += 1;
             }
         }
@@ -847,6 +1115,9 @@ impl ServerState {
             }
         }
 
+        // WAL: write kick state change
+        self.wal_write_state_change(id, Some(JobState::Ready), 0, Duration::ZERO);
+
         self.process_queue();
         Response::KickedOne
     }
@@ -874,14 +1145,16 @@ impl ServerState {
         let now = Instant::now();
         let age = now.duration_since(job.created_at).as_secs() as i64;
         let time_left = match job.state {
-            JobState::Reserved | JobState::Delayed => {
-                job.deadline_at
-                    .map(|d| {
-                        if d > now { d.duration_since(now).as_secs() as i64 }
-                        else { 0 }
-                    })
-                    .unwrap_or(0)
-            }
+            JobState::Reserved | JobState::Delayed => job
+                .deadline_at
+                .map(|d| {
+                    if d > now {
+                        d.duration_since(now).as_secs() as i64
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0),
             _ => 0,
         };
 
@@ -895,12 +1168,16 @@ impl ServerState {
              delay: {}\n\
              ttr: {}\n\
              time-left: {}\n\
-             file: 0\n\
+             file: {}\n\
              reserves: {}\n\
              timeouts: {}\n\
              releases: {}\n\
              buries: {}\n\
-             kicks: {}\n",
+             kicks: {}\n\
+             idempotency-key: {}\n\
+             group: {}\n\
+             after-group: {}\n\
+             concurrency-key: {}\n",
             job.id,
             job.tube_name,
             job.state.as_str(),
@@ -909,11 +1186,16 @@ impl ServerState {
             job.delay.as_secs(),
             job.ttr.as_secs(),
             time_left,
+            job.wal_file_seq.unwrap_or(0),
             job.reserve_ct,
             job.timeout_ct,
             job.release_ct,
             job.bury_ct,
             job.kick_ct,
+            job.idempotency_key.as_deref().unwrap_or(""),
+            job.group.as_deref().unwrap_or(""),
+            job.after_group.as_deref().unwrap_or(""),
+            job.concurrency_key.as_deref().unwrap_or(""),
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -924,11 +1206,15 @@ impl ServerState {
             None => return Response::NotFound,
         };
 
-        let pause_time_left = tube.unpause_at
+        let pause_time_left = tube
+            .unpause_at
             .map(|u| {
                 let now = Instant::now();
-                if u > now { u.duration_since(now).as_secs() as i64 }
-                else { 0 }
+                if u > now {
+                    u.duration_since(now).as_secs() as i64
+                } else {
+                    0
+                }
             })
             .unwrap_or(0);
 
@@ -970,6 +1256,21 @@ impl ServerState {
         let delayed_ct: usize = self.tubes.values().map(|t| t.delay.len()).sum();
         let uptime = Instant::now().duration_since(self.started_at).as_secs();
 
+        // rusage stats
+        let (rusage_utime, rusage_stime) = {
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+            let utime = format!("{}.{:06}", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
+            let stime = format!("{}.{:06}", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
+            (utime, stime)
+        };
+
+        // WAL stats
+        let (binlog_oldest, binlog_current, binlog_max_size) = match &self.wal {
+            Some(wal) => (wal.oldest_seq(), wal.current_seq(), wal.max_file_size()),
+            None => (0, 0, 0),
+        };
+
         let yaml = format!(
             "---\n\
              current-jobs-urgent: {}\n\
@@ -1010,9 +1311,20 @@ impl ServerState {
              current-waiting: {}\n\
              total-connections: {}\n\
              pid: {}\n\
-             version: \"beanstalkd-rs 0.1.0\"\n\
+             version: \"{}\"\n\
+             rusage-utime: {}\n\
+             rusage-stime: {}\n\
              uptime: {}\n\
-             draining: {}\n",
+             binlog-oldest-index: {}\n\
+             binlog-current-index: {}\n\
+             binlog-records-migrated: 0\n\
+             binlog-records-written: 0\n\
+             binlog-max-size: {}\n\
+             draining: {}\n\
+             id: {}\n\
+             hostname: {}\n\
+             os: {}\n\
+             platform: {}\n",
             self.stats.urgent_ct,
             self.ready_ct,
             self.stats.reserved_ct,
@@ -1051,8 +1363,18 @@ impl ServerState {
             self.stats.waiting_ct,
             self.stats.total_connections,
             std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            rusage_utime,
+            rusage_stime,
             uptime,
+            binlog_oldest,
+            binlog_current,
+            binlog_max_size,
             if self.drain_mode { "true" } else { "false" },
+            self.instance_id,
+            self.hostname,
+            self.os,
+            self.platform,
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -1066,7 +1388,9 @@ impl ServerState {
     }
 
     fn cmd_list_tube_used(&self, conn_id: u64) -> Response {
-        let tube = self.conns.get(&conn_id)
+        let tube = self
+            .conns
+            .get(&conn_id)
             .map(|c| c.use_tube.clone())
             .unwrap_or_else(|| "default".to_string());
         Response::Using(tube)
@@ -1146,7 +1470,7 @@ impl ServerState {
         best.map(|(_, _, id)| id)
     }
 
-    fn select_weighted_job(&self, conn_id: u64) -> Option<u64> {
+    fn select_weighted_job(&mut self, conn_id: u64) -> Option<u64> {
         let conn = self.conns.get(&conn_id)?;
 
         // Sum weights of tubes with ready, unpaused jobs
@@ -1169,9 +1493,14 @@ impl ServerState {
             return None;
         }
 
-        // Simple deterministic selection for now (use random in production)
-        // We'll use a basic pseudo-random based on current time nanos
-        let r = (Instant::now().elapsed().subsec_nanos() as u32) % total_weight;
+        // Simple xorshift-based PRNG for weighted selection
+        self.rng_state = self.rng_state.wrapping_add(1);
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        let r = (x as u32) % total_weight;
         let mut cumulative = 0u32;
         for (job_id, weight) in &candidates {
             cumulative += weight;
@@ -1205,7 +1534,11 @@ impl ServerState {
         }
 
         // Remove from back to front to preserve indices
-        let mut all_remove: Vec<usize> = timed_out_indices.iter().chain(fulfill_indices.iter()).cloned().collect();
+        let mut all_remove: Vec<usize> = timed_out_indices
+            .iter()
+            .chain(fulfill_indices.iter())
+            .cloned()
+            .collect();
         all_remove.sort_unstable();
         all_remove.dedup();
 
@@ -1269,6 +1602,39 @@ impl ServerState {
         }
     }
 
+    // --- WAL helpers ---
+
+    fn wal_write_put(&mut self, job_id: u64) {
+        if let Some(wal) = self.wal.as_mut() {
+            // We need to temporarily take the job out to satisfy borrow checker
+            if let Some(mut job) = self.jobs.remove(&job_id) {
+                if let Err(e) = wal.write_put(&mut job) {
+                    tracing::error!("WAL write_put error: {}, disabling WAL", e);
+                    self.wal = None;
+                }
+                self.jobs.insert(job_id, job);
+            }
+        }
+    }
+
+    fn wal_write_state_change(
+        &mut self,
+        job_id: u64,
+        state: Option<JobState>,
+        pri: u32,
+        delay: Duration,
+    ) {
+        if let Some(wal) = self.wal.as_mut() {
+            if let Some(mut job) = self.jobs.remove(&job_id) {
+                if let Err(e) = wal.write_state_change(&mut job, state, pri, delay) {
+                    tracing::error!("WAL write_state_change error: {}, disabling WAL", e);
+                    self.wal = None;
+                }
+                self.jobs.insert(job_id, job);
+            }
+        }
+    }
+
     /// Tick: promote delayed jobs, expire TTR, unpause tubes.
     fn tick(&mut self) {
         let now = Instant::now();
@@ -1277,7 +1643,9 @@ impl ServerState {
         let tube_names: Vec<String> = self.tubes.keys().cloned().collect();
         for tube_name in &tube_names {
             loop {
-                let should_promote = self.tubes.get(tube_name)
+                let should_promote = self
+                    .tubes
+                    .get(tube_name)
                     .and_then(|t| t.delay.peek().map(|&((deadline, _), _)| deadline <= now))
                     .unwrap_or(false);
 
@@ -1285,7 +1653,9 @@ impl ServerState {
                     break;
                 }
 
-                let job_id = self.tubes.get_mut(tube_name)
+                let job_id = self
+                    .tubes
+                    .get_mut(tube_name)
                     .and_then(|t| t.delay.pop().map(|(_, id)| id));
 
                 if let Some(job_id) = job_id {
@@ -1326,9 +1696,11 @@ impl ServerState {
                     Some(c) => c,
                     None => continue,
                 };
-                conn.reserved_jobs.iter()
+                conn.reserved_jobs
+                    .iter()
                     .filter(|&&jid| {
-                        self.jobs.get(&jid)
+                        self.jobs
+                            .get(&jid)
                             .and_then(|j| j.deadline_at)
                             .map(|d| now >= d)
                             .unwrap_or(false)
@@ -1371,7 +1743,10 @@ impl ServerState {
         // Check waiting connection timeouts
         let now2 = Instant::now();
         // Collect indices of timed-out waiters
-        let timed_out: Vec<usize> = self.waiters.iter().enumerate()
+        let timed_out: Vec<usize> = self
+            .waiters
+            .iter()
+            .enumerate()
             .filter(|(_, w)| w.deadline.map(|d| now2 >= d).unwrap_or(false))
             .map(|(i, _)| i)
             .collect();
@@ -1393,24 +1768,165 @@ impl ServerState {
 
         // Try to fulfill remaining waiters with newly ready jobs
         self.process_queue();
+
+        // WAL maintenance (GC, sync)
+        if let Some(wal) = self.wal.as_mut() {
+            let migrate_ids = wal.maintain();
+            for job_id in migrate_ids {
+                if self.jobs.contains_key(&job_id) {
+                    // Re-write the full job record for compaction
+                    if let Some(wal) = self.wal.as_mut() {
+                        if let Some(mut job) = self.jobs.remove(&job_id) {
+                            if let Err(e) = wal.write_put(&mut job) {
+                                tracing::error!("WAL compaction write error: {}, disabling WAL", e);
+                                self.wal = None;
+                                self.jobs.insert(job_id, job);
+                                break;
+                            }
+                            self.jobs.insert(job_id, job);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restore jobs from WAL replay into server state.
+    fn restore_jobs(&mut self, jobs: HashMap<u64, Job>, next_job_id: u64) {
+        self.next_job_id = next_job_id;
+
+        for (id, job) in jobs {
+            let tube_name = job.tube_name.clone();
+            let state = job.state;
+            let pri = job.priority;
+            let idempotency_key = job.idempotency_key.clone();
+
+            self.ensure_tube(&tube_name);
+
+            match state {
+                JobState::Ready => {
+                    let key = job.ready_key();
+                    self.jobs.insert(id, job);
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.ready.insert(key, id);
+                    }
+                    self.ready_ct += 1;
+                    if pri < URGENT_THRESHOLD {
+                        self.stats.urgent_ct += 1;
+                        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                            tube.stat.urgent_ct += 1;
+                        }
+                    }
+                    self.stats.total_jobs_ct += 1;
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.stat.total_jobs_ct += 1;
+                    }
+                }
+                JobState::Delayed => {
+                    let deadline = job
+                        .deadline_at
+                        .unwrap_or_else(|| Instant::now() + job.delay);
+                    self.jobs.insert(id, job);
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.delay.insert((deadline, id), id);
+                    }
+                    self.stats.total_jobs_ct += 1;
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.stat.total_jobs_ct += 1;
+                    }
+                }
+                JobState::Buried => {
+                    self.jobs.insert(id, job);
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.buried.push_back(id);
+                        tube.stat.buried_ct += 1;
+                    }
+                    self.stats.buried_ct += 1;
+                    self.stats.total_jobs_ct += 1;
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.stat.total_jobs_ct += 1;
+                    }
+                }
+                JobState::Reserved => {
+                    // Reserved jobs replay as Ready (handled by WAL deserialization)
+                    // This shouldn't happen, but handle it gracefully
+                    let key = (pri, id);
+                    self.jobs.insert(id, job);
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.ready.insert(key, id);
+                    }
+                    self.ready_ct += 1;
+                    self.stats.total_jobs_ct += 1;
+                }
+            }
+
+            // Register idempotency key in tube index
+            if let Some(ref key) = idempotency_key
+                && let Some(tube) = self.tubes.get_mut(&tube_name)
+            {
+                tube.idempotency_keys.insert(key.clone(), id);
+            }
+        }
     }
 }
 
 /// Start the beanstalkd server.
-pub async fn run(addr: &str, port: u16, max_job_size: u32) -> io::Result<()> {
+pub async fn run(
+    addr: &str,
+    port: u16,
+    max_job_size: u32,
+    wal_dir: Option<&str>,
+    metrics_port: Option<u16>,
+) -> io::Result<()> {
     let listener = TcpListener::bind((addr, port)).await?;
     tracing::info!("listening on {}:{}", addr, port);
 
+    if let Some(mp) = metrics_port {
+        let listen_addr = listener.local_addr()?.ip();
+        let beanstalk_addr = format!("{listen_addr}:{port}");
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics::serve(listen_addr, mp, beanstalk_addr).await {
+                tracing::error!("metrics server error: {e}");
+            }
+        });
+    }
+
+    let wal_path = wal_dir.map(Path::new);
+    run_with_listener(listener, max_job_size, wal_path).await
+}
+
+pub async fn run_with_listener(
+    listener: TcpListener,
+    max_job_size: u32,
+    wal_dir: Option<&Path>,
+) -> io::Result<()> {
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
     let mut state = ServerState::new(max_job_size);
 
+    // WAL: open and replay if configured
+    if let Some(dir) = wal_dir {
+        let mut wal = Wal::open(dir, None)?;
+        let (jobs, next_id) = wal.replay()?;
+        let job_count = jobs.len();
+        state.restore_jobs(jobs, next_id);
+        state.wal = Some(wal);
+        tracing::info!("WAL: replayed {} jobs from {:?}", job_count, dir);
+    }
+
     // Engine task
-    let engine_handle = tokio::spawn(async move {
+    let _engine_handle = tokio::spawn(async move {
         let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+        let mut sigusr1 =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("failed to register SIGUSR1 handler");
 
         loop {
             tokio::select! {
-                Some(msg) = engine_rx.recv() => {
+                msg = engine_rx.recv() => {
+                    let msg = match msg {
+                        Some(m) => m,
+                        None => break, // all senders dropped
+                    };
                     match msg.payload {
                         EnginePayload::Command { cmd, body, reply_tx } => {
                             let is_reserve = matches!(cmd,
@@ -1450,6 +1966,10 @@ pub async fn run(addr: &str, port: u16, max_job_size: u32) -> io::Result<()> {
                 _ = tick_interval.tick() => {
                     state.tick();
                 }
+                _ = sigusr1.recv() => {
+                    tracing::info!("received SIGUSR1, entering drain mode");
+                    state.drain_mode = true;
+                }
                 else => break,
             }
         }
@@ -1463,7 +1983,7 @@ pub async fn run(addr: &str, port: u16, max_job_size: u32) -> io::Result<()> {
         let tx = engine_tx.clone();
 
         tokio::spawn(async move {
-            handle_connection(socket, tx).await;
+            handle_connection(socket, tx, max_job_size).await;
         });
     }
 }
@@ -1474,6 +1994,7 @@ static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     engine_tx: mpsc::Sender<EngineMsg>,
+    max_job_size: u32,
 ) {
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1483,7 +2004,7 @@ async fn handle_connection(
 
     loop {
         line_buf.clear();
-        let n = match reader.read_line(&mut line_buf).await {
+        let _n = match reader.read_line(&mut line_buf).await {
             Ok(0) => break, // EOF
             Ok(n) => n,
             Err(e) => {
@@ -1522,8 +2043,7 @@ async fn handle_connection(
                     }
                     body_buf.truncate(body_size);
 
-                    if body_size > 65535 {
-                        // Check against configured limit (TODO: get from engine)
+                    if body_size > max_job_size as usize {
                         let _ = writer.write_all(&Response::JobTooBig.serialize()).await;
                         continue;
                     }
@@ -1541,14 +2061,16 @@ async fn handle_connection(
 
         // Send to engine and await response
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = engine_tx.send(EngineMsg {
-            conn_id,
-            payload: EnginePayload::Command {
-                cmd,
-                body,
-                reply_tx,
-            },
-        }).await;
+        let _ = engine_tx
+            .send(EngineMsg {
+                conn_id,
+                payload: EnginePayload::Command {
+                    cmd,
+                    body,
+                    reply_tx,
+                },
+            })
+            .await;
 
         match reply_rx.await {
             Ok(resp) => {
@@ -1561,10 +2083,12 @@ async fn handle_connection(
     }
 
     // Disconnect
-    let _ = engine_tx.send(EngineMsg {
-        conn_id,
-        payload: EnginePayload::Disconnect,
-    }).await;
+    let _ = engine_tx
+        .send(EngineMsg {
+            conn_id,
+            payload: EnginePayload::Disconnect,
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -1579,14 +2103,25 @@ mod tests {
         state.register_conn()
     }
 
+    fn put_cmd(pri: u32, delay: u32, ttr: u32, bytes: u32) -> Command {
+        Command::Put {
+            pri,
+            delay,
+            ttr,
+            bytes,
+            idempotency_key: None,
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        }
+    }
+
     #[test]
     fn test_put_and_reserve() {
         let mut s = make_state();
         let c = register(&mut s);
 
-        let resp = s.handle_command(c, Command::Put {
-            pri: 0, delay: 0, ttr: 10, bytes: 5,
-        }, Some(b"hello".to_vec()));
+        let resp = s.handle_command(c, put_cmd(0, 0, 10, 5), Some(b"hello".to_vec()));
         assert!(matches!(resp, Response::Inserted(1)));
 
         let resp = s.handle_command(c, Command::Reserve, None);
@@ -1604,9 +2139,9 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 5, delay: 0, ttr: 10, bytes: 1 }, Some(b"a".to_vec()));
-        s.handle_command(c, Command::Put { pri: 1, delay: 0, ttr: 10, bytes: 1 }, Some(b"b".to_vec()));
-        s.handle_command(c, Command::Put { pri: 3, delay: 0, ttr: 10, bytes: 1 }, Some(b"c".to_vec()));
+        s.handle_command(c, put_cmd(5, 0, 10, 1), Some(b"a".to_vec()));
+        s.handle_command(c, put_cmd(1, 0, 10, 1), Some(b"b".to_vec()));
+        s.handle_command(c, put_cmd(3, 0, 10, 1), Some(b"c".to_vec()));
 
         // Should get priority 1 first
         let resp = s.handle_command(c, Command::Reserve, None);
@@ -1621,9 +2156,9 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 1, delay: 0, ttr: 10, bytes: 1 }, Some(b"a".to_vec()));
-        s.handle_command(c, Command::Put { pri: 1, delay: 0, ttr: 10, bytes: 1 }, Some(b"b".to_vec()));
-        s.handle_command(c, Command::Put { pri: 1, delay: 0, ttr: 10, bytes: 1 }, Some(b"c".to_vec()));
+        s.handle_command(c, put_cmd(1, 0, 10, 1), Some(b"a".to_vec()));
+        s.handle_command(c, put_cmd(1, 0, 10, 1), Some(b"b".to_vec()));
+        s.handle_command(c, put_cmd(1, 0, 10, 1), Some(b"c".to_vec()));
 
         let resp = s.handle_command(c, Command::Reserve, None);
         match resp {
@@ -1642,7 +2177,7 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
         assert!(matches!(resp, Response::Deleted));
 
@@ -1655,7 +2190,7 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         let resp = s.handle_command(c, Command::Reserve, None);
         let id = match resp {
             Response::Reserved { id, .. } => id,
@@ -1680,11 +2215,24 @@ mod tests {
         let consumer = register(&mut s);
 
         // Producer uses "emails"
-        s.handle_command(producer, Command::Use { tube: "emails".into() }, None);
-        s.handle_command(producer, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 5 }, Some(b"hello".to_vec()));
+        s.handle_command(
+            producer,
+            Command::Use {
+                tube: "emails".into(),
+            },
+            None,
+        );
+        s.handle_command(producer, put_cmd(0, 0, 10, 5), Some(b"hello".to_vec()));
 
         // Consumer watches "emails", reserve should find it
-        s.handle_command(consumer, Command::Watch { tube: "emails".into(), weight: 1 }, None);
+        s.handle_command(
+            consumer,
+            Command::Watch {
+                tube: "emails".into(),
+                weight: 1,
+            },
+            None,
+        );
         let resp = s.handle_command(consumer, Command::Reserve, None);
         match resp {
             Response::Reserved { body, .. } => assert_eq!(body, b"hello"),
@@ -1697,11 +2245,22 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 5, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        s.handle_command(c, put_cmd(5, 0, 10, 1), Some(b"x".to_vec()));
         let resp = s.handle_command(c, Command::Reserve, None);
-        let id = match resp { Response::Reserved { id, .. } => id, _ => panic!() };
+        let id = match resp {
+            Response::Reserved { id, .. } => id,
+            _ => panic!(),
+        };
 
-        let resp = s.handle_command(c, Command::Release { id, pri: 0, delay: 0 }, None);
+        let resp = s.handle_command(
+            c,
+            Command::Release {
+                id,
+                pri: 0,
+                delay: 0,
+            },
+            None,
+        );
         assert!(matches!(resp, Response::Released));
 
         // Should be back in ready with new priority
@@ -1714,9 +2273,12 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         let resp = s.handle_command(c, Command::Reserve, None);
-        let id = match resp { Response::Reserved { id, .. } => id, _ => panic!() };
+        let id = match resp {
+            Response::Reserved { id, .. } => id,
+            _ => panic!(),
+        };
 
         let resp = s.handle_command(c, Command::Touch { id }, None);
         assert!(matches!(resp, Response::Touched));
@@ -1728,7 +2290,7 @@ mod tests {
         let c = register(&mut s);
         s.drain_mode = true;
 
-        let resp = s.handle_command(c, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        let resp = s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         assert!(matches!(resp, Response::Draining));
     }
 
@@ -1737,7 +2299,7 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         s.handle_command(c, Command::Reserve, None);
 
         // Disconnect
@@ -1752,13 +2314,31 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        let resp = s.handle_command(c, Command::ReserveMode { mode: "weighted".into() }, None);
+        let resp = s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "weighted".into(),
+            },
+            None,
+        );
         assert!(matches!(resp, Response::Using(m) if m == "weighted"));
 
-        let resp = s.handle_command(c, Command::ReserveMode { mode: "fifo".into() }, None);
+        let resp = s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "fifo".into(),
+            },
+            None,
+        );
         assert!(matches!(resp, Response::Using(m) if m == "fifo"));
 
-        let resp = s.handle_command(c, Command::ReserveMode { mode: "invalid".into() }, None);
+        let resp = s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "invalid".into(),
+            },
+            None,
+        );
         assert!(matches!(resp, Response::BadFormat));
     }
 
@@ -1767,10 +2347,23 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        let resp = s.handle_command(c, Command::Watch { tube: "foo".into(), weight: 1 }, None);
+        let resp = s.handle_command(
+            c,
+            Command::Watch {
+                tube: "foo".into(),
+                weight: 1,
+            },
+            None,
+        );
         assert!(matches!(resp, Response::Watching(2)));
 
-        let resp = s.handle_command(c, Command::Ignore { tube: "default".into() }, None);
+        let resp = s.handle_command(
+            c,
+            Command::Ignore {
+                tube: "default".into(),
+            },
+            None,
+        );
         assert!(matches!(resp, Response::Watching(1)));
 
         // Can't ignore last tube
@@ -1783,7 +2376,7 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 0, delay: 0, ttr: 10, bytes: 1 }, Some(b"x".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         s.handle_command(c, Command::Reserve, None);
         s.handle_command(c, Command::Bury { id: 1, pri: 0 }, None);
 
@@ -1796,7 +2389,14 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        let resp = s.handle_command(c, Command::PauseTube { tube: "default".into(), delay: 60 }, None);
+        let resp = s.handle_command(
+            c,
+            Command::PauseTube {
+                tube: "default".into(),
+                delay: 60,
+            },
+            None,
+        );
         assert!(matches!(resp, Response::Paused));
 
         assert!(s.tubes.get("default").unwrap().is_paused());
@@ -1807,7 +2407,7 @@ mod tests {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Put { pri: 100, delay: 0, ttr: 60, bytes: 5 }, Some(b"hello".to_vec()));
+        s.handle_command(c, put_cmd(100, 0, 60, 5), Some(b"hello".to_vec()));
 
         let resp = s.handle_command(c, Command::StatsJob { id: 1 }, None);
         match resp {
@@ -1822,11 +2422,47 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_job_with_extensions() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some("mykey".into()),
+            group: Some("grp1".into()),
+            after_group: Some("grp0".into()),
+            concurrency_key: Some("con1".into()),
+        };
+        s.handle_command(c, cmd, Some(b"hello".to_vec()));
+
+        let resp = s.handle_command(c, Command::StatsJob { id: 1 }, None);
+        match resp {
+            Response::Ok(data) => {
+                let yaml = String::from_utf8(data).unwrap();
+                assert!(yaml.contains("idempotency-key: mykey"), "yaml: {}", yaml);
+                assert!(yaml.contains("group: grp1"), "yaml: {}", yaml);
+                assert!(yaml.contains("after-group: grp0"), "yaml: {}", yaml);
+                assert!(yaml.contains("concurrency-key: con1"), "yaml: {}", yaml);
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
     fn test_list_tubes() {
         let mut s = make_state();
         let c = register(&mut s);
 
-        s.handle_command(c, Command::Use { tube: "emails".into() }, None);
+        s.handle_command(
+            c,
+            Command::Use {
+                tube: "emails".into(),
+            },
+            None,
+        );
 
         let resp = s.handle_command(c, Command::ListTubes, None);
         match resp {

@@ -1,5 +1,5 @@
 [package]
-name = "beanstalkd-rs"
+name = "tuber"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,3 +9,8 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+crc32fast = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

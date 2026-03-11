@@ -66,6 +66,17 @@ impl<K: Ord + Copy> IndexHeap<K> {
         Some(self.remove_at(idx))
     }
 
+    /// Returns all IDs currently in the heap.
+    pub fn ids(&self) -> Vec<u64> {
+        self.data.iter().map(|&(_, id)| id).collect()
+    }
+
+    /// Removes all entries from the heap.
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.positions.clear();
+    }
+
     fn remove_at(&mut self, idx: usize) -> (K, u64) {
         let last = self.data.len() - 1;
         let removed = self.data[idx];
@@ -169,13 +180,13 @@ mod tests {
 
         // Should come out in priority order: 1, 2, 3
         let j = h.pop().unwrap();
-        assert_eq!(j.0 .0, 1); // priority 1
+        assert_eq!(j.0.0, 1); // priority 1
 
         let j = h.pop().unwrap();
-        assert_eq!(j.0 .0, 2); // priority 2
+        assert_eq!(j.0.0, 2); // priority 2
 
         let j = h.pop().unwrap();
-        assert_eq!(j.0 .0, 3); // priority 3
+        assert_eq!(j.0.0, 3); // priority 3
 
         assert!(h.is_empty());
     }

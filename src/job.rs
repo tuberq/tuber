@@ -1,5 +1,6 @@
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
 
 pub const MAX_TUBE_NAME_LEN: usize = 200;
 pub const URGENT_THRESHOLD: u32 = 1024;
@@ -35,6 +36,12 @@ pub struct Job {
     pub state: JobState,
     pub tube_name: String,
 
+    // Future feature extension fields
+    pub idempotency_key: Option<String>,
+    pub group: Option<String>,
+    pub after_group: Option<String>,
+    pub concurrency_key: Option<String>,
+
     pub created_at: Instant,
     /// For delayed jobs: when it becomes ready.
     /// For reserved jobs: when TTR expires.
@@ -43,12 +50,20 @@ pub struct Job {
     /// Connection ID of the reserver, if reserved.
     pub reserver_id: Option<u64>,
 
+    /// When the job was last reserved (for processing time tracking).
+    pub reserved_at: Option<Instant>,
+
     // Counters
     pub reserve_ct: u32,
     pub timeout_ct: u32,
     pub release_ct: u32,
     pub bury_ct: u32,
     pub kick_ct: u32,
+
+    // WAL persistence fields
+    pub wal_file_seq: Option<u64>,
+    pub wal_used: usize,
+    pub created_at_epoch: u64,
 }
 
 impl Job {
@@ -75,6 +90,10 @@ impl Job {
             body,
             state,
             tube_name,
+            idempotency_key: None,
+            group: None,
+            after_group: None,
+            concurrency_key: None,
             created_at: now,
             deadline_at,
             reserver_id: None,
@@ -83,6 +102,12 @@ impl Job {
             release_ct: 0,
             bury_ct: 0,
             kick_ct: 0,
+            wal_file_seq: None,
+            wal_used: 0,
+            created_at_epoch: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         }
     }
 
@@ -127,7 +152,14 @@ mod tests {
     use super::*;
 
     fn make_test_job(id: u64, pri: u32) -> Job {
-        Job::new(id, pri, Duration::ZERO, Duration::from_secs(1), vec![], "default".into())
+        Job::new(
+            id,
+            pri,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            vec![],
+            "default".into(),
+        )
     }
 
     // Mirrors cttest_job_creation
