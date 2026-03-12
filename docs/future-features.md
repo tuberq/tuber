@@ -129,6 +129,16 @@ list-jobs <tube> [ready|delayed|buried|reserved]\r\n
 
 ([#427](https://github.com/beanstalkd/beanstalkd/issues/427)) — Reserve/peek multiple jobs at once. Needs a concrete command design (e.g. `reserve-batch <count>`, `peek-batch <tube> <state> <count>`).
 
+### zstd Body Compression (Server-Side)
+
+Compress job bodies in memory and in the WAL using zstd. Decompress transparently on `reserve`/`peek`. Invisible to clients — the protocol stays plain text.
+
+- zstd is fast enough (>1 GB/s compress, >3 GB/s decompress) to add negligible latency
+- JSON/text bodies (the common case) typically compress 3–5x
+- Reduces both memory footprint and WAL disk usage
+- Skip compression for small bodies (e.g. <64 bytes) where overhead exceeds savings
+- Could be a server flag: `--compress` or `--compress-min-size <bytes>`
+
 ## Known Pain Points (C version) That Rust Helps With
 
 - **Monotonic time** ([#166](https://github.com/beanstalkd/beanstalkd/issues/166)) — `tokio::time::Instant` avoids DST/clock-skew issues

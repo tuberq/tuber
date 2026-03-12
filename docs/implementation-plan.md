@@ -192,12 +192,12 @@ Added three fields to `Job` struct:
 
 Rust-native WAL format with CRC32 checksums. No C binary compatibility.
 
-On-disk format:
-- **File header** (8 bytes): `"TWAL"` magic + version u32 LE = 1
+On-disk format (see `docs/wal-format.md` for full specification):
+- **File header** (12 bytes): `"TWAL"` magic + version u32 LE = 3 + flags u32 (reserved)
 - **FullJob record** (type 0x01): job_id + payload (priority, delay, ttr,
-  epoch, state, counters, tube name, body, extension fields) + CRC32
+  epoch, state, counters, tube name, extension fields, body) + CRC32
 - **StateChange record** (type 0x02): job_id + new_state + new_priority +
-  new_delay_nanos + CRC32 (fixed 30 bytes)
+  new_delay_nanos + expiry_epoch_secs + CRC32 (fixed 38 bytes)
 
 State encoding: Ready=0, Reserved=1, Delayed=2, Buried=3, Deleted=0xFF.
 Extension fields use `option_string` encoding (u16 len, 0 = None).

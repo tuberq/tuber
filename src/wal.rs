@@ -14,8 +14,8 @@ use crate::job::{Job, JobState};
 // --- Constants ---
 
 const WAL_MAGIC: &[u8; 4] = b"TWAL";
-const WAL_VERSION: u32 = 1;
-const HEADER_SIZE: usize = 8;
+const WAL_VERSION: u32 = 3;
+const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
 const STATE_CHANGE_PAYLOAD_LEN: u32 = 21;
@@ -160,18 +160,24 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
     payload.extend_from_slice(&(tn.len() as u16).to_le_bytes());
     payload.extend_from_slice(tn);
 
-    // body
-    payload.extend_from_slice(&(job.body.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&job.body);
-
-    // extension fields
+    // extension fields (grouped: key + its associated value)
+    // idempotency_key + ttl
     write_option_string(
         &mut payload,
         &job.idempotency_key.as_ref().map(|(k, _)| k.clone()),
     );
+    payload.extend_from_slice(
+        &job.idempotency_key
+            .as_ref()
+            .map_or(0u32, |(_, ttl)| *ttl)
+            .to_le_bytes(),
+    );
+
+    // group, after_group
     write_option_string(&mut payload, &job.group);
     write_option_string(&mut payload, &job.after_group);
-    // concurrency_key: write key string then limit u32
+
+    // concurrency_key + limit
     write_option_string(
         &mut payload,
         &job.concurrency_key.as_ref().map(|(k, _)| k.clone()),
@@ -183,13 +189,9 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
             .to_le_bytes(),
     );
 
-    // idempotency TTL
-    payload.extend_from_slice(
-        &job.idempotency_key
-            .as_ref()
-            .map_or(0u32, |(_, ttl)| *ttl)
-            .to_le_bytes(),
-    );
+    // body (last — largest variable-length field)
+    payload.extend_from_slice(&(job.body.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&job.body);
 
     // Build full record: type + job_id + payload_len + payload + crc
     let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
@@ -385,37 +387,29 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
         .map_err(|_| WalError::InvalidData)?;
     off += tube_name_len;
 
+    // Extension fields (grouped: key + associated value)
+    // idempotency_key + ttl
+    let idempotency_key_str = read_option_string(payload, &mut off)?;
+    let idempotency_ttl = read_u32!();
+    let idempotency_key = idempotency_key_str.map(|k| (k, idempotency_ttl));
+
+    // group, after_group
+    let group = read_option_string(payload, &mut off)?;
+    let after_group = read_option_string(payload, &mut off)?;
+
+    // concurrency_key + limit
+    let concurrency_key_str = read_option_string(payload, &mut off)?;
+    let concurrency_limit = read_u32!();
+    let concurrency_key = concurrency_key_str.map(|k| (k, concurrency_limit.max(1)));
+
+    // body (last — largest variable-length field)
     let body_len = read_u32!() as usize;
     if off + body_len > payload.len() {
         return Err(WalError::Truncated);
     }
     let body = payload[off..off + body_len].to_vec();
     off += body_len;
-
-    // Read option strings from the payload slice
-    let idempotency_key = read_option_string(payload, &mut off)?;
-    let group = read_option_string(payload, &mut off)?;
-    let after_group = read_option_string(payload, &mut off)?;
-    let concurrency_key_str = read_option_string(payload, &mut off)?;
-    // Read concurrency limit (u32) if present, default to 1 for backwards compat
-    let concurrency_limit = if off + 4 <= payload.len() {
-        let v = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
-        off += 4;
-        v
-    } else {
-        1
-    };
-    let concurrency_key = concurrency_key_str.map(|k| (k, concurrency_limit.max(1)));
-
-    // Read idempotency TTL (u32) if present, default to 0 for backwards compat
-    let idempotency_ttl = if off + 4 <= payload.len() {
-        let v = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
-        let _ = off + 4;
-        v
-    } else {
-        0
-    };
-    let idempotency_key = idempotency_key.map(|k| (k, idempotency_ttl));
+    let _ = off;
 
     let delay = Duration::from_nanos(delay_nanos);
     let ttr = Duration::from_nanos(ttr_nanos);
@@ -494,10 +488,11 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
 fn write_header(w: &mut impl Write) -> io::Result<()> {
     w.write_all(WAL_MAGIC)?;
     w.write_all(&WAL_VERSION.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?; // reserved flags
     Ok(())
 }
 
-fn read_header(data: &[u8]) -> Result<(), WalError> {
+fn read_header(data: &[u8]) -> Result<u32, WalError> {
     if data.len() < HEADER_SIZE {
         return Err(WalError::Truncated);
     }
@@ -508,7 +503,8 @@ fn read_header(data: &[u8]) -> Result<(), WalError> {
     if version != WAL_VERSION {
         return Err(WalError::BadVersion(version));
     }
-    Ok(())
+    let flags = u32::from_le_bytes(data[8..12].try_into().map_err(|_| WalError::Truncated)?);
+    Ok(flags)
 }
 
 // --- WAL file management ---
@@ -847,6 +843,7 @@ impl Wal {
                 tracing::warn!("WAL: bad header in {:?}: {}", path, e);
                 continue;
             }
+            // flags field read but currently unused (reserved for future features)
 
             let mut offset = HEADER_SIZE;
             while offset < data.len() {
@@ -1120,7 +1117,7 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let buf = b"XXXX\x01\x00\x00\x00";
+        let buf = b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00";
         assert!(matches!(read_header(buf), Err(WalError::BadMagic)));
     }
 
@@ -1285,6 +1282,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(WAL_MAGIC);
         buf.extend_from_slice(&99u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flags
         assert!(matches!(read_header(&buf), Err(WalError::BadVersion(99))));
     }
 
