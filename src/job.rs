@@ -37,10 +37,10 @@ pub struct Job {
     pub tube_name: String,
 
     // Future feature extension fields
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: Option<(String, u32)>,
     pub group: Option<String>,
     pub after_group: Option<String>,
-    pub concurrency_key: Option<String>,
+    pub concurrency_key: Option<(String, u32)>,
 
     pub created_at: Instant,
     /// For delayed jobs: when it becomes ready.

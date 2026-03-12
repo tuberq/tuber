@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -11,7 +11,7 @@ use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{Job, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, Response};
 use crate::tube::Tube;
-use crate::wal::Wal;
+use crate::wal::{IdpTombstone, Wal};
 
 /// Message from a connection task to the engine.
 struct EngineMsg {
@@ -105,6 +105,8 @@ struct ServerState {
     groups: HashMap<String, GroupState>,
     /// Active reservation count per concurrency key.
     concurrency_keys: HashMap<String, u32>,
+    /// Concurrency limit per key (max concurrent reservations allowed).
+    concurrency_limits: HashMap<String, u32>,
 }
 
 impl ServerState {
@@ -132,6 +134,23 @@ impl ServerState {
                 let _ = write!(hex, "{:02x}", b);
             }
             hex
+        };
+
+        // Seed PRNG from the same random bytes used for instance_id
+        let rng_seed = {
+            let mut seed_bytes = [0u8; 8];
+            let got_random = std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed_bytes))
+                .is_ok();
+            if !got_random {
+                let pid = std::process::id() as u64;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                seed_bytes = (pid ^ ts).to_le_bytes();
+            }
+            u64::from_le_bytes(seed_bytes)
         };
 
         // Cache system info from uname
@@ -172,7 +191,7 @@ impl ServerState {
             drain_mode: false,
             ready_ct: 0,
             started_at: Instant::now(),
-            rng_state: 0,
+            rng_state: rng_seed,
             stats: GlobalStats::default(),
             waiters: Vec::new(),
             wal: None,
@@ -182,6 +201,7 @@ impl ServerState {
             platform,
             groups: HashMap::new(),
             concurrency_keys: HashMap::new(),
+            concurrency_limits: HashMap::new(),
         }
     }
 
@@ -240,25 +260,31 @@ impl ServerState {
         self.jobs
             .get(&job_id)
             .and_then(|j| j.concurrency_key.as_ref())
-            .and_then(|key| self.concurrency_keys.get(key))
-            .map(|&count| count > 0)
+            .map(|(key, _limit)| {
+                let count = self.concurrency_keys.get(key).copied().unwrap_or(0);
+                let limit = self.concurrency_limits.get(key).copied().unwrap_or(1);
+                count >= limit
+            })
             .unwrap_or(false)
     }
 
-    /// Increment the concurrency counter for a job's key.
+    /// Increment the concurrency counter for a job's key and register limit.
     fn acquire_concurrency_key(&mut self, job_id: u64) {
-        if let Some(key) = self
+        if let Some((key, limit)) = self
             .jobs
             .get(&job_id)
             .and_then(|j| j.concurrency_key.clone())
         {
-            *self.concurrency_keys.entry(key).or_insert(0) += 1;
+            *self.concurrency_keys.entry(key.clone()).or_insert(0) += 1;
+            // Use max of existing and new limit (safest — never blocks more than intended)
+            let entry = self.concurrency_limits.entry(key).or_insert(0);
+            *entry = (*entry).max(limit);
         }
     }
 
     /// Decrement and clean up the concurrency counter for a job's key.
     fn release_concurrency_key(&mut self, job_id: u64) {
-        if let Some(key) = self
+        if let Some((key, _limit)) = self
             .jobs
             .get(&job_id)
             .and_then(|j| j.concurrency_key.clone())
@@ -267,6 +293,7 @@ impl ServerState {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.concurrency_keys.remove(&key);
+                self.concurrency_limits.remove(&key);
             }
         }
     }
@@ -376,10 +403,10 @@ impl ServerState {
         ttr: u32,
         _bytes: u32,
         body: Option<Vec<u8>>,
-        idempotency_key: Option<String>,
+        idempotency_key: Option<(String, u32)>,
         group: Option<String>,
         after_group: Option<String>,
-        concurrency_key: Option<String>,
+        concurrency_key: Option<(String, u32)>,
     ) -> Response {
         if self.drain_mode {
             return Response::Draining;
@@ -407,21 +434,34 @@ impl ServerState {
         self.ensure_tube(&tube_name);
 
         // Idempotency dedup: if key already exists for a live job, return original ID
-        if let Some(ref key) = idempotency_key
+        if let Some(ref key_tuple) = idempotency_key
             && let Some(tube) = self.tubes.get(&tube_name)
-            && let Some(&existing_id) = tube.idempotency_keys.get(key)
+            && let Some(&existing_id) = tube.idempotency_keys.get(&key_tuple.0)
             && self.jobs.contains_key(&existing_id)
         {
             return Response::Inserted(existing_id);
         }
 
+        // Idempotency cooldown dedup: if key is in cooldown period, return original ID
+        if let Some(ref key_tuple) = idempotency_key
+            && let Some(tube) = self.tubes.get_mut(&tube_name)
+            && let Some(&(original_id, expiry)) = tube.idempotency_cooldowns.get(&key_tuple.0)
+        {
+            if SystemTime::now() < expiry {
+                return Response::Inserted(original_id);
+            } else {
+                tube.idempotency_cooldowns.remove(&key_tuple.0);
+            }
+        }
+
         // WAL: check space reservation
         if let Some(wal) = &self.wal {
             // Estimate record size for reservation check
+            let idp_key_str = idempotency_key.as_ref().map(|(k, _)| k.clone());
             let est_size = crate::wal::estimate_full_job_size_raw(
                 &tube_name,
                 body.len(),
-                &idempotency_key,
+                &idp_key_str,
                 &group,
                 &after_group,
                 &concurrency_key,
@@ -445,7 +485,11 @@ impl ServerState {
 
         self.jobs.insert(id, job);
 
-        // Set extension fields
+        // Set extension fields and register concurrency limit
+        if let Some((ref key, limit)) = concurrency_key {
+            let entry = self.concurrency_limits.entry(key.clone()).or_insert(0);
+            *entry = (*entry).max(limit);
+        }
         if let Some(job) = self.jobs.get_mut(&id) {
             job.idempotency_key = idempotency_key;
             job.group = group;
@@ -455,10 +499,10 @@ impl ServerState {
 
         // Register idempotency key in tube index
         if let Some(job) = self.jobs.get(&id)
-            && let Some(ref key) = job.idempotency_key
+            && let Some(ref key_tuple) = job.idempotency_key
             && let Some(tube) = self.tubes.get_mut(&tube_name)
         {
-            tube.idempotency_keys.insert(key.clone(), id);
+            tube.idempotency_keys.insert(key_tuple.0.clone(), id);
         }
 
         // Track group membership
@@ -793,12 +837,24 @@ impl ServerState {
         }
         self.stats.total_delete_ct += 1;
 
-        // Remove idempotency key from tube index
+        // Remove idempotency key from tube index (with optional cooldown)
+        let mut expiry_epoch_secs: u64 = 0;
         if let Some(job) = self.jobs.get(&id)
-            && let Some(ref key) = job.idempotency_key
+            && let Some(ref key_tuple) = job.idempotency_key
             && let Some(tube) = self.tubes.get_mut(&tube_name)
         {
-            tube.idempotency_keys.remove(key);
+            tube.idempotency_keys.remove(&key_tuple.0);
+            if key_tuple.1 > 0 {
+                let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
+                expiry_epoch_secs = expires_at
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                tube.idempotency_cooldowns.insert(
+                    key_tuple.0.clone(),
+                    (id, expires_at),
+                );
+            }
         }
 
         // Group tracking: decrement pending count and check completion
@@ -812,8 +868,8 @@ impl ServerState {
             }
         }
 
-        // WAL: write delete state change
-        self.wal_write_state_change(id, None, 0, Duration::ZERO);
+        // WAL: write delete state change (with tombstone expiry if applicable)
+        self.wal_write_state_change(id, None, 0, Duration::ZERO, expiry_epoch_secs);
 
         self.jobs.remove(&id);
 
@@ -848,6 +904,10 @@ impl ServerState {
 
         let count = job_ids.len() as u32;
         if count == 0 {
+            // Still clear cooldowns even if no jobs
+            if let Some(tube) = self.tubes.get_mut(tube_name) {
+                tube.idempotency_cooldowns.clear();
+            }
             return Response::Flushed(0);
         }
 
@@ -890,6 +950,7 @@ impl ServerState {
         tube.delay.clear();
         tube.buried.clear();
         tube.idempotency_keys.clear();
+        tube.idempotency_cooldowns.clear();
 
         // Update tube stats
         tube.stat.total_delete_ct += count as u64;
@@ -930,7 +991,7 @@ impl ServerState {
 
         // WAL: write delete for each job, then remove from jobs map
         for &id in &job_ids {
-            self.wal_write_state_change(id, None, 0, Duration::ZERO);
+            self.wal_write_state_change(id, None, 0, Duration::ZERO, 0);
             self.jobs.remove(&id);
         }
 
@@ -1007,7 +1068,7 @@ impl ServerState {
         } else {
             JobState::Ready
         };
-        self.wal_write_state_change(id, Some(wal_state), pri, Duration::from_secs(delay as u64));
+        self.wal_write_state_change(id, Some(wal_state), pri, Duration::from_secs(delay as u64), 0);
 
         self.process_queue();
         Response::Released
@@ -1060,7 +1121,7 @@ impl ServerState {
         }
 
         // WAL: write bury state change
-        self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO);
+        self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO, 0);
 
         Response::Buried
     }
@@ -1241,7 +1302,7 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO);
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0);
                 kicked += 1;
             }
         } else {
@@ -1276,7 +1337,7 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO);
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0);
                 kicked += 1;
             }
         }
@@ -1336,7 +1397,7 @@ impl ServerState {
         }
 
         // WAL: write kick state change
-        self.wal_write_state_change(id, Some(JobState::Ready), 0, Duration::ZERO);
+        self.wal_write_state_change(id, Some(JobState::Ready), 0, Duration::ZERO, 0);
 
         self.process_queue();
         Response::KickedOne
@@ -1404,9 +1465,11 @@ impl ServerState {
              buries: {}\n\
              kicks: {}\n\
              idempotency-key: {}\n\
+             idempotency-ttl: {}\n\
              group: {}\n\
              after-group: {}\n\
-             concurrency-key: {}\n",
+             concurrency-key: {}\n\
+             concurrency-limit: {}\n",
             job.id,
             job.tube_name,
             job.state.as_str(),
@@ -1422,10 +1485,24 @@ impl ServerState {
             job.release_ct,
             job.bury_ct,
             job.kick_ct,
-            job.idempotency_key.as_deref().unwrap_or(""),
+            job.idempotency_key
+                .as_ref()
+                .map(|(k, _)| k.as_str())
+                .unwrap_or(""),
+            job.idempotency_key
+                .as_ref()
+                .map(|(_, ttl)| *ttl)
+                .unwrap_or(0),
             job.group.as_deref().unwrap_or(""),
             job.after_group.as_deref().unwrap_or(""),
-            job.concurrency_key.as_deref().unwrap_or(""),
+            job.concurrency_key
+                .as_ref()
+                .map(|(k, _)| k.as_str())
+                .unwrap_or(""),
+            job.concurrency_key
+                .as_ref()
+                .map(|(_, l)| *l)
+                .unwrap_or(0),
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -1847,6 +1924,9 @@ impl ServerState {
         // Each successful reserve changes the ready queue, so we re-check
         // from the start after each fulfillment.
         loop {
+            // Use immutable check to find a candidate waiter with a ready job.
+            // This works for both FIFO and weighted modes since
+            // find_ready_job_for_conn_inner just checks availability.
             let mut fulfilled_idx = None;
             for (i, waiter) in self.waiters.iter().enumerate() {
                 if self.find_ready_job_for_conn_inner(waiter.conn_id).is_some() {
@@ -1858,7 +1938,8 @@ impl ServerState {
             match fulfilled_idx {
                 Some(i) => {
                     let waiter = self.waiters.remove(i);
-                    if let Some(job_id) = self.find_ready_job_for_conn_inner(waiter.conn_id) {
+                    // Select the job respecting the connection's reserve mode.
+                    if let Some(job_id) = self.find_job_for_waiting_conn(waiter.conn_id) {
                         let resp = self.do_reserve(waiter.conn_id, job_id);
                         let _ = waiter.reply_tx.send(resp);
                     } else {
@@ -1899,6 +1980,15 @@ impl ServerState {
         best.map(|(_, id)| id)
     }
 
+    /// Find a job for a waiting connection, respecting its reserve mode.
+    fn find_job_for_waiting_conn(&mut self, conn_id: u64) -> Option<u64> {
+        let mode = self.conns.get(&conn_id)?.reserve_mode;
+        match mode {
+            ReserveMode::Weighted => self.select_weighted_job(conn_id),
+            ReserveMode::Fifo => self.find_ready_job_for_conn_inner(conn_id),
+        }
+    }
+
     fn remove_waiter(&mut self, conn_id: u64) {
         let mut i = 0;
         while i < self.waiters.len() {
@@ -1932,11 +2022,14 @@ impl ServerState {
         state: Option<JobState>,
         pri: u32,
         delay: Duration,
+        expiry_epoch_secs: u64,
     ) {
         if let Some(wal) = self.wal.as_mut()
             && let Some(mut job) = self.jobs.remove(&job_id)
         {
-            if let Err(e) = wal.write_state_change(&mut job, state, pri, delay) {
+            if let Err(e) =
+                wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs)
+            {
                 tracing::error!("WAL write_state_change error: {}, disabling WAL", e);
                 self.wal = None;
             }
@@ -2100,6 +2193,13 @@ impl ServerState {
         // Try to fulfill remaining waiters with newly ready jobs
         self.process_queue();
 
+        // Clean up expired idempotency cooldowns
+        let sys_now = SystemTime::now();
+        for tube in self.tubes.values_mut() {
+            tube.idempotency_cooldowns
+                .retain(|_, (_, expiry)| *expiry > sys_now);
+        }
+
         // WAL maintenance (GC, sync)
         if let Some(wal) = self.wal.as_mut() {
             let migrate_ids = wal.maintain();
@@ -2123,7 +2223,12 @@ impl ServerState {
     }
 
     /// Restore jobs from WAL replay into server state.
-    fn restore_jobs(&mut self, jobs: HashMap<u64, Job>, next_job_id: u64) {
+    fn restore_jobs(
+        &mut self,
+        jobs: HashMap<u64, Job>,
+        next_job_id: u64,
+        tombstones: Vec<IdpTombstone>,
+    ) {
         self.next_job_id = next_job_id;
 
         // Collect after_group job IDs for a second pass
@@ -2197,10 +2302,10 @@ impl ServerState {
             }
 
             // Register idempotency key in tube index
-            if let Some(ref key) = idempotency_key
+            if let Some(ref key_tuple) = idempotency_key
                 && let Some(tube) = self.tubes.get_mut(&tube_name)
             {
-                tube.idempotency_keys.insert(key.clone(), id);
+                tube.idempotency_keys.insert(key_tuple.0.clone(), id);
             }
 
             // Rebuild group state
@@ -2258,6 +2363,17 @@ impl ServerState {
                 }
             }
         }
+
+        // Restore idempotency tombstones from WAL
+        for tombstone in tombstones {
+            self.ensure_tube(&tombstone.tube_name);
+            if let Some(tube) = self.tubes.get_mut(&tombstone.tube_name) {
+                tube.idempotency_cooldowns.insert(
+                    tombstone.key,
+                    (tombstone.job_id, tombstone.expires_at),
+                );
+            }
+        }
     }
 }
 
@@ -2297,11 +2413,17 @@ pub async fn run_with_listener(
     // WAL: open and replay if configured
     if let Some(dir) = wal_dir {
         let mut wal = Wal::open(dir, None)?;
-        let (jobs, next_id) = wal.replay()?;
+        let (jobs, next_id, tombstones) = wal.replay()?;
         let job_count = jobs.len();
-        state.restore_jobs(jobs, next_id);
+        let tombstone_count = tombstones.len();
+        state.restore_jobs(jobs, next_id, tombstones);
         state.wal = Some(wal);
-        tracing::info!("WAL: replayed {} jobs from {:?}", job_count, dir);
+        tracing::info!(
+            "WAL: replayed {} jobs and {} idempotency tombstones from {:?}",
+            job_count,
+            tombstone_count,
+            dir
+        );
     }
 
     // Engine task
@@ -2830,10 +2952,10 @@ mod tests {
             delay: 0,
             ttr: 10,
             bytes: 5,
-            idempotency_key: Some("mykey".into()),
+            idempotency_key: Some(("mykey".into(), 0)),
             group: Some("grp1".into()),
             after_group: Some("grp0".into()),
-            concurrency_key: Some("con1".into()),
+            concurrency_key: Some(("con1".into(), 1)),
         };
         s.handle_command(c, cmd, Some(b"hello".to_vec()));
 
@@ -2845,6 +2967,7 @@ mod tests {
                 assert!(yaml.contains("group: grp1"), "yaml: {}", yaml);
                 assert!(yaml.contains("after-group: grp0"), "yaml: {}", yaml);
                 assert!(yaml.contains("concurrency-key: con1"), "yaml: {}", yaml);
+                assert!(yaml.contains("concurrency-limit: 1"), "yaml: {}", yaml);
             }
             _ => panic!("expected Ok"),
         }
@@ -2869,6 +2992,251 @@ mod tests {
                 let yaml = String::from_utf8(data).unwrap();
                 assert!(yaml.contains("- default"));
                 assert!(yaml.contains("- emails"));
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn test_concurrency_key_limit_n() {
+        // Put 3 jobs with con:api:2, reserve 2 (succeed), 3rd blocked, delete 1, 3rd succeeds
+        let mut s = make_state();
+        let c1 = register(&mut s);
+        let c2 = register(&mut s);
+
+        let con_put = |s: &mut ServerState, conn: u64, body: &[u8]| {
+            let cmd = Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 120,
+                bytes: body.len() as u32,
+                idempotency_key: None,
+                group: None,
+                after_group: None,
+                concurrency_key: Some(("api".into(), 2)),
+            };
+            s.handle_command(conn, cmd, Some(body.to_vec()))
+        };
+
+        // Insert 3 jobs
+        assert!(matches!(con_put(&mut s, c1, b"j1"), Response::Inserted(1)));
+        assert!(matches!(con_put(&mut s, c1, b"j2"), Response::Inserted(2)));
+        assert!(matches!(con_put(&mut s, c1, b"j3"), Response::Inserted(3)));
+
+        // Reserve first two — should succeed
+        let r1 = s.handle_command(c1, Command::Reserve, None);
+        assert!(matches!(r1, Response::Reserved { id: 1, .. }));
+
+        let r2 = s.handle_command(c2, Command::Reserve, None);
+        assert!(matches!(r2, Response::Reserved { id: 2, .. }));
+
+        // Third reserve should be blocked (2 already reserved, limit is 2)
+        let r3 = s.handle_command(
+            c1,
+            Command::ReserveWithTimeout { timeout: 0 },
+            None,
+        );
+        assert!(matches!(r3, Response::TimedOut));
+
+        // Delete one reserved job — frees a slot
+        let resp = s.handle_command(c1, Command::Delete { id: 1 }, None);
+        assert!(matches!(resp, Response::Deleted));
+
+        // Now reserve should succeed
+        let r4 = s.handle_command(c1, Command::Reserve, None);
+        assert!(matches!(r4, Response::Reserved { id: 3, .. }));
+    }
+
+    #[test]
+    fn test_concurrency_key_default_limit_one() {
+        // con:key (no :N) defaults to limit 1
+        let mut s = make_state();
+        let c1 = register(&mut s);
+        let c2 = register(&mut s);
+
+        let con_put = |s: &mut ServerState, conn: u64, body: &[u8]| {
+            let cmd = Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 120,
+                bytes: body.len() as u32,
+                idempotency_key: None,
+                group: None,
+                after_group: None,
+                concurrency_key: Some(("single".into(), 1)),
+            };
+            s.handle_command(conn, cmd, Some(body.to_vec()))
+        };
+
+        con_put(&mut s, c1, b"j1");
+        con_put(&mut s, c1, b"j2");
+
+        // Reserve first — succeeds
+        let r1 = s.handle_command(c1, Command::Reserve, None);
+        assert!(matches!(r1, Response::Reserved { id: 1, .. }));
+
+        // Second reserve should be blocked
+        let r2 = s.handle_command(
+            c2,
+            Command::ReserveWithTimeout { timeout: 0 },
+            None,
+        );
+        assert!(matches!(r2, Response::TimedOut));
+    }
+
+    #[test]
+    fn test_idempotency_ttl_cooldown() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put with idp:key:5
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 5)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd, Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Reserve and delete
+        let resp = s.handle_command(c, Command::Reserve, None);
+        assert!(matches!(resp, Response::Reserved { id: 1, .. }));
+        let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
+        assert!(matches!(resp, Response::Deleted));
+
+        // Re-put with same key should return original ID (cooldown active)
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 5)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+    }
+
+    #[test]
+    fn test_idempotency_no_ttl_no_cooldown() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put with idp:key (no TTL)
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd, Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Reserve and delete
+        let resp = s.handle_command(c, Command::Reserve, None);
+        assert!(matches!(resp, Response::Reserved { id: 1, .. }));
+        let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
+        assert!(matches!(resp, Response::Deleted));
+
+        // Re-put should get new ID (no cooldown)
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::Inserted(2)));
+    }
+
+    #[test]
+    fn test_idempotency_ttl_flush_clears_cooldowns() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put with cooldown
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 60)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd, Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Delete to start cooldown, then flush
+        let resp = s.handle_command(c, Command::Reserve, None);
+        assert!(matches!(resp, Response::Reserved { id: 1, .. }));
+        let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
+        assert!(matches!(resp, Response::Deleted));
+
+        // Flush tube clears cooldowns
+        let resp = s.handle_command(
+            c,
+            Command::FlushTube {
+                tube: "default".into(),
+            },
+            None,
+        );
+        assert!(matches!(resp, Response::Flushed(0)));
+
+        // Re-put should get new ID
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 60)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::Inserted(2)));
+    }
+
+    #[test]
+    fn test_stats_job_idempotency_ttl() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 30)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"hello".to_vec()));
+
+        let resp = s.handle_command(c, Command::StatsJob { id: 1 }, None);
+        match resp {
+            Response::Ok(data) => {
+                let yaml = String::from_utf8(data).unwrap();
+                assert!(yaml.contains("idempotency-key: mykey"), "yaml: {}", yaml);
+                assert!(yaml.contains("idempotency-ttl: 30"), "yaml: {}", yaml);
             }
             _ => panic!("expected Ok"),
         }

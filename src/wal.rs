@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::job::{Job, JobState};
 
@@ -18,9 +18,9 @@ const WAL_VERSION: u32 = 1;
 const HEADER_SIZE: usize = 8;
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
-const STATE_CHANGE_PAYLOAD_LEN: u32 = 13;
-/// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload(13) + crc(4)
-const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 13 + 4;
+const STATE_CHANGE_PAYLOAD_LEN: u32 = 21;
+/// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload(21) + crc(4)
+const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 21 + 4;
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const FILE_PREFIX: &str = "binlog.";
 
@@ -113,6 +113,15 @@ impl std::fmt::Display for WalError {
 
 // --- WAL record types ---
 
+/// An idempotency tombstone recovered from WAL replay.
+#[derive(Debug)]
+pub struct IdpTombstone {
+    pub tube_name: String,
+    pub key: String,
+    pub job_id: u64,
+    pub expires_at: SystemTime,
+}
+
 #[derive(Debug)]
 pub enum WalRecord {
     FullJob(Box<Job>),
@@ -121,6 +130,7 @@ pub enum WalRecord {
         new_state: Option<JobState>, // None = Deleted
         new_priority: u32,
         new_delay_nanos: u64,
+        expiry_epoch_secs: u64, // For idempotency tombstones (0 = no tombstone)
     },
 }
 
@@ -155,10 +165,31 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
     payload.extend_from_slice(&job.body);
 
     // extension fields
-    write_option_string(&mut payload, &job.idempotency_key);
+    write_option_string(
+        &mut payload,
+        &job.idempotency_key.as_ref().map(|(k, _)| k.clone()),
+    );
     write_option_string(&mut payload, &job.group);
     write_option_string(&mut payload, &job.after_group);
-    write_option_string(&mut payload, &job.concurrency_key);
+    // concurrency_key: write key string then limit u32
+    write_option_string(
+        &mut payload,
+        &job.concurrency_key.as_ref().map(|(k, _)| k.clone()),
+    );
+    payload.extend_from_slice(
+        &job.concurrency_key
+            .as_ref()
+            .map_or(0u32, |(_, l)| *l)
+            .to_le_bytes(),
+    );
+
+    // idempotency TTL
+    payload.extend_from_slice(
+        &job.idempotency_key
+            .as_ref()
+            .map_or(0u32, |(_, ttl)| *ttl)
+            .to_le_bytes(),
+    );
 
     // Build full record: type + job_id + payload_len + payload + crc
     let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
@@ -178,13 +209,14 @@ pub fn serialize_state_change(
     state: Option<JobState>,
     priority: u32,
     delay_nanos: u64,
+    expiry_epoch_secs: u64,
 ) -> Vec<u8> {
     let mut record = Vec::with_capacity(STATE_CHANGE_RECORD_SIZE);
     record.push(RECORD_TYPE_STATE_CHANGE);
     record.extend_from_slice(&job_id.to_le_bytes());
     record.extend_from_slice(&STATE_CHANGE_PAYLOAD_LEN.to_le_bytes());
 
-    // payload: state + priority + delay_nanos
+    // payload: state + priority + delay_nanos + expiry_epoch_secs
     let state_byte = match state {
         Some(s) => state_to_u8(s),
         None => STATE_DELETED,
@@ -192,6 +224,7 @@ pub fn serialize_state_change(
     record.push(state_byte);
     record.extend_from_slice(&priority.to_le_bytes());
     record.extend_from_slice(&delay_nanos.to_le_bytes());
+    record.extend_from_slice(&expiry_epoch_secs.to_le_bytes());
 
     let crc = crc32fast::hash(&record);
     record.extend_from_slice(&crc.to_le_bytes());
@@ -203,14 +236,14 @@ pub fn estimate_full_job_size(job: &Job) -> usize {
     // type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
     // payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1) +
     //          5 counters * 4 = 20 + tube_name_len(2) + tube_name +
-    //          body_len(4) + body + 4 option_strings (2 bytes each min)
-    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8; // 8 = 4 * 2 for option_string headers
+    //          body_len(4) + body + 4 option_strings (2 bytes each min) + concurrency_limit(4) + idp_ttl(4)
+    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8 + 4 + 4; // +4 concurrency limit +4 idp ttl
     let variable = job.tube_name.len()
         + job.body.len()
-        + job.idempotency_key.as_ref().map_or(0, |s| s.len())
+        + job.idempotency_key.as_ref().map_or(0, |(s, _)| s.len())
         + job.group.as_ref().map_or(0, |s| s.len())
         + job.after_group.as_ref().map_or(0, |s| s.len())
-        + job.concurrency_key.as_ref().map_or(0, |s| s.len());
+        + job.concurrency_key.as_ref().map_or(0, |(s, _)| s.len());
     fixed + variable
 }
 
@@ -221,19 +254,19 @@ pub fn estimate_full_job_size_raw(
     idempotency_key: &Option<String>,
     group: &Option<String>,
     after_group: &Option<String>,
-    concurrency_key: &Option<String>,
+    concurrency_key: &Option<(String, u32)>,
 ) -> usize {
     // type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
     // payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1) +
     //          5 counters * 4 = 20 + tube_name_len(2) + tube_name +
-    //          body_len(4) + body + 4 option_strings (2 bytes each min)
-    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8;
+    //          body_len(4) + body + 4 option_strings (2 bytes each min) + concurrency_limit(4) + idp_ttl(4)
+    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8 + 4 + 4;
     let variable = tube_name.len()
         + body_len
         + idempotency_key.as_ref().map_or(0, |s| s.len())
         + group.as_ref().map_or(0, |s| s.len())
         + after_group.as_ref().map_or(0, |s| s.len())
-        + concurrency_key.as_ref().map_or(0, |s| s.len());
+        + concurrency_key.as_ref().map_or(0, |(s, _)| s.len());
     fixed + variable
 }
 
@@ -363,7 +396,26 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
     let idempotency_key = read_option_string(payload, &mut off)?;
     let group = read_option_string(payload, &mut off)?;
     let after_group = read_option_string(payload, &mut off)?;
-    let concurrency_key = read_option_string(payload, &mut off)?;
+    let concurrency_key_str = read_option_string(payload, &mut off)?;
+    // Read concurrency limit (u32) if present, default to 1 for backwards compat
+    let concurrency_limit = if off + 4 <= payload.len() {
+        let v = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+        off += 4;
+        v
+    } else {
+        1
+    };
+    let concurrency_key = concurrency_key_str.map(|k| (k, concurrency_limit.max(1)));
+
+    // Read idempotency TTL (u32) if present, default to 0 for backwards compat
+    let idempotency_ttl = if off + 4 <= payload.len() {
+        let v = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+        let _ = off + 4;
+        v
+    } else {
+        0
+    };
+    let idempotency_key = idempotency_key.map(|k| (k, idempotency_ttl));
 
     let delay = Duration::from_nanos(delay_nanos);
     let ttr = Duration::from_nanos(ttr_nanos);
@@ -424,6 +476,8 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
         u32::from_le_bytes(data[14..18].try_into().map_err(|_| WalError::Truncated)?);
     let new_delay_nanos =
         u64::from_le_bytes(data[18..26].try_into().map_err(|_| WalError::Truncated)?);
+    let expiry_epoch_secs =
+        u64::from_le_bytes(data[26..34].try_into().map_err(|_| WalError::Truncated)?);
 
     Ok((
         WalRecord::StateChange {
@@ -431,6 +485,7 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
             new_state,
             new_priority,
             new_delay_nanos,
+            expiry_epoch_secs,
         },
         STATE_CHANGE_RECORD_SIZE,
     ))
@@ -685,6 +740,7 @@ impl Wal {
         new_state: Option<JobState>,
         new_priority: u32,
         new_delay: Duration,
+        expiry_epoch_secs: u64,
     ) -> io::Result<()> {
         // State changes are allowed to exceed max_file_size
         if self.should_rotate() {
@@ -697,7 +753,8 @@ impl Wal {
         }
 
         let delay_nanos = new_delay.as_nanos().min(u64::MAX as u128) as u64;
-        let record = serialize_state_change(job.id, new_state, new_priority, delay_nanos);
+        let record =
+            serialize_state_change(job.id, new_state, new_priority, delay_nanos, expiry_epoch_secs);
         let record_len = record.len();
 
         let file = self.current_file_mut()?;
@@ -760,9 +817,11 @@ impl Wal {
 
     // --- Replay ---
 
-    pub fn replay(&mut self) -> io::Result<(HashMap<u64, Job>, u64)> {
+    pub fn replay(&mut self) -> io::Result<(HashMap<u64, Job>, u64, Vec<IdpTombstone>)> {
         let mut jobs: HashMap<u64, Job> = HashMap::new();
         let mut max_id: u64 = 0;
+        let mut tombstones: Vec<IdpTombstone> = Vec::new();
+        let replay_time = SystemTime::now();
 
         // Read and process each file
         let file_infos: Vec<(u64, PathBuf)> =
@@ -818,13 +877,32 @@ impl Wal {
                                 new_state,
                                 new_priority,
                                 new_delay_nanos,
+                                expiry_epoch_secs,
                             } => {
                                 if job_id > max_id {
                                     max_id = job_id;
                                 }
                                 match new_state {
                                     None => {
-                                        // Deleted
+                                        // Deleted — check for idempotency tombstone
+                                        if expiry_epoch_secs > 0 {
+                                            let expires_at = UNIX_EPOCH
+                                                + Duration::from_secs(expiry_epoch_secs);
+                                            if expires_at > replay_time {
+                                                // Tombstone still active — extract idp info from job before removing
+                                                if let Some(job) = jobs.get(&job_id)
+                                                    && let Some((ref key, _)) =
+                                                        job.idempotency_key
+                                                {
+                                                    tombstones.push(IdpTombstone {
+                                                        tube_name: job.tube_name.clone(),
+                                                        key: key.clone(),
+                                                        job_id,
+                                                        expires_at,
+                                                    });
+                                                }
+                                            }
+                                        }
                                         if let Some(old_job) = jobs.remove(&job_id)
                                             && let Some(old_seq) = old_job.wal_file_seq
                                         {
@@ -881,7 +959,7 @@ impl Wal {
         // Create new writable file
         self.create_next_file()?;
 
-        Ok((jobs, max_id + 1))
+        Ok((jobs, max_id + 1, tombstones))
     }
 
     // --- GC and compaction ---
@@ -935,10 +1013,10 @@ mod tests {
         job.release_ct = 2;
         job.bury_ct = 0;
         job.kick_ct = 1;
-        job.idempotency_key = Some("idem-key".to_string());
+        job.idempotency_key = Some(("idem-key".to_string(), 60));
         job.group = Some("group1".to_string());
         job.after_group = None;
-        job.concurrency_key = Some("conc".to_string());
+        job.concurrency_key = Some(("conc".to_string(), 3));
         job
     }
 
@@ -961,10 +1039,16 @@ mod tests {
             assert_eq!(j.release_ct, 2);
             assert_eq!(j.bury_ct, 0);
             assert_eq!(j.kick_ct, 1);
-            assert_eq!(j.idempotency_key.as_deref(), Some("idem-key"));
+            assert_eq!(
+                j.idempotency_key,
+                Some(("idem-key".to_string(), 60))
+            );
             assert_eq!(j.group.as_deref(), Some("group1"));
             assert!(j.after_group.is_none());
-            assert_eq!(j.concurrency_key.as_deref(), Some("conc"));
+            assert_eq!(
+                j.concurrency_key,
+                Some(("conc".to_string(), 3))
+            );
             // Reserved replays as Ready
             assert_eq!(j.state, JobState::Delayed); // original was delayed (delay > 0)
         } else {
@@ -974,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_state_change() {
-        let record = serialize_state_change(99, Some(JobState::Buried), 500, 0);
+        let record = serialize_state_change(99, Some(JobState::Buried), 500, 0, 0);
         assert_eq!(record.len(), STATE_CHANGE_RECORD_SIZE);
 
         let (rec, consumed) = deserialize_record(&record).unwrap();
@@ -985,12 +1069,14 @@ mod tests {
             new_state,
             new_priority,
             new_delay_nanos,
+            expiry_epoch_secs,
         } = rec
         {
             assert_eq!(job_id, 99);
             assert_eq!(new_state, Some(JobState::Buried));
             assert_eq!(new_priority, 500);
             assert_eq!(new_delay_nanos, 0);
+            assert_eq!(expiry_epoch_secs, 0);
         } else {
             panic!("expected StateChange");
         }
@@ -998,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_state_change_deleted() {
-        let record = serialize_state_change(77, None, 0, 0);
+        let record = serialize_state_change(77, None, 0, 0, 0);
         let (rec, _) = deserialize_record(&record).unwrap();
 
         if let WalRecord::StateChange { new_state, .. } = rec {
@@ -1010,7 +1096,7 @@ mod tests {
 
     #[test]
     fn test_crc32_validation() {
-        let mut record = serialize_state_change(99, Some(JobState::Ready), 0, 0);
+        let mut record = serialize_state_change(99, Some(JobState::Ready), 0, 0, 0);
         // Corrupt a byte in the middle
         record[5] ^= 0xFF;
         let result = deserialize_record(&record);
@@ -1134,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_state_change_crc() {
-        let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0);
+        let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0, 0);
         let len = record.len();
         record[len - 2] ^= 0xFF;
         assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
@@ -1160,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_invalid_state_byte_in_state_change() {
-        let mut record = serialize_state_change(1, Some(JobState::Ready), 0, 0);
+        let mut record = serialize_state_change(1, Some(JobState::Ready), 0, 0, 0);
         // State byte is at offset 13 in state change record
         record[13] = 0xEE; // invalid state (not 0-3 or 0xFF)
         // Recompute CRC
@@ -1249,7 +1335,7 @@ mod tests {
 
         // Replay should recover both valid jobs, skip the garbage
         let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
-        let (jobs, next_id) = wal.replay().unwrap();
+        let (jobs, next_id, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 2);
         assert!(jobs.contains_key(&1));
         assert!(jobs.contains_key(&2));
@@ -1289,7 +1375,7 @@ mod tests {
 
         // Replay should skip the bad file, recover nothing
         let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
-        let (jobs, _) = wal.replay().unwrap();
+        let (jobs, _, _) = wal.replay().unwrap();
         assert!(jobs.is_empty());
     }
 
@@ -1336,7 +1422,7 @@ mod tests {
 
         // Should recover job 1 only
         let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
-        let (jobs, next_id) = wal.replay().unwrap();
+        let (jobs, next_id, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs.contains_key(&1));
         assert!(next_id >= 2);
@@ -1372,14 +1458,14 @@ mod tests {
             wal.write_put(&mut job2).unwrap();
 
             // Delete job 1
-            wal.write_state_change(&mut job1, None, 0, Duration::ZERO)
+            wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0)
                 .unwrap();
         }
 
         // Replay
         {
             let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
-            let (jobs, next_id) = wal.replay().unwrap();
+            let (jobs, next_id, _) = wal.replay().unwrap();
 
             // Job 1 was deleted
             assert!(!jobs.contains_key(&1));

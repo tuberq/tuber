@@ -3201,3 +3201,106 @@ async fn test_peek_buried_empty() {
     c.mustsend("peek-buried\r\n").await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
+
+// ---------------------------------------------------------------------------
+// Idempotency TTL cooldown tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_idempotency_ttl_cooldown() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put with idp:key1:5 (5 second cooldown)
+    c.mustsend("put 0 0 60 5 idp:key1:5\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve and delete
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Re-put within cooldown → returns original ID
+    c.mustsend("put 0 0 60 5 idp:key1:5\r\n").await;
+    c.mustsend("world\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+}
+
+#[tokio::test]
+async fn test_idempotency_ttl_expired() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put with idp:key1:1 (1 second cooldown)
+    c.mustsend("put 0 0 60 5 idp:key1:1\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve and delete
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Wait for cooldown to expire
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Re-put after cooldown → new ID
+    c.mustsend("put 0 0 60 5 idp:key1:1\r\n").await;
+    c.mustsend("world\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+}
+
+#[tokio::test]
+async fn test_idempotency_no_ttl_unchanged() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put with idp:key1 (no TTL, backwards compat)
+    c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve and delete
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Re-put immediately → new ID (no cooldown)
+    c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
+    c.mustsend("world\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+}
+
+#[tokio::test]
+async fn test_idempotency_ttl_flush_clears() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put with cooldown
+    c.mustsend("put 0 0 60 5 idp:key1:60\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve, delete (starts cooldown)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Flush tube clears cooldowns
+    c.mustsend("flush-tube default\r\n").await;
+    c.ckresp("FLUSHED 0\r\n").await;
+
+    // Re-put → new ID (cooldown cleared by flush)
+    c.mustsend("put 0 0 60 5 idp:key1:60\r\n").await;
+    c.mustsend("world\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+}

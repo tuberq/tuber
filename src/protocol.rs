@@ -10,10 +10,10 @@ pub enum Command {
         delay: u32,
         ttr: u32,
         bytes: u32,
-        idempotency_key: Option<String>,
+        idempotency_key: Option<(String, u32)>,
         group: Option<String>,
         after_group: Option<String>,
-        concurrency_key: Option<String>,
+        concurrency_key: Option<(String, u32)>,
     },
     Use {
         tube: String,
@@ -270,10 +270,21 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
 
     for part in &parts[4..] {
         if let Some(val) = part.strip_prefix("idp:") {
-            if !is_valid_key(val) {
-                return Err(Response::BadFormat);
+            // Parse idp:key or idp:key:N
+            if let Some(colon_pos) = val.rfind(':') {
+                let key_part = &val[..colon_pos];
+                let ttl_part = &val[colon_pos + 1..];
+                if !is_valid_key(key_part) {
+                    return Err(Response::BadFormat);
+                }
+                let ttl: u32 = ttl_part.parse().map_err(|_| Response::BadFormat)?;
+                idempotency_key = Some((key_part.to_string(), ttl));
+            } else {
+                if !is_valid_key(val) {
+                    return Err(Response::BadFormat);
+                }
+                idempotency_key = Some((val.to_string(), 0));
             }
-            idempotency_key = Some(val.to_string());
         } else if let Some(val) = part.strip_prefix("grp:") {
             if !is_valid_key(val) {
                 return Err(Response::BadFormat);
@@ -285,10 +296,24 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
             }
             after_group = Some(val.to_string());
         } else if let Some(val) = part.strip_prefix("con:") {
-            if !is_valid_key(val) {
-                return Err(Response::BadFormat);
+            // Parse con:key or con:key:N
+            if let Some(colon_pos) = val.rfind(':') {
+                let key_part = &val[..colon_pos];
+                let limit_part = &val[colon_pos + 1..];
+                if !is_valid_key(key_part) {
+                    return Err(Response::BadFormat);
+                }
+                let limit: u32 = limit_part.parse().map_err(|_| Response::BadFormat)?;
+                if limit == 0 {
+                    return Err(Response::BadFormat);
+                }
+                concurrency_key = Some((key_part.to_string(), limit));
+            } else {
+                if !is_valid_key(val) {
+                    return Err(Response::BadFormat);
+                }
+                concurrency_key = Some((val.to_string(), 1));
             }
-            concurrency_key = Some(val.to_string());
         } else {
             return Err(Response::BadFormat);
         }
@@ -450,7 +475,7 @@ mod tests {
                 delay: 0,
                 ttr: 10,
                 bytes: 5,
-                idempotency_key: Some("abc123".into()),
+                idempotency_key: Some(("abc123".into(), 0)),
                 group: None,
                 after_group: None,
                 concurrency_key: None,
@@ -467,10 +492,10 @@ mod tests {
                 delay: 0,
                 ttr: 10,
                 bytes: 5,
-                idempotency_key: Some("k1".into()),
+                idempotency_key: Some(("k1".into(), 0)),
                 group: Some("g1".into()),
                 after_group: Some("g0".into()),
-                concurrency_key: Some("c1".into()),
+                concurrency_key: Some(("c1".into(), 1)),
             }
         );
     }
@@ -484,10 +509,10 @@ mod tests {
                 delay: 0,
                 ttr: 10,
                 bytes: 5,
-                idempotency_key: Some("k1".into()),
+                idempotency_key: Some(("k1".into(), 0)),
                 group: None,
                 after_group: None,
-                concurrency_key: Some("c1".into()),
+                concurrency_key: Some(("c1".into(), 1)),
             }
         );
     }
@@ -743,6 +768,106 @@ mod tests {
 
         let name_201 = "a".repeat(201);
         assert!(!is_valid_tube_name(&name_201));
+    }
+
+    #[test]
+    fn test_parse_put_con_key_with_limit() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 con:api:5").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: None,
+                after_group: None,
+                concurrency_key: Some(("api".into(), 5)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_con_key_default_limit() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 con:mykey").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: None,
+                after_group: None,
+                concurrency_key: Some(("mykey".into(), 1)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_con_key_limit_zero_rejected() {
+        assert!(parse_command("put 0 0 10 5 con:api:0").is_err());
+    }
+
+    #[test]
+    fn test_parse_put_con_key_limit_non_numeric_rejected() {
+        assert!(parse_command("put 0 0 10 5 con:api:abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_put_con_key_limit_one() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 con:api:1").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: None,
+                after_group: None,
+                concurrency_key: Some(("api".into(), 1)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_idp_with_ttl() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 idp:key:60").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: Some(("key".into(), 60)),
+                group: None,
+                after_group: None,
+                concurrency_key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_idp_with_zero_ttl() {
+        assert_eq!(
+            parse_command("put 0 0 10 5 idp:key:0").unwrap(),
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: Some(("key".into(), 0)),
+                group: None,
+                after_group: None,
+                concurrency_key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_put_idp_ttl_non_numeric_rejected() {
+        assert!(parse_command("put 0 0 10 5 idp:key:abc").is_err());
     }
 
     #[test]

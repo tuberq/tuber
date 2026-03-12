@@ -21,6 +21,14 @@ tuber tubes
 tuber stats
 ```
 
+## The case for Tuber / Beanstalkd
+
+Redis-backed queues are popular and performant, but Redis isn't a natural fit for job storage. Jobs aren't ephemeral cache entries — they need durability, not RAM. Sizing Redis to hold your entire queue in memory is wasteful when disk storage is perfectly adequate.
+
+SQLite-backed queues are simple and fast, but limited to a single host. PostgreSQL and MySQL-backed queues can scale beyond one host, but a job queue should be separate from your application database for capacity planning — which means another instance to manage with connection pooling, tuning, vacuuming, backups, and restores.
+
+Tuber and Beanstalkd are purpose-built for this. A single binary, easy to deploy in Docker, with queues stored on disk. Memory usage stays flat regardless of queue depth — no capacity planning, no tuning, no surprises. Workers wait efficiently at any scale.
+
 ## Features
 
 All the great hits from beanstalkd - backwards compatible, plus:
@@ -54,6 +62,24 @@ put 100 0 30 5 idp:my-key
 ```
 
 The key is scoped to the tube and cleared when the job is deleted, so the same key can be reused afterwards.
+
+#### Cooldown TTL
+
+By default, the idempotency key is removed as soon as the job is deleted. Add a TTL with `idp:key:N` to keep deduplicating for N seconds after deletion:
+
+```text
+put 0 0 30 5 idp:report:300
+<body>
+→ INSERTED 1
+
+(reserve → delete job 1)
+
+put 0 0 30 5 idp:report:300
+<body>
+→ INSERTED 1   (still deduped — within 300s cooldown)
+```
+
+After the cooldown expires, the key is freed and a new job will be created. `idp:key` (no TTL) keeps the original behaviour — key removed immediately on delete.
 
 ### Job Groups (Fan-out / Fan-in)
 
@@ -102,6 +128,17 @@ payload2
 
 Only one `con:user-42` job can be reserved at a time, ensuring serial processing per key.
 
+Set a higher limit with `con:key:N` to allow N concurrent reservations:
+
+```text
+put 0 0 30 7 con:api:3
+payload1
+put 0 0 30 7 con:api:3
+payload2
+```
+
+Up to 3 `con:api` jobs can be reserved simultaneously. `con:key` (no `:N`) defaults to a limit of 1.
+
 ### Prometheus Metrics
 
 Expose a `/metrics` endpoint for Prometheus scraping:
@@ -145,10 +182,10 @@ tuber put [OPTIONS] [BODY]
 | `-p`, `--pri` | `0` | Priority (0 is most urgent) |
 | `-d`, `--delay` | `0` | Delay in seconds before job becomes ready |
 | `--ttr` | `60` | Time-to-run in seconds |
-| `-i`, `--idp` | — | Idempotency key (prevents duplicate jobs) |
+| `-i`, `--idp` | — | Idempotency key — `key` or `key:ttl` (TTL seconds keeps deduping after delete) |
 | `-g`, `--grp` | — | Group name (for job grouping) |
 | `--aft` | — | After-group dependency (wait for this group to complete) |
-| `-c`, `--con` | — | Concurrency key (only one job with this key runs at a time) |
+| `-c`, `--con` | — | Concurrency key — `key` or `key:N` (N = max concurrent reservations, default 1) |
 | `-a`, `--addr` | `localhost:11300` | Server address |
 
 ```bash
@@ -249,6 +286,9 @@ tuber put -i "transcode-video-42" "ffmpeg -i /data/video-42.raw -c:v libx264 /da
 
 # Generate a nightly report — re-running the script won't queue it twice
 tuber put -i "report-2026-03-12" "./generate-report.sh 2026-03-12"
+
+# Keep deduplicating for 5 minutes after the job completes
+tuber put -i "report-2026-03-12:300" "./generate-report.sh 2026-03-12"
 ```
 
 ### Serialising work with concurrency keys
@@ -265,6 +305,11 @@ tuber put -c "deploy-web2" "./deploy.sh web2"  # runs in parallel with web1
 tuber put -c "example.com" "curl -o /data/page1.html https://example.com/page1"
 tuber put -c "example.com" "curl -o /data/page2.html https://example.com/page2"
 tuber put -c "other.com"   "curl -o /data/index.html https://other.com/"
+
+# Allow up to 3 concurrent API calls per service
+tuber put -c "api-svc:3" "curl -X POST https://api.example.com/job1"
+tuber put -c "api-svc:3" "curl -X POST https://api.example.com/job2"
+tuber put -c "api-svc:3" "curl -X POST https://api.example.com/job3"
 ```
 
 ### Chaining pipelines with groups
@@ -296,10 +341,10 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 
 | Tag | Effect |
 |---|---|
-| `idp:<key>` | Idempotency — deduplicates jobs by key within the tube. See [Unique Jobs](#unique-jobs-idempotency). |
+| `idp:<key>` or `idp:<key>:<ttl>` | Idempotency — deduplicates jobs by key within the tube. Optional TTL (seconds) keeps deduplicating after deletion. See [Unique Jobs](#unique-jobs-idempotency). |
 | `grp:<name>` | Assigns the job to a group for fan-out/fan-in. See [Job Groups](#job-groups-fan-out--fan-in). |
 | `aft:<name>` | Holds the job until all jobs in the named group are deleted. See [Job Groups](#job-groups-fan-out--fan-in). |
-| `con:<key>` | Concurrency key — only one job per key can be reserved at a time. See [Concurrency Keys](#concurrency-keys). |
+| `con:<key>` or `con:<key>:<limit>` | Concurrency key — limits how many jobs per key can be reserved at once (default 1). See [Concurrency Keys](#concurrency-keys). |
 
 ### Worker commands
 
