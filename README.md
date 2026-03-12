@@ -23,7 +23,7 @@ tuber stats
 
 ## The case for Tuber / Beanstalkd
 
-Redis-backed queues are popular and performant, but Redis isn't a natural fit for job storage. Jobs aren't ephemeral cache entries — they need durability, not RAM. Sizing Redis to hold your entire queue in memory is wasteful when disk storage is perfectly adequate.
+Redis-backed queues are popular and performant, but Redis isn't a natural fit for job queues. You're bolting priorities, delays, reservations, and timeouts onto a general-purpose data structure server — complexity that grows with every edge case.
 
 SQLite-backed queues are simple and fast, but limited to a single host. PostgreSQL and MySQL-backed queues can scale beyond one host, but a job queue should be separate from your application database for capacity planning — which means another instance to manage with connection pooling, tuning, vacuuming, backups, and restores.
 
@@ -169,6 +169,17 @@ tuber server -p 11301 -b /var/lib/tuber
 # Verbose mode with metrics
 tuber server -VV --metrics-port 9100
 ```
+
+### Durability & fsync
+
+When persistence is enabled (`-b`), tuber appends job mutations to a write-ahead log (WAL). The WAL is fsynced every 100ms as part of the server's internal tick — not on every write. This means:
+
+- **At most 100ms of data can be lost on a crash.** Jobs written in the last tick interval may not have been fsynced to disk yet.
+- **fsync overhead is constant regardless of throughput.** Whether you're doing 10 jobs/sec or 100,000 jobs/sec, tuber calls fsync ~10 times per second. On NVMe/SSD storage this adds negligible latency; on spinning disks it costs ~50–150ms/sec of I/O time.
+
+This is a different trade-off from databases like PostgreSQL or MySQL, which fsync on every transaction commit to guarantee durability of each acknowledged write (the "D" in ACID). Tuber's `INSERTED` response means the job is buffered in the WAL but not necessarily fsynced — similar to PostgreSQL's `synchronous_commit = off` mode. For most queue workloads, losing a fraction of a second of jobs on a hard crash is acceptable, and the throughput benefit is significant.
+
+Without `-b`, all state is in-memory only and lost on restart.
 
 ## Put
 

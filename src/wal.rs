@@ -942,11 +942,18 @@ impl Wal {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "WAL: error reading record in {:?} at offset {}: {}",
+                            "WAL: error reading record in {:?} at offset {}: {}, truncating",
                             path,
                             offset,
                             e
                         );
+                        // Truncate the file at the corrupt offset to prevent
+                        // repeated warnings on every restart.
+                        if let Ok(f) = OpenOptions::new().write(true).open(path) {
+                            if let Err(te) = f.set_len(offset as u64) {
+                                tracing::warn!("WAL: failed to truncate {:?}: {}", path, te);
+                            }
+                        }
                         break;
                     }
                 }

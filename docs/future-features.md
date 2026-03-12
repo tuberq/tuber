@@ -101,6 +101,10 @@ Tracks min/max/average processing time per tube using an exponentially weighted 
 
 `/metrics` HTTP endpoint in Prometheus text format. Enabled via `--metrics-port <port>`. Exposes job gauges, tube stats, connection count, and uptime.
 
+### Idempotency Tombstones
+
+Post-completion idempotency via tombstone with TTL (`idp:key:N`) — prevents re-insertion of a recently completed job for N seconds after deletion. Tombstones are persisted in the WAL and restored on replay.
+
 ## Partially Done
 
 ### Command Counters
@@ -109,7 +113,7 @@ Structure exists (`op_ct` array in `GlobalStats`) and is wired into `stats` outp
 
 ### WAL Fsync Mode
 
-WAL uses fsync, but there's no configurable mode (`-f 0`, `-f <ms>`, no fsync). Currently always fsyncs.
+WAL fsyncs every 100ms (on the server tick), not per-write. There's no configurable mode (`-f 0`, `-f <ms>`, `-F`). Given the tick-based approach, the rate-limited `-f <ms>` mode provides little benefit over the current behaviour. A `--no-fsync` flag for ephemeral workloads could still be useful.
 
 ## Future
 
@@ -124,10 +128,6 @@ list-jobs <tube> [ready|delayed|buried|reserved]\r\n
 ### Bulk Retrieval
 
 ([#427](https://github.com/beanstalkd/beanstalkd/issues/427)) — Reserve/peek multiple jobs at once. Needs a concrete command design (e.g. `reserve-batch <count>`, `peek-batch <tube> <state> <count>`).
-
-### Idempotency Tombstones
-
-Post-completion idempotency via tombstone with TTL — prevents re-insertion of a recently completed job.
 
 ## Known Pain Points (C version) That Rust Helps With
 
