@@ -27,7 +27,7 @@ Redis-backed queues are popular and performant, but Redis isn't a natural fit fo
 
 SQLite-backed queues are simple and fast, but limited to a single host. PostgreSQL and MySQL-backed queues can scale beyond one host, but a job queue should be separate from your application database for capacity planning — which means another instance to manage with connection pooling, tuning, vacuuming, backups, and restores.
 
-Tuber and Beanstalkd are purpose-built for this. A single binary, easy to deploy in Docker, with queues stored on disk. Memory usage stays flat regardless of queue depth — no capacity planning, no tuning, no surprises. Workers wait efficiently at any scale.
+Tuber and Beanstalkd are purpose-built for this. A single binary, easy to deploy in Docker, with optional write-ahead log for durability. No capacity planning, no tuning, no surprises. Workers wait efficiently at any scale.
 
 ## Features
 
