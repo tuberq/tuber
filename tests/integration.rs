@@ -114,11 +114,11 @@ impl TestConn {
         self.mustsend(&cmd).await;
         self.mustsend(&format!("{}\r\n", body)).await;
         let line = self.readline().await;
-        let id_str = line
+        let after = line
             .strip_prefix("INSERTED ")
             .unwrap_or_else(|| panic!("expected INSERTED, got {:?}", line))
             .trim();
-        id_str.parse().unwrap()
+        after.split_whitespace().next().unwrap().parse().unwrap()
     }
 
     /// Convenience: put a job, reserve it, and return the job ID.
@@ -1590,10 +1590,10 @@ async fn test_idempotency_basic() {
     c.mustsend("hello\r\n").await;
     c.ckresp("INSERTED 1\r\n").await;
 
-    // Second put with same key on same tube → same ID
+    // Second put with same key on same tube → same ID with state
     c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
     c.mustsend("world\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    c.ckresp("INSERTED 1 READY\r\n").await;
 }
 
 #[tokio::test]
@@ -1667,7 +1667,7 @@ async fn test_idempotency_buried_job() {
     // Dedup still works for buried job
     c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
     c.mustsend("world\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    c.ckresp("INSERTED 1 BURIED\r\n").await;
 }
 
 #[tokio::test]
@@ -1682,7 +1682,7 @@ async fn test_idempotency_delayed_job() {
     // Dedup works for delayed job
     c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
     c.mustsend("world\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    c.ckresp("INSERTED 1 DELAYED\r\n").await;
 }
 
 #[tokio::test]
@@ -1702,7 +1702,7 @@ async fn test_idempotency_reserved_job() {
     // Dedup still works for reserved job
     c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
     c.mustsend("world\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    c.ckresp("INSERTED 1 RESERVED\r\n").await;
 }
 
 #[tokio::test]
@@ -3223,10 +3223,10 @@ async fn test_idempotency_ttl_cooldown() {
     c.mustsend("delete 1\r\n").await;
     c.ckresp("DELETED\r\n").await;
 
-    // Re-put within cooldown → returns original ID
+    // Re-put within cooldown → returns original ID with DELETED state
     c.mustsend("put 0 0 60 5 idp:key1:5\r\n").await;
     c.mustsend("world\r\n").await;
-    c.ckresp("INSERTED 1\r\n").await;
+    c.ckresp("INSERTED 1 DELETED\r\n").await;
 }
 
 #[tokio::test]
@@ -3303,4 +3303,38 @@ async fn test_idempotency_ttl_flush_clears() {
     c.mustsend("put 0 0 60 5 idp:key1:60\r\n").await;
     c.mustsend("world\r\n").await;
     c.ckresp("INSERTED 2\r\n").await;
+}
+
+#[tokio::test]
+async fn test_deadline_soon_proactive_wake() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a job with TTR=2
+    c.mustsend("put 0 0 2 1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve it immediately
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Now start a long reserve-with-timeout. The server should proactively
+    // wake us with DEADLINE_SOON when the reserved job enters the 1-second
+    // safety margin (~1 second from now), NOT wait for the 10-second timeout.
+    c.mustsend("reserve-with-timeout 10\r\n").await;
+
+    // We should get DEADLINE_SOON well before 5 seconds (the readline timeout).
+    // With TTR=2, deadline_soon triggers after ~1 second.
+    let start = std::time::Instant::now();
+    c.ckresp("DEADLINE_SOON\r\n").await;
+    let elapsed = start.elapsed();
+
+    // Should have been woken proactively in ~1-2 seconds, not 10
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "expected proactive wake within 5s, took {:?}",
+        elapsed
+    );
 }

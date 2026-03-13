@@ -49,7 +49,7 @@ Tubes default to weight 1. Here, `another-tube` is selected 3x as often as `noti
 
 ### Unique Jobs (Idempotency)
 
-Prevent duplicate jobs with an `idp:` key on `put`. If a live job with the same key already exists in the tube, the original job ID is returned instead of creating a new one:
+Prevent duplicate jobs with an `idp:` key on `put`. If a live job with the same key already exists in the tube, the original job ID is returned along with the existing job's state:
 
 ```text
 put 100 0 30 5 idp:my-key
@@ -58,8 +58,21 @@ put 100 0 30 5 idp:my-key
 
 put 100 0 30 5 idp:my-key
 <body>
-→ INSERTED 1   (same ID, no duplicate created)
+→ INSERTED 1 READY       (dedup hit — job is ready)
 ```
+
+The response state tells you exactly what happened to the original job:
+
+| Response | Meaning |
+|---|---|
+| `INSERTED <id>` | Fresh insert, new job created |
+| `INSERTED <id> READY` | Dedup hit — original job is waiting to be reserved |
+| `INSERTED <id> RESERVED` | Dedup hit — original job is being processed |
+| `INSERTED <id> DELAYED` | Dedup hit — original job is delayed |
+| `INSERTED <id> BURIED` | Dedup hit — original job is buried |
+| `INSERTED <id> DELETED` | Dedup hit during TTL cooldown (see below) |
+
+The state suffix only appears on dedup hits — a `put` without `idp:` always returns plain `INSERTED <id>`, keeping the response fully backwards-compatible with standard beanstalkd clients.
 
 The key is scoped to the tube and cleared when the job is deleted, so the same key can be reused afterwards.
 
@@ -76,7 +89,7 @@ put 0 0 30 5 idp:report:300
 
 put 0 0 30 5 idp:report:300
 <body>
-→ INSERTED 1   (still deduped — within 300s cooldown)
+→ INSERTED 1 DELETED     (still deduped — within 300s cooldown)
 ```
 
 After the cooldown expires, the key is freed and a new job will be created. `idp:key` (no TTL) keeps the original behaviour — key removed immediately on delete.
@@ -94,7 +107,7 @@ put 0 0 60 14 aft:import
 send-summary
 ```
 
-The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish.
+The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish. If an `aft:` job isn't running and you're not sure why, use `stats-group <name>` to check whether the group still has pending or buried members.
 
 Chain stages together by combining `aft:` and `grp:` on the same job — the after-job becomes a member of the next group:
 
@@ -110,6 +123,21 @@ load
 ```
 
 Here `transform` waits for the extract group to finish, then becomes part of the `transform` group. `load` waits for `transform` to complete — giving you a simple DAG pipeline.
+
+Use `stats-group <name>` to inspect group state — useful for debugging why `aft:` jobs aren't running:
+
+```text
+stats-group import
+→ OK <bytes>
+---
+name: "import"
+pending: 2
+buried: 1
+complete: false
+waiting-jobs: 1
+```
+
+A buried job blocks group completion (`complete: false`). Kick it to let the group finish.
 
 Group names are global — jobs in the same group can span multiple tubes. Note that the server does not detect cycles: if two groups depend on each other, the waiting jobs will be held indefinitely. Cycle avoidance is the client's responsibility.
 
@@ -138,6 +166,8 @@ payload2
 ```
 
 Up to 3 `con:api` jobs can be reserved simultaneously. `con:key` (no `:N`) defaults to a limit of 1.
+
+Burying or releasing-with-delay a job frees its concurrency slot immediately — the slot is only held while the job is reserved. Delayed jobs don't occupy a slot until they become ready and are reserved. Use `stats-job <id>` to check a job's current state if reserves are unexpectedly blocked.
 
 ### Prometheus Metrics
 
@@ -392,6 +422,7 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `stats\r\n` | Server-wide statistics in YAML. |
 | `stats-job <id>\r\n` | Statistics for a single job in YAML. |
 | `stats-tube <tube>\r\n` | Statistics for a tube in YAML. |
+| **⚡** `stats-group <name>\r\n` | Statistics for a job group in YAML (pending, buried, complete, waiting-jobs). |
 | `list-tubes\r\n` | List all existing tubes in YAML. |
 | `list-tube-used\r\n` | Show the currently used tube. Returns `USING <tube>`. |
 | `list-tubes-watched\r\n` | List watched tubes in YAML. |

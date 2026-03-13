@@ -5,12 +5,22 @@ terminated by `\r\n`. Job bodies are raw bytes of the declared length.
 
 ## Producer Commands
 
-### put \<pri\> \<delay\> \<ttr\> \<bytes\>\r\n\<body\>\r\n
+### put \<pri\> \<delay\> \<ttr\> \<bytes\> [tags...]\r\n\<body\>\r\n
 
 Insert a job. Body must be exactly `<bytes>` bytes followed by `\r\n`.
 
+Optional extension tags (space-separated, after `<bytes>`):
+
+| Tag | Description |
+|---|---|
+| `idp:<key>` or `idp:<key>:<ttl>` | Idempotency key. Deduplicates within the tube — if a live job with the same key exists, returns the original ID and state. Optional TTL (seconds) keeps deduplicating after the job is deleted. |
+| `grp:<name>` | Assign the job to a named group for fan-out/fan-in. |
+| `aft:<name>` | Hold the job until all jobs in the named group are deleted. |
+| `con:<key>` or `con:<key>:<N>` | Concurrency key. Limits parallel reservations sharing this key. Default limit is 1. |
+
 Responses:
-- `INSERTED <id>\r\n`
+- `INSERTED <id>\r\n` — new job created
+- `INSERTED <id> <STATE>\r\n` — idempotency dedup hit (STATE is `READY`, `RESERVED`, `DELAYED`, `BURIED`, or `DELETED`)
 - `BURIED <id>\r\n` (out of memory)
 - `EXPECTED_CRLF\r\n` (body not terminated correctly)
 - `JOB_TOO_BIG\r\n`
@@ -31,7 +41,7 @@ Reserve a job from watched tubes. Blocks until a job is available or timeout.
 Responses:
 - `RESERVED <id> <bytes>\r\n<body>\r\n`
 - `TIMED_OUT\r\n`
-- `DEADLINE_SOON\r\n`
+- `DEADLINE_SOON\r\n` — the connection has a reserved job whose TTR is about to expire (see below).
 
 ### reserve-job \<id\>\r\n
 
@@ -83,6 +93,18 @@ Set reserve mode to `fifo` or `weighted`.
 
 Response: `USING <mode>\r\n` or `BAD_FORMAT\r\n`
 
+#### DEADLINE_SOON
+
+When a connection has a reserved job whose TTR (time-to-run) is within 1 second of expiring, the server returns `DEADLINE_SOON` instead of reserving a new job. This happens in two ways:
+
+1. **On reserve**: If you send `reserve` or `reserve-with-timeout` while holding a nearly-expired reservation, the server responds immediately with `DEADLINE_SOON` (unless a ready job is available, in which case it's returned normally).
+
+2. **Proactive wake**: If you're already blocked waiting on a `reserve-with-timeout` and one of your reserved jobs enters the 1-second safety margin, the server interrupts the wait and sends `DEADLINE_SOON` — you don't have to wait for your reserve timeout to expire.
+
+When you receive `DEADLINE_SOON`, you should `touch`, `delete`, or `release` the expiring job before trying to reserve again. If you don't act, the job's TTR will expire and the server will return it to the ready queue for another worker to pick up.
+
+The safety margin is 1 second. The minimum TTR is also 1 second, so a job with TTR=1 may trigger `DEADLINE_SOON` almost immediately after being reserved.
+
 ## Other Commands
 
 ### peek \<id\>\r\n / peek-ready\r\n / peek-delayed\r\n / peek-buried\r\n
@@ -103,7 +125,15 @@ Response: `KICKED\r\n` or `NOT_FOUND\r\n`
 
 ### stats\r\n / stats-job \<id\>\r\n / stats-tube \<tube\>\r\n
 
-Response: `OK <bytes>\r\n<yaml>\r\n`
+Response: `OK <bytes>\r\n<yaml>\r\n` or `NOT_FOUND\r\n`
+
+### stats-group \<name\>\r\n
+
+Statistics for a job group (used with `grp:`/`aft:` features).
+
+Response: `OK <bytes>\r\n<yaml>\r\n` or `NOT_FOUND\r\n`
+
+YAML fields: `name`, `pending`, `buried`, `complete`, `waiting-jobs`.
 
 ### list-tubes\r\n / list-tube-used\r\n / list-tubes-watched\r\n
 
@@ -114,6 +144,16 @@ Response: `OK <bytes>\r\n<yaml>\r\n` or `USING <tube>\r\n`
 Pause a tube for `<delay>` seconds.
 
 Response: `PAUSED\r\n` or `NOT_FOUND\r\n`
+
+### flush-tube \<tube\>\r\n
+
+Delete all jobs from a tube.
+
+Response: `FLUSHED <count>\r\n` or `NOT_FOUND\r\n`
+
+### drain\r\n
+
+Enter drain mode — rejects new `put` commands with `DRAINING`, allows in-flight work to complete.
 
 ### quit\r\n
 

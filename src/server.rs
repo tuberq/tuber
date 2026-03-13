@@ -26,6 +26,7 @@ enum EnginePayload {
         reply_tx: oneshot::Sender<Response>,
     },
     Disconnect,
+    Shutdown,
 }
 
 /// Waiting reservation request, stored when no job is immediately available.
@@ -378,6 +379,7 @@ impl ServerState {
             Command::KickJob { id } => self.cmd_kick_job(id),
             Command::StatsJob { id } => self.cmd_stats_job(id),
             Command::StatsTube { tube } => self.cmd_stats_tube(&tube),
+            Command::StatsGroup { group } => self.cmd_stats_group(&group),
             Command::Stats => self.cmd_stats(),
             Command::ListTubes => self.cmd_list_tubes(),
             Command::ListTubeUsed => self.cmd_list_tube_used(conn_id),
@@ -433,22 +435,22 @@ impl ServerState {
 
         self.ensure_tube(&tube_name);
 
-        // Idempotency dedup: if key already exists for a live job, return original ID
+        // Idempotency dedup: if key already exists for a live job, return original ID + state
         if let Some(ref key_tuple) = idempotency_key
             && let Some(tube) = self.tubes.get(&tube_name)
             && let Some(&existing_id) = tube.idempotency_keys.get(&key_tuple.0)
-            && self.jobs.contains_key(&existing_id)
+            && let Some(existing_job) = self.jobs.get(&existing_id)
         {
-            return Response::Inserted(existing_id);
+            return Response::InsertedDup(existing_id, existing_job.state.as_protocol_str());
         }
 
-        // Idempotency cooldown dedup: if key is in cooldown period, return original ID
+        // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
         if let Some(ref key_tuple) = idempotency_key
             && let Some(tube) = self.tubes.get_mut(&tube_name)
             && let Some(&(original_id, expiry)) = tube.idempotency_cooldowns.get(&key_tuple.0)
         {
             if SystemTime::now() < expiry {
-                return Response::Inserted(original_id);
+                return Response::InsertedDup(original_id, "DELETED");
             } else {
                 tube.idempotency_cooldowns.remove(&key_tuple.0);
             }
@@ -599,7 +601,7 @@ impl ServerState {
         }
 
         // Check deadline_soon
-        if self.conn_deadline_soon(conn_id) && !self.conn_has_ready_job(conn_id) {
+        if self.conn_deadline_soon(conn_id, Instant::now()) && !self.conn_has_ready_job(conn_id) {
             return Response::DeadlineSoon;
         }
 
@@ -850,10 +852,8 @@ impl ServerState {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                tube.idempotency_cooldowns.insert(
-                    key_tuple.0.clone(),
-                    (id, expires_at),
-                );
+                tube.idempotency_cooldowns
+                    .insert(key_tuple.0.clone(), (id, expires_at));
             }
         }
 
@@ -1068,7 +1068,13 @@ impl ServerState {
         } else {
             JobState::Ready
         };
-        self.wal_write_state_change(id, Some(wal_state), pri, Duration::from_secs(delay as u64), 0);
+        self.wal_write_state_change(
+            id,
+            Some(wal_state),
+            pri,
+            Duration::from_secs(delay as u64),
+            0,
+        );
 
         self.process_queue();
         Response::Released
@@ -1499,10 +1505,7 @@ impl ServerState {
                 .as_ref()
                 .map(|(k, _)| k.as_str())
                 .unwrap_or(""),
-            job.concurrency_key
-                .as_ref()
-                .map(|(_, l)| *l)
-                .unwrap_or(0),
+            job.concurrency_key.as_ref().map(|(_, l)| *l).unwrap_or(0),
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -1569,6 +1572,28 @@ impl ServerState {
             tube.stat.processing_time_min.unwrap_or(0.0),
             tube.stat.processing_time_max.unwrap_or(0.0),
             tube.stat.processing_time_samples,
+        );
+        Response::Ok(yaml.into_bytes())
+    }
+
+    fn cmd_stats_group(&self, group_name: &str) -> Response {
+        let gs = match self.groups.get(group_name) {
+            Some(gs) => gs,
+            None => return Response::NotFound,
+        };
+
+        let yaml = format!(
+            "---\n\
+             name: \"{}\"\n\
+             pending: {}\n\
+             buried: {}\n\
+             complete: {}\n\
+             waiting-jobs: {}\n",
+            group_name,
+            gs.pending,
+            gs.buried,
+            gs.is_complete(),
+            gs.waiting_jobs.len(),
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -1731,12 +1756,11 @@ impl ServerState {
 
     // --- Internal helpers ---
 
-    fn conn_deadline_soon(&self, conn_id: u64) -> bool {
+    fn conn_deadline_soon(&self, conn_id: u64, now: Instant) -> bool {
         let conn = match self.conns.get(&conn_id) {
             Some(c) => c,
             None => return false,
         };
-        let now = Instant::now();
         let margin = Duration::from_secs(1);
         for &job_id in &conn.reserved_jobs {
             if let Some(job) = self.jobs.get(&job_id)
@@ -1913,7 +1937,7 @@ impl ServerState {
         }
 
         for waiter in timed_out {
-            if self.conn_deadline_soon(waiter.conn_id) {
+            if self.conn_deadline_soon(waiter.conn_id, now) {
                 let _ = waiter.reply_tx.send(Response::DeadlineSoon);
             } else {
                 let _ = waiter.reply_tx.send(Response::TimedOut);
@@ -2027,9 +2051,7 @@ impl ServerState {
         if let Some(wal) = self.wal.as_mut()
             && let Some(mut job) = self.jobs.remove(&job_id)
         {
-            if let Err(e) =
-                wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs)
-            {
+            if let Err(e) = wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs) {
                 tracing::error!("WAL write_state_change error: {}, disabling WAL", e);
                 self.wal = None;
             }
@@ -2164,14 +2186,26 @@ impl ServerState {
             }
         }
 
+        // Proactive DEADLINE_SOON: wake waiting clients whose reserved jobs
+        // are within the 1-second safety margin.
+        let mut deadline_soon_indices = Vec::new();
+        for (i, waiter) in self.waiters.iter().enumerate() {
+            if self.conn_deadline_soon(waiter.conn_id, now) {
+                deadline_soon_indices.push(i);
+            }
+        }
+        for &i in deadline_soon_indices.iter().rev() {
+            let waiter = self.waiters.remove(i);
+            let _ = waiter.reply_tx.send(Response::DeadlineSoon);
+        }
+
         // Check waiting connection timeouts
-        let now2 = Instant::now();
         // Collect indices of timed-out waiters
         let timed_out: Vec<usize> = self
             .waiters
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.deadline.map(|d| now2 >= d).unwrap_or(false))
+            .filter(|(_, w)| w.deadline.map(|d| now >= d).unwrap_or(false))
             .map(|(i, _)| i)
             .collect();
 
@@ -2183,7 +2217,7 @@ impl ServerState {
 
         // Now send responses (no longer borrowing self.waiters)
         for waiter in expired {
-            if self.conn_deadline_soon(waiter.conn_id) {
+            if self.conn_deadline_soon(waiter.conn_id, now) {
                 let _ = waiter.reply_tx.send(Response::DeadlineSoon);
             } else {
                 let _ = waiter.reply_tx.send(Response::TimedOut);
@@ -2368,10 +2402,8 @@ impl ServerState {
         for tombstone in tombstones {
             self.ensure_tube(&tombstone.tube_name);
             if let Some(tube) = self.tubes.get_mut(&tombstone.tube_name) {
-                tube.idempotency_cooldowns.insert(
-                    tombstone.key,
-                    (tombstone.job_id, tombstone.expires_at),
-                );
+                tube.idempotency_cooldowns
+                    .insert(tombstone.key, (tombstone.job_id, tombstone.expires_at));
             }
         }
     }
@@ -2473,6 +2505,13 @@ pub async fn run_with_listener(
                         EnginePayload::Disconnect => {
                             state.unregister_conn(msg.conn_id);
                         }
+                        EnginePayload::Shutdown => {
+                            tracing::info!("engine shutting down, flushing WAL");
+                            if let Some(wal) = &mut state.wal {
+                                wal.maintain();
+                            }
+                            break;
+                        }
                     }
                 }
                 _ = tick_interval.tick() => {
@@ -2485,19 +2524,47 @@ pub async fn run_with_listener(
                 else => break,
             }
         }
+        tracing::info!("engine stopped");
     });
 
-    // Accept loop
+    // Accept loop with graceful shutdown on SIGINT/SIGTERM
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("failed to register SIGINT handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
     loop {
-        let (socket, peer) = listener.accept().await?;
-        tracing::debug!("accepted connection from {}", peer);
+        tokio::select! {
+            result = listener.accept() => {
+                let (socket, peer) = result?;
+                tracing::debug!("accepted connection from {}", peer);
 
-        let tx = engine_tx.clone();
-
-        tokio::spawn(async move {
-            handle_connection(socket, tx, max_job_size).await;
-        });
+                let tx = engine_tx.clone();
+                tokio::spawn(async move {
+                    handle_connection(socket, tx, max_job_size).await;
+                });
+            }
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, shutting down gracefully");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, shutting down gracefully");
+                break;
+            }
+        }
     }
+
+    // Send shutdown to engine and wait for it to flush WAL
+    let _ = engine_tx.send(EngineMsg {
+        conn_id: 0,
+        payload: EnginePayload::Shutdown,
+    }).await;
+
+    // Drop the sender so the engine loop exits after processing Shutdown
+    drop(engine_tx);
+
+    Ok(())
 }
 
 /// Atomic counter for connection IDs (simpler than engine round-trip).
@@ -3031,11 +3098,7 @@ mod tests {
         assert!(matches!(r2, Response::Reserved { id: 2, .. }));
 
         // Third reserve should be blocked (2 already reserved, limit is 2)
-        let r3 = s.handle_command(
-            c1,
-            Command::ReserveWithTimeout { timeout: 0 },
-            None,
-        );
+        let r3 = s.handle_command(c1, Command::ReserveWithTimeout { timeout: 0 }, None);
         assert!(matches!(r3, Response::TimedOut));
 
         // Delete one reserved job — frees a slot
@@ -3076,11 +3139,7 @@ mod tests {
         assert!(matches!(r1, Response::Reserved { id: 1, .. }));
 
         // Second reserve should be blocked
-        let r2 = s.handle_command(
-            c2,
-            Command::ReserveWithTimeout { timeout: 0 },
-            None,
-        );
+        let r2 = s.handle_command(c2, Command::ReserveWithTimeout { timeout: 0 }, None);
         assert!(matches!(r2, Response::TimedOut));
     }
 
@@ -3109,7 +3168,7 @@ mod tests {
         let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
         assert!(matches!(resp, Response::Deleted));
 
-        // Re-put with same key should return original ID (cooldown active)
+        // Re-put with same key should return original ID with DELETED state (cooldown active)
         let cmd = Command::Put {
             pri: 0,
             delay: 0,
@@ -3121,7 +3180,7 @@ mod tests {
             concurrency_key: None,
         };
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::Inserted(1)));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELETED")));
     }
 
     #[test]
@@ -3212,6 +3271,209 @@ mod tests {
         };
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
         assert!(matches!(resp, Response::Inserted(2)));
+    }
+
+    #[test]
+    fn test_idempotency_dedup_returns_ready_state() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd.clone(), Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Duplicate put returns InsertedDup with READY state
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "READY")));
+    }
+
+    #[test]
+    fn test_idempotency_dedup_returns_reserved_state() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd.clone(), Some(b"hello".to_vec()));
+
+        // Reserve the job
+        s.handle_command(c, Command::Reserve, None);
+
+        // Duplicate put returns InsertedDup with RESERVED state
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "RESERVED")));
+    }
+
+    #[test]
+    fn test_idempotency_dedup_returns_buried_state() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd.clone(), Some(b"hello".to_vec()));
+
+        // Reserve and bury
+        s.handle_command(c, Command::Reserve, None);
+        s.handle_command(c, Command::Bury { id: 1, pri: 0 }, None);
+
+        // Duplicate put returns InsertedDup with BURIED state
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "BURIED")));
+    }
+
+    #[test]
+    fn test_idempotency_dedup_returns_delayed_state() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 3600,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd.clone(), Some(b"hello".to_vec()));
+
+        // Duplicate put returns InsertedDup with DELAYED state
+        let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELAYED")));
+    }
+
+    #[test]
+    fn test_idempotency_cooldown_dedup_returns_deleted_state() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 60)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"hello".to_vec()));
+
+        // Reserve and delete (starts cooldown)
+        s.handle_command(c, Command::Reserve, None);
+        s.handle_command(c, Command::Delete { id: 1 }, None);
+
+        // Re-put during cooldown returns InsertedDup with DELETED state
+        let cmd2 = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 60)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELETED")));
+    }
+
+    #[test]
+    fn test_stats_group_not_found() {
+        let s = make_state();
+        let resp = s.cmd_stats_group("nonexistent");
+        assert!(matches!(resp, Response::NotFound));
+    }
+
+    #[test]
+    fn test_stats_group_pending() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: None,
+            group: Some("g1".into()),
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"hello".to_vec()));
+
+        let resp = s.cmd_stats_group("g1");
+        match resp {
+            Response::Ok(data) => {
+                let yaml = String::from_utf8(data).unwrap();
+                assert!(yaml.contains("name: \"g1\""), "yaml: {}", yaml);
+                assert!(yaml.contains("pending: 1"), "yaml: {}", yaml);
+                assert!(yaml.contains("buried: 0"), "yaml: {}", yaml);
+                assert!(yaml.contains("complete: false"), "yaml: {}", yaml);
+                assert!(yaml.contains("waiting-jobs: 0"), "yaml: {}", yaml);
+            }
+            _ => panic!("expected Ok, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_stats_group_buried() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: None,
+            group: Some("g1".into()),
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"hello".to_vec()));
+
+        // Reserve and bury
+        s.handle_command(c, Command::Reserve, None);
+        s.handle_command(c, Command::Bury { id: 1, pri: 0 }, None);
+
+        let resp = s.cmd_stats_group("g1");
+        match resp {
+            Response::Ok(data) => {
+                let yaml = String::from_utf8(data).unwrap();
+                assert!(yaml.contains("pending: 1"), "yaml: {}", yaml);
+                assert!(yaml.contains("buried: 1"), "yaml: {}", yaml);
+                assert!(yaml.contains("complete: false"), "yaml: {}", yaml);
+            }
+            _ => panic!("expected Ok, got {:?}", resp),
+        }
     }
 
     #[test]

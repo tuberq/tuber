@@ -79,6 +79,9 @@ pub enum Command {
     FlushTube {
         tube: String,
     },
+    StatsGroup {
+        group: String,
+    },
     Drain,
     Quit,
 }
@@ -87,6 +90,7 @@ pub enum Command {
 #[derive(Debug, Clone)]
 pub enum Response {
     Inserted(u64),
+    InsertedDup(u64, &'static str),
     BuriedId(u64),
     Buried,
     Using(String),
@@ -127,6 +131,7 @@ impl Response {
     pub fn serialize(&self) -> Vec<u8> {
         match self {
             Response::Inserted(id) => format!("INSERTED {id}\r\n").into_bytes(),
+            Response::InsertedDup(id, state) => format!("INSERTED {id} {state}\r\n").into_bytes(),
             Response::BuriedId(id) => format!("BURIED {id}\r\n").into_bytes(),
             Response::Buried => b"BURIED\r\n".to_vec(),
             Response::Using(name) => format!("USING {name}\r\n").into_bytes(),
@@ -214,6 +219,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_uint(rest).map(|id| Command::StatsJob { id })
     } else if let Some(rest) = line.strip_prefix("stats-tube ") {
         parse_stats_tube(rest)
+    } else if let Some(rest) = line.strip_prefix("stats-group ") {
+        parse_stats_group(rest)
     } else if line == "stats" {
         Ok(Command::Stats)
     } else if let Some(rest) = line.strip_prefix("use ") {
@@ -415,6 +422,16 @@ fn parse_stats_tube(rest: &str) -> Result<Command, Response> {
     }
     Ok(Command::StatsTube {
         tube: name.to_string(),
+    })
+}
+
+fn parse_stats_group(rest: &str) -> Result<Command, Response> {
+    let name = rest.trim();
+    if !is_valid_key(name) {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::StatsGroup {
+        group: name.to_string(),
     })
 }
 
@@ -875,5 +892,37 @@ mod tests {
         assert_eq!(Response::Deleted.serialize(), b"DELETED\r\n");
         assert_eq!(Response::Inserted(42).serialize(), b"INSERTED 42\r\n");
         assert_eq!(Response::NotFound.serialize(), b"NOT_FOUND\r\n");
+    }
+
+    #[test]
+    fn test_response_inserted_dup_serialize() {
+        assert_eq!(
+            Response::InsertedDup(42, "READY").serialize(),
+            b"INSERTED 42 READY\r\n"
+        );
+        assert_eq!(
+            Response::InsertedDup(7, "BURIED").serialize(),
+            b"INSERTED 7 BURIED\r\n"
+        );
+        assert_eq!(
+            Response::InsertedDup(1, "DELETED").serialize(),
+            b"INSERTED 1 DELETED\r\n"
+        );
+    }
+
+    #[test]
+    fn test_parse_stats_group() {
+        assert_eq!(
+            parse_command("stats-group mygroup").unwrap(),
+            Command::StatsGroup {
+                group: "mygroup".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_stats_group_bad_name() {
+        assert!(parse_command("stats-group -bad").is_err());
+        assert!(parse_command("stats-group ").is_err());
     }
 }

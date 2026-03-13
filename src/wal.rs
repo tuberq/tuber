@@ -749,8 +749,13 @@ impl Wal {
         }
 
         let delay_nanos = new_delay.as_nanos().min(u64::MAX as u128) as u64;
-        let record =
-            serialize_state_change(job.id, new_state, new_priority, delay_nanos, expiry_epoch_secs);
+        let record = serialize_state_change(
+            job.id,
+            new_state,
+            new_priority,
+            delay_nanos,
+            expiry_epoch_secs,
+        );
         let record_len = record.len();
 
         let file = self.current_file_mut()?;
@@ -883,13 +888,12 @@ impl Wal {
                                     None => {
                                         // Deleted — check for idempotency tombstone
                                         if expiry_epoch_secs > 0 {
-                                            let expires_at = UNIX_EPOCH
-                                                + Duration::from_secs(expiry_epoch_secs);
+                                            let expires_at =
+                                                UNIX_EPOCH + Duration::from_secs(expiry_epoch_secs);
                                             if expires_at > replay_time {
                                                 // Tombstone still active — extract idp info from job before removing
                                                 if let Some(job) = jobs.get(&job_id)
-                                                    && let Some((ref key, _)) =
-                                                        job.idempotency_key
+                                                    && let Some((ref key, _)) = job.idempotency_key
                                                 {
                                                     tombstones.push(IdpTombstone {
                                                         tube_name: job.tube_name.clone(),
@@ -1043,16 +1047,10 @@ mod tests {
             assert_eq!(j.release_ct, 2);
             assert_eq!(j.bury_ct, 0);
             assert_eq!(j.kick_ct, 1);
-            assert_eq!(
-                j.idempotency_key,
-                Some(("idem-key".to_string(), 60))
-            );
+            assert_eq!(j.idempotency_key, Some(("idem-key".to_string(), 60)));
             assert_eq!(j.group.as_deref(), Some("group1"));
             assert!(j.after_group.is_none());
-            assert_eq!(
-                j.concurrency_key,
-                Some(("conc".to_string(), 3))
-            );
+            assert_eq!(j.concurrency_key, Some(("conc".to_string(), 3)));
             // Reserved replays as Ready
             assert_eq!(j.state, JobState::Delayed); // original was delayed (delay > 0)
         } else {

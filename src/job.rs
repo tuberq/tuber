@@ -24,6 +24,15 @@ impl JobState {
             JobState::Buried => "buried",
         }
     }
+
+    pub fn as_protocol_str(&self) -> &'static str {
+        match self {
+            JobState::Ready => "READY",
+            JobState::Reserved => "RESERVED",
+            JobState::Delayed => "DELAYED",
+            JobState::Buried => "BURIED",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

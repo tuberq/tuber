@@ -509,10 +509,10 @@ async fn test_wal_replay_idempotency() {
     let srv2 = TestServer::start_with_wal(&wal_dir).await;
     let mut c2 = srv2.connect().await;
 
-    // Same key should return same ID
+    // Same key should return same ID with state
     c2.mustsend("put 0 0 60 5 idp:key1\r\n").await;
     c2.mustsend("world\r\n").await;
-    c2.ckresp("INSERTED 1\r\n").await;
+    c2.ckresp("INSERTED 1 READY\r\n").await;
 
     // Different key should get new ID
     c2.mustsend("put 0 0 60 5 idp:key2\r\n").await;
