@@ -1,12 +1,8 @@
-FROM rust:1.84-slim AS builder
-WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
+FROM rust:1.94 AS builder
+WORKDIR /src
+COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/tuber /usr/local/bin/tuber
-EXPOSE 11300
+COPY --from=builder /src/target/release/tuber /usr/local/bin/tuber
 ENTRYPOINT ["tuber"]
-CMD ["-l", "0.0.0.0", "-p", "11300", "-V"]
