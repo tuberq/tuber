@@ -50,7 +50,7 @@ jobs:
           tar czf ../../../tuber-${{ matrix.target }}.tar.gz tuber
           cd ../../..
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: tuber-${{ matrix.target }}
           path: tuber-${{ matrix.target }}.tar.gz
@@ -59,7 +59,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v6
         with:
           merge-multiple: true
 
