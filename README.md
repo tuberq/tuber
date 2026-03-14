@@ -428,7 +428,21 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `list-tubes-watched\r\n` | List watched tubes in YAML. |
 | `quit\r\n` | Close the connection. |
 
-## Building
+## Installation
+
+```bash
+cargo install --git https://github.com/dkam/tuber
+```
+
+Pre-built binaries for Linux and macOS are available on the [releases page](https://github.com/dkam/tuber/releases).
+
+### Docker
+
+```bash
+docker run ghcr.io/dkam/tuber server -l 0.0.0.0 -p 11300
+```
+
+### Building from source
 
 ```bash
 cargo build --release
