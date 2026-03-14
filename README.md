@@ -97,7 +97,7 @@ tuber put -i "transcode-42" "ffmpeg -i /data/video-42.raw -c:v libx264 /data/vid
 
 ## Features
 
-All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & kick — plus idempotency, concurrency keys, job groups, and weighted reserve.
+All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & kick — plus idempotency, concurrency keys, job groups, weighted reserve, and batch operations.
 
 ### Core
 
@@ -109,7 +109,7 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 - **Peek** — inspect jobs without reserving them. Peek by ID, or peek at the next ready/delayed/buried job.
 - **Pause** — temporarily stop a tube from serving jobs.
 - **Persistence** — optional write-ahead log (`-b` flag) for crash recovery.
-- **Prometheus metrics** — expose a `/metrics` endpoint for monitoring.
+- **Prometheus metrics** — expose a `/metrics` endpoint for monitoring. See [Statistics Reference](docs/statistics.md#prometheus-metrics).
 
 ### Weighted Reserve
 
@@ -245,6 +245,38 @@ Up to 3 `con:api` jobs can be reserved simultaneously. `con:key` (no `:N`) defau
 
 Burying or releasing-with-delay a job frees its concurrency slot immediately — the slot is only held while the job is reserved. Delayed jobs don't occupy a slot until they become ready and are reserved. Use `stats-job <id>` to check a job's current state if reserves are unexpectedly blocked.
 
+### Batch Operations
+
+Reduce round trips when working with many jobs at once.
+
+#### reserve-batch
+
+Reserve up to N jobs in a single call (1–1000). Returns immediately with whatever is available — if fewer jobs are ready than requested, you get fewer:
+
+```text
+reserve-batch 5
+→ RESERVED_BATCH 3
+→ RESERVED 1 5
+→ hello
+→ RESERVED 2 5
+→ world
+→ RESERVED 3 7
+→ goodbye
+```
+
+The response starts with `RESERVED_BATCH <count>`, followed by standard `RESERVED <id> <bytes>\r\n<body>\r\n` entries for each job. If no jobs are available, `RESERVED_BATCH 0` is returned.
+
+#### delete-batch
+
+Delete multiple jobs in a single call (1–1000 IDs, space-separated):
+
+```text
+delete-batch 1 2 3 99
+→ DELETED_BATCH 3 1
+```
+
+Returns `DELETED_BATCH <deleted_count> <not_found_count>` — here 3 jobs were deleted and 1 was not found.
+
 ## Installation
 
 ```bash
@@ -376,7 +408,7 @@ my-tube: ready=16 reserved=0 delayed=0 buried=0
 
 ### Stats
 
-Show global server statistics or per-tube statistics.
+Show global server statistics or per-tube statistics. See [Statistics Reference](docs/statistics.md) for all available fields.
 
 ```bash
 tuber stats [OPTIONS]
@@ -424,8 +456,10 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `reserve\r\n` | Block until a job is available. Returns `RESERVED <id> <bytes>\r\n<body>`. |
 | `reserve-with-timeout <seconds>\r\n` | Like `reserve` but times out. Returns `RESERVED …` or `TIMED_OUT`. |
 | `reserve-job <id>\r\n` | Reserve a specific job by ID. Returns `RESERVED …` or `NOT_FOUND`. |
+| **+** `reserve-batch <count>\r\n` | Reserve up to `<count>` jobs at once (1–1000). Non-blocking — returns whatever is available. See [Batch Operations](#batch-operations). |
 | **+** `reserve-mode <mode>\r\n` | Set reserve strategy: `default` (priority-first) or `weighted` (random by tube weight). See [Weighted Reserve](#weighted-reserve). |
 | `delete <id>\r\n` | Delete a job. Returns `DELETED` or `NOT_FOUND`. |
+| **+** `delete-batch <id> …\r\n` | Delete multiple jobs by ID (1–1000, space-separated). Returns `DELETED_BATCH <deleted> <not_found>`. See [Batch Operations](#batch-operations). |
 | `release <id> <pri> <delay>\r\n` | Release a reserved job back to ready (or delayed). Returns `RELEASED`. |
 | `bury <id> <pri>\r\n` | Bury a reserved job. Returns `BURIED`. |
 | `touch <id>\r\n` | Reset the TTR timer on a reserved job. Returns `TOUCHED`. |
@@ -449,10 +483,10 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `kick-job <id>\r\n` | Kick a specific buried or delayed job. Returns `KICKED` or `NOT_FOUND`. |
 | `pause-tube <tube> <delay>\r\n` | Pause a tube for `<delay>` seconds. Returns `PAUSED`. |
 | **+** `flush-tube <tube>\r\n` | Delete all jobs from a tube. Returns `FLUSHED <count>`. |
-| `stats\r\n` | Server-wide statistics in YAML. |
-| `stats-job <id>\r\n` | Statistics for a single job in YAML. |
-| `stats-tube <tube>\r\n` | Statistics for a tube in YAML. |
-| **+** `stats-group <name>\r\n` | Statistics for a job group in YAML (pending, buried, complete, waiting-jobs). |
+| `stats\r\n` | Server-wide statistics in YAML. See [Statistics Reference](docs/statistics.md). |
+| `stats-job <id>\r\n` | Statistics for a single job in YAML. See [Statistics Reference](docs/statistics.md#job-stats-stats-job-id). |
+| `stats-tube <tube>\r\n` | Statistics for a tube in YAML. See [Statistics Reference](docs/statistics.md#tube-stats-stats-tube-tube). |
+| **+** `stats-group <name>\r\n` | Statistics for a job group in YAML. See [Statistics Reference](docs/statistics.md#group-stats-stats-group-name). |
 | `list-tubes\r\n` | List all existing tubes in YAML. |
 | `list-tube-used\r\n` | Show the currently used tube. Returns `USING <tube>`. |
 | `list-tubes-watched\r\n` | List watched tubes in YAML. |

@@ -125,6 +125,24 @@ impl TuberClient {
         Ok(jobs)
     }
 
+    pub async fn delete_batch(&mut self, ids: &[u64]) -> io::Result<(u32, u32)> {
+        let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        self.send_line(&format!("delete-batch {}", id_strs.join(" ")))
+            .await?;
+        let line = self.read_line().await?;
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() != 3 || parts[0] != "DELETED_BATCH" {
+            return Err(io::Error::other(line));
+        }
+        let deleted: u32 = parts[1]
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let not_found: u32 = parts[2]
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok((deleted, not_found))
+    }
+
     pub async fn delete(&mut self, id: u64) -> io::Result<String> {
         self.send_line(&format!("delete {id}")).await?;
         self.read_line().await

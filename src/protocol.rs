@@ -82,6 +82,9 @@ pub enum Command {
     ReserveBatch {
         count: u32,
     },
+    DeleteBatch {
+        ids: Vec<u64>,
+    },
     StatsGroup {
         group: String,
     },
@@ -110,6 +113,7 @@ pub enum Response {
     Watching(usize),
     NotIgnored,
     ReservedBatch(Vec<(u64, Vec<u8>)>),
+    DeletedBatch { deleted: u32, not_found: u32 },
     Ok(Vec<u8>),
     Paused,
     Flushed(u32),
@@ -163,6 +167,9 @@ impl Response {
                     out.extend_from_slice(b"\r\n");
                 }
                 out
+            }
+            Response::DeletedBatch { deleted, not_found } => {
+                format!("DELETED_BATCH {deleted} {not_found}\r\n").into_bytes()
             }
             Response::Ok(data) => serialize_with_body(format!("OK {}\r\n", data.len()), data),
             Response::Paused => b"PAUSED\r\n".to_vec(),
@@ -218,6 +225,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_reserve_job(rest)
     } else if line == "reserve" {
         Ok(Command::Reserve)
+    } else if let Some(rest) = line.strip_prefix("delete-batch ") {
+        parse_delete_batch(rest)
     } else if let Some(rest) = line.strip_prefix("delete ") {
         parse_uint(rest).map(|id| Command::Delete { id })
     } else if let Some(rest) = line.strip_prefix("release ") {
@@ -365,6 +374,21 @@ fn parse_reserve_batch(rest: &str) -> Result<Command, Response> {
         return Err(Response::BadFormat);
     }
     Ok(Command::ReserveBatch { count })
+}
+
+const MAX_DELETE_BATCH: usize = 1000;
+
+fn parse_delete_batch(rest: &str) -> Result<Command, Response> {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > MAX_DELETE_BATCH {
+        return Err(Response::BadFormat);
+    }
+    let mut ids = Vec::with_capacity(parts.len());
+    for part in parts {
+        let id: u64 = part.parse().map_err(|_| Response::BadFormat)?;
+        ids.push(id);
+    }
+    Ok(Command::DeleteBatch { ids })
 }
 
 fn parse_reserve_with_timeout(rest: &str) -> Result<Command, Response> {
@@ -1003,5 +1027,47 @@ mod tests {
     fn test_response_reserved_batch_empty_serialize() {
         let resp = Response::ReservedBatch(vec![]);
         assert_eq!(resp.serialize(), b"RESERVED_BATCH 0\r\n");
+    }
+
+    #[test]
+    fn test_parse_delete_batch() {
+        assert_eq!(
+            parse_command("delete-batch 1 2 3").unwrap(),
+            Command::DeleteBatch { ids: vec![1, 2, 3] }
+        );
+        assert_eq!(
+            parse_command("delete-batch 42").unwrap(),
+            Command::DeleteBatch { ids: vec![42] }
+        );
+    }
+
+    #[test]
+    fn test_parse_delete_batch_bad_format() {
+        // No IDs
+        assert!(parse_command("delete-batch").is_err());
+        // Non-numeric
+        assert!(parse_command("delete-batch abc").is_err());
+        // Negative
+        assert!(parse_command("delete-batch -1").is_err());
+    }
+
+    #[test]
+    fn test_parse_delete_batch_max_limit() {
+        let ids: Vec<String> = (1..=1000).map(|i| i.to_string()).collect();
+        let cmd = format!("delete-batch {}", ids.join(" "));
+        assert!(parse_command(&cmd).is_ok());
+
+        let ids: Vec<String> = (1..=1001).map(|i| i.to_string()).collect();
+        let cmd = format!("delete-batch {}", ids.join(" "));
+        assert!(parse_command(&cmd).is_err());
+    }
+
+    #[test]
+    fn test_response_deleted_batch_serialize() {
+        let resp = Response::DeletedBatch {
+            deleted: 3,
+            not_found: 1,
+        };
+        assert_eq!(resp.serialize(), b"DELETED_BATCH 3 1\r\n");
     }
 }

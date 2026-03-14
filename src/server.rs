@@ -367,6 +367,7 @@ impl ServerState {
             Command::ReserveMode { mode } => self.cmd_reserve_mode(conn_id, &mode),
             Command::ReserveBatch { count } => self.cmd_reserve_batch(conn_id, count),
             Command::Delete { id } => self.cmd_delete(conn_id, id),
+            Command::DeleteBatch { ids } => self.cmd_delete_batch(conn_id, ids),
             Command::Release { id, pri, delay } => self.cmd_release(conn_id, id, pri, delay),
             Command::Bury { id, pri } => self.cmd_bury(conn_id, id, pri),
             Command::Touch { id } => self.cmd_touch(conn_id, id),
@@ -907,6 +908,18 @@ impl ServerState {
         }
 
         Response::Deleted
+    }
+
+    fn cmd_delete_batch(&mut self, conn_id: u64, ids: Vec<u64>) -> Response {
+        let mut deleted: u32 = 0;
+        let mut not_found: u32 = 0;
+        for id in ids {
+            match self.cmd_delete(conn_id, id) {
+                Response::Deleted => deleted += 1,
+                _ => not_found += 1,
+            }
+        }
+        Response::DeletedBatch { deleted, not_found }
     }
 
     fn cmd_flush_tube(&mut self, tube_name: &str) -> Response {
@@ -2636,7 +2649,11 @@ async fn handle_connection(
         line_buf.clear();
         // Limit read to MAX_LINE_LEN to prevent unbounded memory growth from
         // clients that send data without a newline. Matches beanstalkd behavior.
-        let _n = match (&mut reader).take(MAX_LINE_LEN).read_line(&mut line_buf).await {
+        let _n = match (&mut reader)
+            .take(MAX_LINE_LEN)
+            .read_line(&mut line_buf)
+            .await
+        {
             Ok(0) => break, // EOF
             Ok(n) => {
                 if !line_buf.ends_with('\n') {
@@ -3572,5 +3589,88 @@ mod tests {
             }
             _ => panic!("expected Ok"),
         }
+    }
+
+    #[test]
+    fn test_delete_batch_all_reserved() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put and reserve 3 jobs
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"a".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"b".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"c".to_vec()));
+        s.handle_command(c, Command::Reserve, None);
+        s.handle_command(c, Command::Reserve, None);
+        s.handle_command(c, Command::Reserve, None);
+
+        let resp = s.handle_command(c, Command::DeleteBatch { ids: vec![1, 2, 3] }, None);
+        assert_eq!(
+            resp,
+            Response::DeletedBatch {
+                deleted: 3,
+                not_found: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_delete_batch_mixed() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"a".to_vec()));
+        s.handle_command(c, Command::Reserve, None);
+
+        let resp = s.handle_command(
+            c,
+            Command::DeleteBatch {
+                ids: vec![1, 999, 1000],
+            },
+            None,
+        );
+        assert_eq!(
+            resp,
+            Response::DeletedBatch {
+                deleted: 1,
+                not_found: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_delete_batch_all_not_found() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let resp = s.handle_command(c, Command::DeleteBatch { ids: vec![99, 100] }, None);
+        assert_eq!(
+            resp,
+            Response::DeletedBatch {
+                deleted: 0,
+                not_found: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_delete_batch_other_conn_reserved() {
+        let mut s = make_state();
+        let c1 = register(&mut s);
+        let c2 = register(&mut s);
+
+        // c1 reserves a job
+        s.handle_command(c1, put_cmd(0, 0, 10, 1), Some(b"a".to_vec()));
+        s.handle_command(c1, Command::Reserve, None);
+
+        // c2 tries to delete-batch it — should be not_found (not reserved by c2)
+        let resp = s.handle_command(c2, Command::DeleteBatch { ids: vec![1] }, None);
+        assert_eq!(
+            resp,
+            Response::DeletedBatch {
+                deleted: 0,
+                not_found: 1
+            }
+        );
     }
 }

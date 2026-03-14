@@ -3508,6 +3508,139 @@ async fn test_reserve_batch_count_one() {
 }
 
 // ---------------------------------------------------------------------------
+// delete-batch tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_delete_batch_basic() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // Put and reserve 3 jobs
+    c.put_job(0, 0, 120, "a").await;
+    c.put_job(0, 0, 120, "b").await;
+    c.put_job(0, 0, 120, "c").await;
+
+    c.mustsend("reserve-batch 3\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    let ids: Vec<u64> = jobs.iter().map(|(id, _)| *id).collect();
+
+    let cmd = format!("delete-batch {} {} {}\r\n", ids[0], ids[1], ids[2]);
+    c.mustsend(&cmd).await;
+    c.ckresp("DELETED_BATCH 3 0\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_mixed_found_not_found() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    let id = c.put_and_reserve(0, 0, 120, "x").await;
+
+    let cmd = format!("delete-batch {} 99999 88888\r\n", id);
+    c.mustsend(&cmd).await;
+    c.ckresp("DELETED_BATCH 1 2\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_all_not_found() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.mustsend("delete-batch 1 2 3\r\n").await;
+    c.ckresp("DELETED_BATCH 0 3\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_ready_jobs() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    let id1 = c.put_job(0, 0, 120, "a").await;
+    let id2 = c.put_job(0, 0, 120, "b").await;
+
+    // Delete ready jobs (no reserve needed)
+    let cmd = format!("delete-batch {} {}\r\n", id1, id2);
+    c.mustsend(&cmd).await;
+    c.ckresp("DELETED_BATCH 2 0\r\n").await;
+
+    // Verify they're gone
+    c.mustsend(&format!("peek {}\r\n", id1)).await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_other_conn_reserved() {
+    let s = TestServer::start().await;
+    let mut c1 = s.connect().await;
+    let mut c2 = s.connect().await;
+
+    let id = c1.put_and_reserve(0, 0, 120, "mine").await;
+
+    // c2 can't delete c1's reserved job
+    let cmd = format!("delete-batch {}\r\n", id);
+    c2.mustsend(&cmd).await;
+    c2.ckresp("DELETED_BATCH 0 1\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_bad_format() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // No IDs
+    c.mustsend("delete-batch \r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+
+    // Non-numeric
+    c.mustsend("delete-batch abc\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+
+    // Negative
+    c.mustsend("delete-batch -1\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_single_id() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    let id = c.put_and_reserve(0, 0, 120, "solo").await;
+
+    let cmd = format!("delete-batch {}\r\n", id);
+    c.mustsend(&cmd).await;
+    c.ckresp("DELETED_BATCH 1 0\r\n").await;
+}
+
+#[tokio::test]
+async fn test_delete_batch_after_reserve_batch() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // Put 5 jobs
+    for i in 0..5u32 {
+        c.put_job(i, 0, 120, &format!("job{i}")).await;
+    }
+
+    // Reserve all via batch
+    c.mustsend("reserve-batch 5\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 5);
+
+    // Delete all via batch
+    let id_strs: Vec<String> = jobs.iter().map(|(id, _)| id.to_string()).collect();
+    let cmd = format!("delete-batch {}\r\n", id_strs.join(" "));
+    c.mustsend(&cmd).await;
+    c.ckresp("DELETED_BATCH 5 0\r\n").await;
+
+    // Verify tube is empty
+    c.mustsend("reserve-batch 1\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Fuzz / garbage input tests
 // ---------------------------------------------------------------------------
 
@@ -3609,7 +3742,10 @@ async fn test_fuzz_garbage_commands() {
     let mut fresh = server.connect().await;
     fresh.mustsend("stats\r\n").await;
     let resp = fresh.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "server still healthy after garbage");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "server still healthy after garbage"
+    );
 }
 
 /// Fire garbage that looks like put commands with mismatched body sizes.
@@ -3643,7 +3779,10 @@ async fn test_fuzz_put_body_mismatch() {
     let mut fresh = server.connect().await;
     fresh.mustsend("stats\r\n").await;
     let resp = fresh.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "server survived body mismatches");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "server survived body mismatches"
+    );
 }
 
 /// Rapid connect/disconnect without sending anything.
@@ -3652,7 +3791,9 @@ async fn test_fuzz_rapid_connect_disconnect() {
     let server = TestServer::start().await;
 
     for _ in 0..100 {
-        let stream = TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+        let stream = TcpStream::connect(("127.0.0.1", server.port))
+            .await
+            .unwrap();
         drop(stream);
     }
 
@@ -3660,7 +3801,10 @@ async fn test_fuzz_rapid_connect_disconnect() {
     let mut conn = server.connect().await;
     conn.mustsend("stats\r\n").await;
     let resp = conn.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "server survived rapid connect/disconnect");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "server survived rapid connect/disconnect"
+    );
 }
 
 /// Send many concurrent connections with garbage.
@@ -3690,7 +3834,10 @@ async fn test_fuzz_concurrent_garbage() {
     let mut conn = server.connect().await;
     conn.mustsend("stats\r\n").await;
     let resp = conn.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "server survived concurrent garbage");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "server survived concurrent garbage"
+    );
 }
 
 /// Interleave valid and invalid commands to test state machine robustness.
@@ -3731,7 +3878,10 @@ async fn test_fuzz_interleaved_valid_invalid() {
     // Valid: stats still works
     conn.mustsend("stats\r\n").await;
     let resp = conn.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready: 1"), "job should still be there");
+    assert!(
+        resp.contains("current-jobs-ready: 1"),
+        "job should still be there"
+    );
 }
 
 /// Test that put with bytes=u32::MAX doesn't crash (OOM protection).
@@ -3762,7 +3912,10 @@ async fn test_fuzz_put_huge_body_size() {
     let mut fresh = server.connect().await;
     fresh.mustsend("stats\r\n").await;
     let resp = fresh.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "server survived huge body size request");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "server survived huge body size request"
+    );
 }
 
 /// Test that put with body exceeding max_job_size is rejected but connection stays open.
@@ -3781,7 +3934,10 @@ async fn test_put_oversized_body_keeps_connection() {
     // Connection should still work for subsequent commands
     conn.mustsend("stats\r\n").await;
     let resp = conn.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "connection still works after oversized put");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "connection still works after oversized put"
+    );
 }
 
 /// Test that a legitimate put with long extension keys works within the line limit.
@@ -3792,11 +3948,13 @@ async fn test_fuzz_long_put_with_extensions() {
 
     // 200-char key (max tube/key name length)
     let long_key = "a".repeat(200);
-    let cmd = format!(
-        "put 0 0 120 5 idp:{long_key} grp:{long_key} aft:{long_key} con:{long_key}\r\n"
-    );
+    let cmd =
+        format!("put 0 0 120 5 idp:{long_key} grp:{long_key} aft:{long_key} con:{long_key}\r\n");
     // This is ~891 bytes — should be under the 1024 limit
-    assert!(cmd.len() < 1024, "test setup: cmd should fit in MAX_LINE_LEN");
+    assert!(
+        cmd.len() < 1024,
+        "test setup: cmd should fit in MAX_LINE_LEN"
+    );
 
     conn.mustsend(&cmd).await;
     conn.mustsend("hello\r\n").await;
@@ -3817,7 +3975,11 @@ async fn test_fuzz_line_over_max_rejected() {
     let result = tokio::time::timeout(Duration::from_secs(2), conn.readline()).await;
     match result {
         Ok(line) => {
-            assert!(line.contains("BAD_FORMAT"), "expected BAD_FORMAT, got: {:?}", line);
+            assert!(
+                line.contains("BAD_FORMAT"),
+                "expected BAD_FORMAT, got: {:?}",
+                line
+            );
         }
         Err(_) => {
             // Timeout — also acceptable
@@ -3830,7 +3992,9 @@ async fn test_fuzz_line_over_max_rejected() {
 async fn test_fuzz_very_long_line_no_newline() {
     let server = TestServer::start().await;
 
-    let stream = TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let stream = TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
     stream.set_nodelay(true).unwrap();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -3844,7 +4008,11 @@ async fn test_fuzz_very_long_line_no_newline() {
     let result = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut buf)).await;
     match result {
         Ok(Ok(_)) => {
-            assert!(buf.contains("BAD_FORMAT"), "expected BAD_FORMAT, got: {:?}", buf);
+            assert!(
+                buf.contains("BAD_FORMAT"),
+                "expected BAD_FORMAT, got: {:?}",
+                buf
+            );
         }
         Ok(Err(_)) | Err(_) => {
             // Connection closed or timeout — also acceptable
@@ -3855,5 +4023,8 @@ async fn test_fuzz_very_long_line_no_newline() {
     let mut fresh = server.connect().await;
     fresh.mustsend("stats\r\n").await;
     let resp = fresh.read_ok_body().await;
-    assert!(resp.contains("current-jobs-ready"), "server survived long line attack");
+    assert!(
+        resp.contains("current-jobs-ready"),
+        "server survived long line attack"
+    );
 }
