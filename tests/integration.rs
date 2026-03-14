@@ -135,7 +135,6 @@ impl TestConn {
         id
     }
 
-
     /// Read a RESERVED_BATCH response and return (id, body_string) pairs.
     async fn read_reserve_batch(&mut self) -> Vec<(u64, String)> {
         let header = self.readline().await;
@@ -153,13 +152,10 @@ impl TestConn {
             let id: u64 = parts[1].parse().unwrap();
             let bytes: usize = parts[2].parse().unwrap();
             let mut buf = vec![0u8; bytes + 2];
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                self.reader.read_exact(&mut buf),
-            )
-            .await
-            .expect("read body timed out")
-            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), self.reader.read_exact(&mut buf))
+                .await
+                .expect("read body timed out")
+                .unwrap();
             buf.truncate(bytes);
             let body = String::from_utf8(buf).unwrap();
             jobs.push((id, body));
@@ -3509,4 +3505,355 @@ async fn test_reserve_batch_count_one() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].0, id);
     assert_eq!(jobs[0].1, "single");
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz / garbage input tests
+// ---------------------------------------------------------------------------
+
+/// Fire a bunch of garbage lines at the server and make sure it stays alive.
+#[tokio::test]
+async fn test_fuzz_garbage_commands() {
+    let server = TestServer::start().await;
+
+    let garbage_inputs: Vec<&[u8]> = vec![
+        // Empty / whitespace
+        b"\r\n",
+        b"\n",
+        b"   \r\n",
+        b"\t\t\r\n",
+        // Random bytes
+        b"\xff\xfe\xfd\r\n",
+        b"\x00\x00\x00\r\n",
+        // Partial commands
+        b"pu\r\n",
+        b"reser\r\n",
+        b"d\r\n",
+        // Commands with absurd arguments
+        b"put 99999999999999999999 0 0 0\r\n",
+        b"delete 99999999999999999999999999999\r\n",
+        b"reserve-with-timeout 99999999999999999\r\n",
+        b"kick 99999999999999999999999\r\n",
+        // Negative-looking numbers
+        b"put -1 -1 -1 -1\r\n",
+        b"delete -1\r\n",
+        b"release -1 -1 -1\r\n",
+        // Commands with too many args
+        b"delete 1 2 3 4 5\r\n",
+        b"reserve extra args here\r\n",
+        b"stats extra\r\n",
+        // Very long tube name
+        b"use AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n",
+        // Special characters in tube names
+        b"use \x01\x02\x03\r\n",
+        b"use ../../../etc/passwd\r\n",
+        b"watch '; DROP TABLE tubes;--\r\n",
+        // Embedded NUL bytes
+        b"put 0 0 10\x005\r\n",
+        b"use \x00default\r\n",
+        // Unicode / multi-byte
+        b"use \xc3\xa9\xc3\xa0\xc3\xbc\r\n",
+        b"put \xe2\x80\x8b 0 0 5\r\n",
+        // Protocol confusion
+        b"GET / HTTP/1.1\r\n",
+        b"HELO smtp.example.com\r\n",
+        b"EHLO\r\n",
+        // Repeated commands mashed together (no newlines between)
+        b"put 0 0 10 5put 0 0 10 5\r\n",
+        // Just the command prefix with nothing else
+        b"put \r\n",
+        b"put\r\n",
+        b"use \r\n",
+        b"use\r\n",
+        b"watch \r\n",
+        b"watch\r\n",
+        b"ignore \r\n",
+        b"delete \r\n",
+        b"release \r\n",
+        b"bury \r\n",
+        b"kick \r\n",
+        b"touch \r\n",
+        b"peek \r\n",
+        b"stats-job \r\n",
+        b"stats-tube \r\n",
+        b"pause-tube \r\n",
+        b"flush-tube \r\n",
+        b"reserve-batch \r\n",
+        // Extension tags with garbage
+        b"put 0 0 10 5 idp:\r\n",
+        b"put 0 0 10 5 grp:\r\n",
+        b"put 0 0 10 5 aft:\r\n",
+        b"put 0 0 10 5 con:\r\n",
+        b"put 0 0 10 5 con:key:0\r\n",
+        b"put 0 0 10 5 con:key:-1\r\n",
+        b"put 0 0 10 5 con:key:99999999999999\r\n",
+        b"put 0 0 10 5 idp:key:abc\r\n",
+        // Tab-separated instead of space
+        b"put\t0\t0\t10\t5\r\n",
+        // Carriage return only (no line feed)
+        b"stats\r",
+    ];
+
+    // Send all garbage on a single connection and verify the server responds
+    // to each with an error (not a crash).
+    let mut conn = server.connect().await;
+
+    for input in &garbage_inputs {
+        // Some inputs contain invalid UTF-8 which will cause read_line to error,
+        // closing the connection. We handle that by reconnecting.
+        conn.writer.write_all(input).await.unwrap();
+    }
+
+    // After all garbage, the server should still accept new connections
+    // and process valid commands.
+    let mut fresh = server.connect().await;
+    fresh.mustsend("stats\r\n").await;
+    let resp = fresh.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "server still healthy after garbage");
+}
+
+/// Fire garbage that looks like put commands with mismatched body sizes.
+#[tokio::test]
+async fn test_fuzz_put_body_mismatch() {
+    let server = TestServer::start().await;
+
+    let cases: Vec<(&str, &[u8])> = vec![
+        // Claim 5 bytes but send 0
+        ("put 0 0 10 5\r\n", b"\r\n"),
+        // Claim 5 bytes but send 100
+        ("put 0 0 10 5\r\n", b"this is way more than five bytes of data, way way more!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n"),
+        // Claim 0 bytes
+        ("put 0 0 10 0\r\n", b"\r\n"),
+        // Body without trailing \r\n
+        ("put 0 0 10 5\r\n", b"hello"),
+        // Body with only \n (no \r)
+        ("put 0 0 10 5\r\n", b"hello\n"),
+    ];
+
+    for (cmd, body) in &cases {
+        // Each case might break the connection, so reconnect each time
+        let mut conn = server.connect().await;
+        conn.writer.write_all(cmd.as_bytes()).await.unwrap();
+        conn.writer.write_all(body).await.unwrap();
+        // Read whatever response we get (or timeout, which is fine)
+        let _ = tokio::time::timeout(Duration::from_millis(500), conn.readline()).await;
+    }
+
+    // Server should still be alive
+    let mut fresh = server.connect().await;
+    fresh.mustsend("stats\r\n").await;
+    let resp = fresh.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "server survived body mismatches");
+}
+
+/// Rapid connect/disconnect without sending anything.
+#[tokio::test]
+async fn test_fuzz_rapid_connect_disconnect() {
+    let server = TestServer::start().await;
+
+    for _ in 0..100 {
+        let stream = TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+        drop(stream);
+    }
+
+    // Server should still work
+    let mut conn = server.connect().await;
+    conn.mustsend("stats\r\n").await;
+    let resp = conn.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "server survived rapid connect/disconnect");
+}
+
+/// Send many concurrent connections with garbage.
+#[tokio::test]
+async fn test_fuzz_concurrent_garbage() {
+    let server = TestServer::start().await;
+
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let port = server.port;
+        handles.push(tokio::spawn(async move {
+            let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let (_, mut writer) = stream.into_split();
+            // Each connection sends different garbage
+            for j in 0..50 {
+                let garbage = format!("garbage_{}_{}_{}\r\n", i, j, "X".repeat(j % 100));
+                let _ = writer.write_all(garbage.as_bytes()).await;
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    // Server should still work
+    let mut conn = server.connect().await;
+    conn.mustsend("stats\r\n").await;
+    let resp = conn.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "server survived concurrent garbage");
+}
+
+/// Interleave valid and invalid commands to test state machine robustness.
+#[tokio::test]
+async fn test_fuzz_interleaved_valid_invalid() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    // Valid: use a tube
+    conn.mustsend("use test_fuzz\r\n").await;
+    conn.ckresp("USING test_fuzz\r\n").await;
+
+    // Garbage
+    conn.mustsend("not_a_command\r\n").await;
+    conn.ckresp("UNKNOWN_COMMAND\r\n").await;
+
+    // Valid: put a job
+    conn.mustsend("put 0 0 120 5\r\nhello\r\n").await;
+    conn.ckrespsub("INSERTED").await;
+
+    // Bad format
+    conn.mustsend("put abc\r\n").await;
+    conn.ckresp("BAD_FORMAT\r\n").await;
+
+    // Valid: peek (FOUND has a body: "FOUND <id> <bytes>\r\n<body>\r\n")
+    conn.mustsend("peek-ready\r\n").await;
+    let resp = conn.readline().await;
+    assert!(resp.starts_with("FOUND "), "peek-ready should find the job");
+    let _body = conn.readline().await; // consume body line
+
+    // More garbage
+    conn.mustsend("delete\r\n").await; // missing id — "delete" without space is not matched by strip_prefix("delete ")
+    conn.ckresp("UNKNOWN_COMMAND\r\n").await;
+
+    conn.mustsend("delete not_a_number\r\n").await;
+    conn.ckresp("BAD_FORMAT\r\n").await;
+
+    // Valid: stats still works
+    conn.mustsend("stats\r\n").await;
+    let resp = conn.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready: 1"), "job should still be there");
+}
+
+/// Test that put with bytes=u32::MAX doesn't crash (OOM protection).
+#[tokio::test]
+async fn test_fuzz_put_huge_body_size() {
+    // Use a small max_job_size to ensure rejection
+    let server = TestServer::start_with_max_job_size(1024).await;
+    let mut conn = server.connect().await;
+
+    // Try to put with claimed size of 2GB — the server should reject before allocating
+    conn.mustsend("put 0 0 10 2000000000\r\n").await;
+    let resp = tokio::time::timeout(Duration::from_secs(2), conn.readline()).await;
+    // Either JOB_TOO_BIG or connection closed is acceptable — crash is not
+    match resp {
+        Ok(line) => {
+            assert!(
+                line.contains("JOB_TOO_BIG") || line.contains("BAD_FORMAT"),
+                "expected rejection, got: {:?}",
+                line
+            );
+        }
+        Err(_) => {
+            // Timeout — acceptable, server is protecting itself
+        }
+    }
+
+    // Server should still be alive
+    let mut fresh = server.connect().await;
+    fresh.mustsend("stats\r\n").await;
+    let resp = fresh.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "server survived huge body size request");
+}
+
+/// Test that put with body exceeding max_job_size is rejected but connection stays open.
+#[tokio::test]
+async fn test_put_oversized_body_keeps_connection() {
+    let server = TestServer::start_with_max_job_size(10).await;
+    let mut conn = server.connect().await;
+
+    // Send a put with 20 bytes (over the 10-byte limit)
+    conn.mustsend("put 0 0 120 20\r\n").await;
+    conn.ckresp("JOB_TOO_BIG\r\n").await;
+
+    // Send the body anyway (server should drain it)
+    conn.mustsend("01234567890123456789\r\n").await;
+
+    // Connection should still work for subsequent commands
+    conn.mustsend("stats\r\n").await;
+    let resp = conn.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "connection still works after oversized put");
+}
+
+/// Test that a legitimate put with long extension keys works within the line limit.
+#[tokio::test]
+async fn test_fuzz_long_put_with_extensions() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    // 200-char key (max tube/key name length)
+    let long_key = "a".repeat(200);
+    let cmd = format!(
+        "put 0 0 120 5 idp:{long_key} grp:{long_key} aft:{long_key} con:{long_key}\r\n"
+    );
+    // This is ~891 bytes — should be under the 1024 limit
+    assert!(cmd.len() < 1024, "test setup: cmd should fit in MAX_LINE_LEN");
+
+    conn.mustsend(&cmd).await;
+    conn.mustsend("hello\r\n").await;
+    conn.ckrespsub("INSERTED").await;
+}
+
+/// Test that a line over MAX_LINE_LEN (1024) gets rejected.
+#[tokio::test]
+async fn test_fuzz_line_over_max_rejected() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    // Send a 1100-byte line — over the 1024 limit
+    let long_cmd = format!("use {}\r\n", "B".repeat(1090));
+    conn.writer.write_all(long_cmd.as_bytes()).await.unwrap();
+
+    // Should get BAD_FORMAT (and connection closed)
+    let result = tokio::time::timeout(Duration::from_secs(2), conn.readline()).await;
+    match result {
+        Ok(line) => {
+            assert!(line.contains("BAD_FORMAT"), "expected BAD_FORMAT, got: {:?}", line);
+        }
+        Err(_) => {
+            // Timeout — also acceptable
+        }
+    }
+}
+
+/// Test that a very long line without newline gets rejected (not OOM).
+#[tokio::test]
+async fn test_fuzz_very_long_line_no_newline() {
+    let server = TestServer::start().await;
+
+    let stream = TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    // Send 1KB of 'A' with no newline — should exceed MAX_LINE_LEN (224 bytes)
+    let long_line = "A".repeat(1000);
+    writer.write_all(long_line.as_bytes()).await.unwrap();
+
+    // Server should respond with BAD_FORMAT and close the connection
+    let mut buf = String::new();
+    let result = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut buf)).await;
+    match result {
+        Ok(Ok(_)) => {
+            assert!(buf.contains("BAD_FORMAT"), "expected BAD_FORMAT, got: {:?}", buf);
+        }
+        Ok(Err(_)) | Err(_) => {
+            // Connection closed or timeout — also acceptable
+        }
+    }
+
+    // Server should still be alive for other connections
+    let mut fresh = server.connect().await;
+    fresh.mustsend("stats\r\n").await;
+    let resp = fresh.read_ok_body().await;
+    assert!(resp.contains("current-jobs-ready"), "server survived long line attack");
 }

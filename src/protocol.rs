@@ -158,9 +158,7 @@ impl Response {
             Response::ReservedBatch(jobs) => {
                 let mut out = format!("RESERVED_BATCH {}\r\n", jobs.len()).into_bytes();
                 for (id, body) in jobs {
-                    out.extend_from_slice(
-                        format!("RESERVED {id} {}\r\n", body.len()).as_bytes(),
-                    );
+                    out.extend_from_slice(format!("RESERVED {id} {}\r\n", body.len()).as_bytes());
                     out.extend_from_slice(body);
                     out.extend_from_slice(b"\r\n");
                 }
@@ -995,10 +993,7 @@ mod tests {
 
     #[test]
     fn test_response_reserved_batch_serialize() {
-        let resp = Response::ReservedBatch(vec![
-            (1, b"hello".to_vec()),
-            (2, b"world".to_vec()),
-        ]);
+        let resp = Response::ReservedBatch(vec![(1, b"hello".to_vec()), (2, b"world".to_vec())]);
         let out = resp.serialize();
         let expected = b"RESERVED_BATCH 2\r\nRESERVED 1 5\r\nhello\r\nRESERVED 2 5\r\nworld\r\n";
         assert_eq!(out, expected);

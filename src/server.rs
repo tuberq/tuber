@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
-use crate::job::{Job, JobState, URGENT_THRESHOLD};
+use crate::job::{Job, JobState, MAX_TUBE_NAME_LEN, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, Response};
 use crate::tube::Tube;
 use crate::wal::{IdpTombstone, Wal};
@@ -2584,10 +2584,12 @@ pub async fn run_with_listener(
     }
 
     // Send shutdown to engine and wait for it to flush WAL
-    let _ = engine_tx.send(EngineMsg {
-        conn_id: 0,
-        payload: EnginePayload::Shutdown,
-    }).await;
+    let _ = engine_tx
+        .send(EngineMsg {
+            conn_id: 0,
+            payload: EnginePayload::Shutdown,
+        })
+        .await;
 
     // Drop the sender so the engine loop exits after processing Shutdown
     drop(engine_tx);
@@ -2597,6 +2599,27 @@ pub async fn run_with_listener(
 
 /// Atomic counter for connection IDs (simpler than engine round-trip).
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Maximum digits in a u32 value (4294967295).
+const MAX_U32_DIGITS: usize = 10;
+
+/// Maximum command line length in bytes, including the trailing \r\n.
+/// Derived from the longest possible command (put with all extensions):
+///   "put "                                           =   4
+///   pri + " " + delay + " " + ttr + " " + bytes     =  43  (4 × u32 + 3 spaces)
+///   " idp:" + key + ":" + ttl                        = 216  (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS)
+///   " grp:" + name                                   = 205  (5 + MAX_TUBE_NAME_LEN)
+///   " aft:" + name                                   = 205  (5 + MAX_TUBE_NAME_LEN)
+///   " con:" + key + ":" + limit                      = 216  (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS)
+///   "\r\n"                                           =   2
+///   Total                                            = 891
+const MAX_LINE_LEN: u64 = (4
+    + (MAX_U32_DIGITS * 4 + 3)
+    + (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS) // idp:key:ttl
+    + (5 + MAX_TUBE_NAME_LEN)                       // grp:name
+    + (5 + MAX_TUBE_NAME_LEN)                       // aft:name
+    + (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS) // con:key:limit
+    + 2) as u64;
 
 async fn handle_connection(
     socket: tokio::net::TcpStream,
@@ -2611,9 +2634,18 @@ async fn handle_connection(
 
     loop {
         line_buf.clear();
-        let _n = match reader.read_line(&mut line_buf).await {
+        // Limit read to MAX_LINE_LEN to prevent unbounded memory growth from
+        // clients that send data without a newline. Matches beanstalkd behavior.
+        let _n = match (&mut reader).take(MAX_LINE_LEN).read_line(&mut line_buf).await {
             Ok(0) => break, // EOF
-            Ok(n) => n,
+            Ok(n) => {
+                if !line_buf.ends_with('\n') {
+                    // Line exceeded MAX_LINE_LEN without a newline — bad client
+                    let _ = writer.write_all(&Response::BadFormat.serialize()).await;
+                    break;
+                }
+                n
+            }
             Err(e) => {
                 tracing::debug!("read error for conn {}: {}", conn_id, e);
                 break;
@@ -2640,6 +2672,21 @@ async fn handle_connection(
         // If it's a put command, read the body
         let body = if let Command::Put { bytes, .. } = &cmd {
             let body_size = *bytes as usize;
+
+            // Check size BEFORE allocating to prevent OOM from malicious clients
+            if body_size > max_job_size as usize {
+                let _ = writer.write_all(&Response::JobTooBig.serialize()).await;
+                // Drain the body + \r\n so the connection stays usable
+                let to_drain = body_size as u64 + 2;
+                if tokio::io::copy(&mut (&mut reader).take(to_drain), &mut tokio::io::sink())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+
             let mut body_buf = vec![0u8; body_size + 2]; // +2 for \r\n
             match reader.read_exact(&mut body_buf).await {
                 Ok(_) => {
@@ -2649,11 +2696,6 @@ async fn handle_connection(
                         continue;
                     }
                     body_buf.truncate(body_size);
-
-                    if body_size > max_job_size as usize {
-                        let _ = writer.write_all(&Response::JobTooBig.serialize()).await;
-                        continue;
-                    }
 
                     Some(body_buf)
                 }

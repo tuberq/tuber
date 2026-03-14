@@ -160,7 +160,12 @@ fn fmt_dur(d: Duration) -> String {
 // Scenarios
 // ---------------------------------------------------------------------------
 
-async fn scenario_put(addr: &str, num_conns: usize, jobs_per_conn: usize, body: &[u8]) -> LatencyStats {
+async fn scenario_put(
+    addr: &str,
+    num_conns: usize,
+    jobs_per_conn: usize,
+    body: &[u8],
+) -> LatencyStats {
     let body = Arc::new(body.to_vec());
     let addr = addr.to_string();
 
@@ -175,7 +180,10 @@ async fn scenario_put(addr: &str, num_conns: usize, jobs_per_conn: usize, body: 
             let mut latencies = Vec::with_capacity(jobs_per_conn);
             for _ in 0..jobs_per_conn {
                 let t = Instant::now();
-                let resp = client.put(0, 0, 60, &body, None, None, None, None).await.unwrap();
+                let resp = client
+                    .put(0, 0, 60, &body, None, None, None, None)
+                    .await
+                    .unwrap();
                 latencies.push(t.elapsed());
                 assert!(resp.starts_with("INSERTED"), "unexpected: {resp}");
             }
@@ -201,7 +209,10 @@ async fn scenario_reserve_delete(
     {
         let mut loader = TuberClient::connect(addr).await.unwrap();
         for _ in 0..total_jobs {
-            let resp = loader.put(0, 0, 60, body, None, None, None, None).await.unwrap();
+            let resp = loader
+                .put(0, 0, 60, body, None, None, None, None)
+                .await
+                .unwrap();
             assert!(resp.starts_with("INSERTED"), "preload failed: {resp}");
         }
     }
@@ -262,7 +273,10 @@ async fn scenario_mixed(
         let mut loader = TuberClient::connect(addr).await.unwrap();
         let preload = consumers * jobs_per_conn / 4;
         for _ in 0..preload {
-            loader.put(0, 0, 60, &body, None, None, None, None).await.unwrap();
+            loader
+                .put(0, 0, 60, &body, None, None, None, None)
+                .await
+                .unwrap();
         }
     }
 
@@ -278,7 +292,10 @@ async fn scenario_mixed(
             let mut latencies = Vec::with_capacity(jobs_per_conn);
             for _ in 0..jobs_per_conn {
                 let t = Instant::now();
-                let resp = client.put(0, 0, 60, &body, None, None, None, None).await.unwrap();
+                let resp = client
+                    .put(0, 0, 60, &body, None, None, None, None)
+                    .await
+                    .unwrap();
                 latencies.push(t.elapsed());
                 assert!(resp.starts_with("INSERTED"), "unexpected: {resp}");
             }
@@ -410,13 +427,8 @@ async fn main() {
                 "reserve+delete" => {
                     let server = BenchServer::start().await;
                     let total_jobs = num_conns * config.jobs_per_conn;
-                    let stats = scenario_reserve_delete(
-                        &server.addr(),
-                        num_conns,
-                        total_jobs,
-                        &body,
-                    )
-                    .await;
+                    let stats =
+                        scenario_reserve_delete(&server.addr(), num_conns, total_jobs, &body).await;
                     if !config.json {
                         print_row("reserve+delete", &num_conns.to_string(), &stats);
                     }
@@ -436,7 +448,11 @@ async fn main() {
                     let conns_label = format!("{}+{}", effective / 2, effective - effective / 2);
                     if !config.json {
                         print_row("mixed (put)", &conns_label, &result.put_stats);
-                        print_row("mixed (reserve+delete)", &conns_label, &result.reserve_delete_stats);
+                        print_row(
+                            "mixed (reserve+delete)",
+                            &conns_label,
+                            &result.reserve_delete_stats,
+                        );
                     }
                     results.push(ScenarioResult {
                         key: format!("mixed_put_{num_conns}"),

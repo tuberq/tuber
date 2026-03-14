@@ -94,10 +94,7 @@ impl TuberClient {
         }
     }
 
-    pub async fn reserve_batch(
-        &mut self,
-        count: u32,
-    ) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    pub async fn reserve_batch(&mut self, count: u32) -> io::Result<Vec<(u64, Vec<u8>)>> {
         self.send_line(&format!("reserve-batch {count}")).await?;
         let line = self.read_line().await?;
         let n: usize = line
