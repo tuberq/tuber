@@ -94,6 +94,40 @@ impl TuberClient {
         }
     }
 
+    pub async fn reserve_batch(
+        &mut self,
+        count: u32,
+    ) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        self.send_line(&format!("reserve-batch {count}")).await?;
+        let line = self.read_line().await?;
+        let n: usize = line
+            .strip_prefix("RESERVED_BATCH ")
+            .ok_or_else(|| io::Error::other(line.clone()))?
+            .trim()
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut jobs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let rline = self.read_line().await?;
+            let parts: Vec<&str> = rline.split_whitespace().collect();
+            if parts.len() != 3 || parts[0] != "RESERVED" {
+                return Err(io::Error::other(format!("unexpected: {rline}")));
+            }
+            let id: u64 = parts[1]
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let bytes: usize = parts[2]
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut buf = vec![0u8; bytes + 2];
+            self.reader.read_exact(&mut buf).await?;
+            buf.truncate(bytes);
+            jobs.push((id, buf));
+        }
+        Ok(jobs)
+    }
+
     pub async fn delete(&mut self, id: u64) -> io::Result<String> {
         self.send_line(&format!("delete {id}")).await?;
         self.read_line().await

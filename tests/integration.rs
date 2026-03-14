@@ -134,6 +134,38 @@ impl TestConn {
         self.readline().await; // consume body line
         id
     }
+
+
+    /// Read a RESERVED_BATCH response and return (id, body_string) pairs.
+    async fn read_reserve_batch(&mut self) -> Vec<(u64, String)> {
+        let header = self.readline().await;
+        let n: usize = header
+            .trim_end()
+            .strip_prefix("RESERVED_BATCH ")
+            .unwrap_or_else(|| panic!("expected RESERVED_BATCH, got {:?}", header))
+            .parse()
+            .unwrap();
+        let mut jobs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let rline = self.readline().await;
+            let parts: Vec<&str> = rline.trim_end().split_whitespace().collect();
+            assert_eq!(parts[0], "RESERVED", "expected RESERVED, got {:?}", rline);
+            let id: u64 = parts[1].parse().unwrap();
+            let bytes: usize = parts[2].parse().unwrap();
+            let mut buf = vec![0u8; bytes + 2];
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.reader.read_exact(&mut buf),
+            )
+            .await
+            .expect("read body timed out")
+            .unwrap();
+            buf.truncate(bytes);
+            let body = String::from_utf8(buf).unwrap();
+            jobs.push((id, body));
+        }
+        jobs
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3337,4 +3369,144 @@ async fn test_deadline_soon_proactive_wake() {
         "expected proactive wake within 5s, took {:?}",
         elapsed
     );
+}
+
+// ---------------------------------------------------------------------------
+// reserve-batch tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_reserve_batch_basic() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // Put 5 jobs with ascending priority
+    for i in 0..5u32 {
+        c.put_job(i, 0, 120, &format!("job{i}")).await;
+    }
+
+    c.mustsend("reserve-batch 5\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 5);
+    // Should be in priority order
+    for (i, (_id, body)) in jobs.iter().enumerate() {
+        assert_eq!(body, &format!("job{i}"));
+    }
+}
+
+#[tokio::test]
+async fn test_reserve_batch_partial() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.put_job(0, 0, 120, "a").await;
+    c.put_job(0, 0, 120, "b").await;
+    c.put_job(0, 0, 120, "c").await;
+
+    c.mustsend("reserve-batch 10\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 3);
+}
+
+#[tokio::test]
+async fn test_reserve_batch_empty() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.mustsend("reserve-batch 5\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 0);
+}
+
+#[tokio::test]
+async fn test_reserve_batch_priority_order() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // Insert in reverse priority order
+    let id3 = c.put_job(30, 0, 120, "low").await;
+    let id1 = c.put_job(10, 0, 120, "high").await;
+    let id2 = c.put_job(20, 0, 120, "mid").await;
+
+    c.mustsend("reserve-batch 3\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs[0].0, id1);
+    assert_eq!(jobs[1].0, id2);
+    assert_eq!(jobs[2].0, id3);
+}
+
+#[tokio::test]
+async fn test_reserve_batch_concurrency_key() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // Put 5 jobs with concurrency limit of 2
+    for i in 0..5u32 {
+        let cmd = format!("put 0 0 120 3 con:key:2\r\n");
+        c.mustsend(&cmd).await;
+        c.mustsend(&format!("jb{i}\r\n")).await;
+        c.ckrespsub("INSERTED").await;
+    }
+
+    c.mustsend("reserve-batch 5\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 2, "concurrency limit should cap at 2");
+}
+
+#[tokio::test]
+async fn test_reserve_batch_multi_tube() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    // Put jobs in two tubes
+    c.mustsend("use tube1\r\n").await;
+    c.ckresp("USING tube1\r\n").await;
+    c.put_job(10, 0, 120, "t1").await;
+
+    c.mustsend("use tube2\r\n").await;
+    c.ckresp("USING tube2\r\n").await;
+    c.put_job(5, 0, 120, "t2").await;
+
+    // Watch both tubes
+    c.mustsend("watch tube1\r\n").await;
+    c.ckrespsub("WATCHING").await;
+    c.mustsend("watch tube2\r\n").await;
+    c.ckrespsub("WATCHING").await;
+
+    c.mustsend("reserve-batch 5\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 2);
+    // tube2 job has lower priority (5 < 10), should come first
+    assert_eq!(jobs[0].1, "t2");
+    assert_eq!(jobs[1].1, "t1");
+}
+
+#[tokio::test]
+async fn test_reserve_batch_bad_format() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.mustsend("reserve-batch 0\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+
+    c.mustsend("reserve-batch 1001\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+
+    c.mustsend("reserve-batch abc\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+}
+
+#[tokio::test]
+async fn test_reserve_batch_count_one() {
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    let id = c.put_job(0, 0, 120, "single").await;
+
+    c.mustsend("reserve-batch 1\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].0, id);
+    assert_eq!(jobs[0].1, "single");
 }

@@ -79,6 +79,9 @@ pub enum Command {
     FlushTube {
         tube: String,
     },
+    ReserveBatch {
+        count: u32,
+    },
     StatsGroup {
         group: String,
     },
@@ -87,7 +90,7 @@ pub enum Command {
 }
 
 /// Responses sent back to the client.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     Inserted(u64),
     InsertedDup(u64, &'static str),
@@ -106,6 +109,7 @@ pub enum Response {
     NotFound,
     Watching(usize),
     NotIgnored,
+    ReservedBatch(Vec<(u64, Vec<u8>)>),
     Ok(Vec<u8>),
     Paused,
     Flushed(u32),
@@ -151,6 +155,17 @@ impl Response {
             Response::NotFound => b"NOT_FOUND\r\n".to_vec(),
             Response::Watching(n) => format!("WATCHING {n}\r\n").into_bytes(),
             Response::NotIgnored => b"NOT_IGNORED\r\n".to_vec(),
+            Response::ReservedBatch(jobs) => {
+                let mut out = format!("RESERVED_BATCH {}\r\n", jobs.len()).into_bytes();
+                for (id, body) in jobs {
+                    out.extend_from_slice(
+                        format!("RESERVED {id} {}\r\n", body.len()).as_bytes(),
+                    );
+                    out.extend_from_slice(body);
+                    out.extend_from_slice(b"\r\n");
+                }
+                out
+            }
             Response::Ok(data) => serialize_with_body(format!("OK {}\r\n", data.len()), data),
             Response::Paused => b"PAUSED\r\n".to_vec(),
             Response::Flushed(n) => format!("FLUSHED {n}\r\n").into_bytes(),
@@ -193,6 +208,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         Ok(Command::PeekDelayed)
     } else if line == "peek-buried" {
         Ok(Command::PeekBuried)
+    } else if let Some(rest) = line.strip_prefix("reserve-batch ") {
+        parse_reserve_batch(rest)
     } else if let Some(rest) = line.strip_prefix("reserve-mode ") {
         Ok(Command::ReserveMode {
             mode: rest.to_string(),
@@ -342,6 +359,16 @@ fn parse_peek(rest: &str) -> Result<Command, Response> {
     parse_uint(rest).map(|id| Command::Peek { id })
 }
 
+const MAX_RESERVE_BATCH: u32 = 1000;
+
+fn parse_reserve_batch(rest: &str) -> Result<Command, Response> {
+    let count: u32 = parse_uint(rest)?;
+    if count == 0 || count > MAX_RESERVE_BATCH {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::ReserveBatch { count })
+}
+
 fn parse_reserve_with_timeout(rest: &str) -> Result<Command, Response> {
     parse_uint(rest).map(|timeout| Command::ReserveWithTimeout { timeout })
 }
@@ -372,7 +399,7 @@ fn parse_bury(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_use(rest: &str) -> Result<Command, Response> {
-    let name = rest.trim();
+    let name = rest;
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
@@ -382,7 +409,11 @@ fn parse_use(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_watch(rest: &str) -> Result<Command, Response> {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
+    // Reject leading/trailing whitespace to avoid ambiguity with the weight delimiter
+    if rest != rest.trim() {
+        return Err(Response::BadFormat);
+    }
+    let parts: Vec<&str> = rest.split(' ').collect();
     if parts.is_empty() || parts.len() > 2 {
         return Err(Response::BadFormat);
     }
@@ -406,7 +437,7 @@ fn parse_watch(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_ignore(rest: &str) -> Result<Command, Response> {
-    let name = rest.trim();
+    let name = rest;
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
@@ -416,7 +447,7 @@ fn parse_ignore(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_stats_tube(rest: &str) -> Result<Command, Response> {
-    let name = rest.trim();
+    let name = rest;
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
@@ -426,7 +457,7 @@ fn parse_stats_tube(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_stats_group(rest: &str) -> Result<Command, Response> {
-    let name = rest.trim();
+    let name = rest;
     if !is_valid_key(name) {
         return Err(Response::BadFormat);
     }
@@ -436,7 +467,7 @@ fn parse_stats_group(rest: &str) -> Result<Command, Response> {
 }
 
 fn parse_flush_tube(rest: &str) -> Result<Command, Response> {
-    let name = rest.trim();
+    let name = rest;
     if !is_valid_tube_name(name) {
         return Err(Response::BadFormat);
     }
@@ -779,6 +810,17 @@ mod tests {
     }
 
     #[test]
+    fn test_tube_name_with_trailing_space_rejected() {
+        // Trailing spaces should not be silently trimmed — reject like beanstalkd does
+        assert_eq!(parse_command("use ; "), Err(Response::BadFormat));
+        assert_eq!(parse_command("use foo "), Err(Response::BadFormat));
+        assert_eq!(parse_command("use  foo"), Err(Response::BadFormat));
+        assert_eq!(parse_command("watch ; "), Err(Response::BadFormat));
+        assert_eq!(parse_command("watch foo "), Err(Response::BadFormat));
+        assert_eq!(parse_command("ignore foo "), Err(Response::BadFormat));
+    }
+
+    #[test]
     fn test_tube_name_max_length() {
         let name_200 = "a".repeat(200);
         assert!(is_valid_tube_name(&name_200));
@@ -924,5 +966,47 @@ mod tests {
     fn test_parse_stats_group_bad_name() {
         assert!(parse_command("stats-group -bad").is_err());
         assert!(parse_command("stats-group ").is_err());
+    }
+
+    #[test]
+    fn test_parse_reserve_batch() {
+        assert_eq!(
+            parse_command("reserve-batch 5").unwrap(),
+            Command::ReserveBatch { count: 5 }
+        );
+        assert_eq!(
+            parse_command("reserve-batch 1").unwrap(),
+            Command::ReserveBatch { count: 1 }
+        );
+        assert_eq!(
+            parse_command("reserve-batch 1000").unwrap(),
+            Command::ReserveBatch { count: 1000 }
+        );
+    }
+
+    #[test]
+    fn test_parse_reserve_batch_bad_format() {
+        assert!(parse_command("reserve-batch 0").is_err());
+        assert!(parse_command("reserve-batch 1001").is_err());
+        assert!(parse_command("reserve-batch").is_err());
+        assert!(parse_command("reserve-batch abc").is_err());
+        assert!(parse_command("reserve-batch -1").is_err());
+    }
+
+    #[test]
+    fn test_response_reserved_batch_serialize() {
+        let resp = Response::ReservedBatch(vec![
+            (1, b"hello".to_vec()),
+            (2, b"world".to_vec()),
+        ]);
+        let out = resp.serialize();
+        let expected = b"RESERVED_BATCH 2\r\nRESERVED 1 5\r\nhello\r\nRESERVED 2 5\r\nworld\r\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn test_response_reserved_batch_empty_serialize() {
+        let resp = Response::ReservedBatch(vec![]);
+        assert_eq!(resp.serialize(), b"RESERVED_BATCH 0\r\n");
     }
 }

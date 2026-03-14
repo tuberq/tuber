@@ -365,6 +365,7 @@ impl ServerState {
             Command::ReserveWithTimeout { timeout } => self.cmd_reserve(conn_id, Some(timeout)),
             Command::ReserveJob { id } => self.cmd_reserve_job(conn_id, id),
             Command::ReserveMode { mode } => self.cmd_reserve_mode(conn_id, &mode),
+            Command::ReserveBatch { count } => self.cmd_reserve_batch(conn_id, count),
             Command::Delete { id } => self.cmd_delete(conn_id, id),
             Command::Release { id, pri, delay } => self.cmd_release(conn_id, id, pri, delay),
             Command::Bury { id, pri } => self.cmd_bury(conn_id, id, pri),
@@ -595,6 +596,22 @@ impl ServerState {
         Response::Using(tube.to_string())
     }
 
+    /// Find the next ready job for a connection, respecting reserve mode.
+    fn find_next_ready_job(&mut self, conn_id: u64) -> Option<u64> {
+        let reserve_mode = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.reserve_mode)
+            .unwrap_or(ReserveMode::Fifo);
+
+        if reserve_mode == ReserveMode::Weighted {
+            self.select_weighted_job(conn_id)
+                .or_else(|| self.find_ready_job_for_conn(conn_id))
+        } else {
+            self.find_ready_job_for_conn(conn_id)
+        }
+    }
+
     fn cmd_reserve(&mut self, conn_id: u64, timeout: Option<u32>) -> Response {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.set_worker();
@@ -605,18 +622,7 @@ impl ServerState {
             return Response::DeadlineSoon;
         }
 
-        // Weighted mode: pick a tube by weight
-        let conn = self.conns.get(&conn_id);
-        let reserve_mode = conn.map(|c| c.reserve_mode).unwrap_or(ReserveMode::Fifo);
-
-        if reserve_mode == ReserveMode::Weighted
-            && let Some(job_id) = self.select_weighted_job(conn_id)
-        {
-            return self.do_reserve(conn_id, job_id);
-        }
-
-        // FIFO mode: try to find a ready job from watched tubes
-        if let Some(job_id) = self.find_ready_job_for_conn(conn_id) {
+        if let Some(job_id) = self.find_next_ready_job(conn_id) {
             return self.do_reserve(conn_id, job_id);
         }
 
@@ -762,6 +768,28 @@ impl ServerState {
             }
             _ => Response::BadFormat,
         }
+    }
+
+    fn cmd_reserve_batch(&mut self, conn_id: u64, count: u32) -> Response {
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.set_worker();
+        }
+
+        let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        for _ in 0..count {
+            let Some(jid) = self.find_next_ready_job(conn_id) else {
+                break;
+            };
+            let resp = self.do_reserve(conn_id, jid);
+            if let Response::Reserved { id, body } = resp {
+                collected.push((id, body));
+            } else {
+                break;
+            }
+        }
+
+        Response::ReservedBatch(collected)
     }
 
     fn cmd_delete(&mut self, conn_id: u64, id: u64) -> Response {

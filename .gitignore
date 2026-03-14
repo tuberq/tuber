@@ -1,4 +1,4 @@
 /target
 /data/
 /tmp/
-autoresearch.jsonl
+autoresearch-*.jsonl
