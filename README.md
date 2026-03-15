@@ -2,9 +2,17 @@
 
 An experimental, simple, fast job queue server. One binary, zero dependencies.
 
-Priority queues, delayed jobs, job reservations, named tubes — plus idempotency, concurrency control, and job group pipelines.
+Tube is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds idempotency, concurrency control, job group pipelines and weighted queues. 
 
-Every line of Rust in this project was written by AI. The architecture, testing strategy, and design decisions were human-driven.
+## How was this built?
+
+Every line of Rust in this project was written by Claude Opus 4.6. The architecture, testing strategy, and design decisions were human-driven.  I program in Ruby, I have programmed in C, Java and PHP - I have never programmed in Rust.
+
+I used Beanstalkd's C source code and tests as the foundation, first building a minimal working version, duplicating the tests, then incrementally adding the new extensions.
+
+The docs/ directory contains the working files we used to plan and describe the implementation.
+
+I use Beanstalkd in [Booko](https://booko.au). In my dev environment, I've replaced Beanstalkd with Tuber. I'll replace it in production when I'm comfortable with it. 
 
 ## Quick Start
 
