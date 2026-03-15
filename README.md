@@ -2,7 +2,7 @@
 
 An experimental, simple, fast job queue server. One binary, zero dependencies.
 
-Tuber is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds idempotency, concurrency control, job group pipelines and weighted queues.
+Tuber is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds unique jobs, concurrency control, job group pipelines and weighted queues.
 
 ## How was this built?
 
