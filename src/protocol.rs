@@ -1,7 +1,5 @@
 use crate::job::MAX_TUBE_NAME_LEN;
 
-const NAME_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-+/;.$_()";
-
 /// Commands parsed from the beanstalkd text protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -126,70 +124,84 @@ pub enum Response {
     JobTooBig,
 }
 
-/// Serialize a response header + body payload (header\r\nbody\r\n).
-fn serialize_with_body(header: String, body: &[u8]) -> Vec<u8> {
-    let mut out = header.into_bytes();
-    out.extend_from_slice(body);
-    out.extend_from_slice(b"\r\n");
-    out
-}
-
 impl Response {
-    /// Serialize the response to bytes for sending over TCP.
-    pub fn serialize(&self) -> Vec<u8> {
+    /// Serialize the response into a reusable buffer, avoiding per-call allocation.
+    pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+        use std::io::Write;
         match self {
-            Response::Inserted(id) => format!("INSERTED {id}\r\n").into_bytes(),
-            Response::InsertedDup(id, state) => format!("INSERTED {id} {state}\r\n").into_bytes(),
-            Response::BuriedId(id) => format!("BURIED {id}\r\n").into_bytes(),
-            Response::Buried => b"BURIED\r\n".to_vec(),
-            Response::Using(name) => format!("USING {name}\r\n").into_bytes(),
+            Response::Inserted(id) => { let _ = write!(buf, "INSERTED {id}\r\n"); }
+            Response::InsertedDup(id, state) => { let _ = write!(buf, "INSERTED {id} {state}\r\n"); }
+            Response::BuriedId(id) => { let _ = write!(buf, "BURIED {id}\r\n"); }
+            Response::Buried => buf.extend_from_slice(b"BURIED\r\n"),
+            Response::Using(name) => { let _ = write!(buf, "USING {name}\r\n"); }
             Response::Reserved { id, body } => {
-                serialize_with_body(format!("RESERVED {id} {}\r\n", body.len()), body)
+                let _ = write!(buf, "RESERVED {id} {}\r\n", body.len());
+                buf.extend_from_slice(body);
+                buf.extend_from_slice(b"\r\n");
             }
-            Response::DeadlineSoon => b"DEADLINE_SOON\r\n".to_vec(),
-            Response::TimedOut => b"TIMED_OUT\r\n".to_vec(),
-            Response::Deleted => b"DELETED\r\n".to_vec(),
-            Response::Released => b"RELEASED\r\n".to_vec(),
-            Response::Touched => b"TOUCHED\r\n".to_vec(),
-            Response::Kicked(n) => format!("KICKED {n}\r\n").into_bytes(),
-            Response::KickedOne => b"KICKED\r\n".to_vec(),
+            Response::DeadlineSoon => buf.extend_from_slice(b"DEADLINE_SOON\r\n"),
+            Response::TimedOut => buf.extend_from_slice(b"TIMED_OUT\r\n"),
+            Response::Deleted => buf.extend_from_slice(b"DELETED\r\n"),
+            Response::Released => buf.extend_from_slice(b"RELEASED\r\n"),
+            Response::Touched => buf.extend_from_slice(b"TOUCHED\r\n"),
+            Response::Kicked(n) => { let _ = write!(buf, "KICKED {n}\r\n"); }
+            Response::KickedOne => buf.extend_from_slice(b"KICKED\r\n"),
             Response::Found { id, body } => {
-                serialize_with_body(format!("FOUND {id} {}\r\n", body.len()), body)
+                let _ = write!(buf, "FOUND {id} {}\r\n", body.len());
+                buf.extend_from_slice(body);
+                buf.extend_from_slice(b"\r\n");
             }
-            Response::NotFound => b"NOT_FOUND\r\n".to_vec(),
-            Response::Watching(n) => format!("WATCHING {n}\r\n").into_bytes(),
-            Response::NotIgnored => b"NOT_IGNORED\r\n".to_vec(),
+            Response::NotFound => buf.extend_from_slice(b"NOT_FOUND\r\n"),
+            Response::Watching(n) => { let _ = write!(buf, "WATCHING {n}\r\n"); }
+            Response::NotIgnored => buf.extend_from_slice(b"NOT_IGNORED\r\n"),
             Response::ReservedBatch(jobs) => {
-                let mut out = format!("RESERVED_BATCH {}\r\n", jobs.len()).into_bytes();
+                let _ = write!(buf, "RESERVED_BATCH {}\r\n", jobs.len());
                 for (id, body) in jobs {
-                    out.extend_from_slice(format!("RESERVED {id} {}\r\n", body.len()).as_bytes());
-                    out.extend_from_slice(body);
-                    out.extend_from_slice(b"\r\n");
+                    let _ = write!(buf, "RESERVED {id} {}\r\n", body.len());
+                    buf.extend_from_slice(body);
+                    buf.extend_from_slice(b"\r\n");
                 }
-                out
             }
             Response::DeletedBatch { deleted, not_found } => {
-                format!("DELETED_BATCH {deleted} {not_found}\r\n").into_bytes()
+                let _ = write!(buf, "DELETED_BATCH {deleted} {not_found}\r\n");
             }
-            Response::Ok(data) => serialize_with_body(format!("OK {}\r\n", data.len()), data),
-            Response::Paused => b"PAUSED\r\n".to_vec(),
-            Response::Flushed(n) => format!("FLUSHED {n}\r\n").into_bytes(),
-            Response::OutOfMemory => b"OUT_OF_MEMORY\r\n".to_vec(),
-            Response::InternalError => b"INTERNAL_ERROR\r\n".to_vec(),
-            Response::Draining => b"DRAINING\r\n".to_vec(),
-            Response::BadFormat => b"BAD_FORMAT\r\n".to_vec(),
-            Response::UnknownCommand => b"UNKNOWN_COMMAND\r\n".to_vec(),
-            Response::ExpectedCrlf => b"EXPECTED_CRLF\r\n".to_vec(),
-            Response::JobTooBig => b"JOB_TOO_BIG\r\n".to_vec(),
+            Response::Ok(data) => {
+                let _ = write!(buf, "OK {}\r\n", data.len());
+                buf.extend_from_slice(data);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Response::Paused => buf.extend_from_slice(b"PAUSED\r\n"),
+            Response::Flushed(n) => { let _ = write!(buf, "FLUSHED {n}\r\n"); }
+            Response::OutOfMemory => buf.extend_from_slice(b"OUT_OF_MEMORY\r\n"),
+            Response::InternalError => buf.extend_from_slice(b"INTERNAL_ERROR\r\n"),
+            Response::Draining => buf.extend_from_slice(b"DRAINING\r\n"),
+            Response::BadFormat => buf.extend_from_slice(b"BAD_FORMAT\r\n"),
+            Response::UnknownCommand => buf.extend_from_slice(b"UNKNOWN_COMMAND\r\n"),
+            Response::ExpectedCrlf => buf.extend_from_slice(b"EXPECTED_CRLF\r\n"),
+            Response::JobTooBig => buf.extend_from_slice(b"JOB_TOO_BIG\r\n"),
         }
     }
+
+    /// Serialize the response to bytes for sending over TCP.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        self.serialize_into(&mut buf);
+        buf
+    }
+}
+
+fn is_valid_name_byte(b: u8) -> bool {
+    matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+        b'-' | b'+' | b'/' | b';' | b'.' | b'$' | b'_' | b'(' | b')'
+    )
 }
 
 fn is_valid_tube_name(name: &str) -> bool {
     let len = name.len();
     len > 0
         && len <= MAX_TUBE_NAME_LEN
-        && name.bytes().all(|b| NAME_CHARS.as_bytes().contains(&b))
+        && name.bytes().all(is_valid_name_byte)
         && !name.starts_with('-')
 }
 

@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "tuber"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bytes",
  "clap",

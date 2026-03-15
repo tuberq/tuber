@@ -478,7 +478,7 @@ impl ServerState {
         let id = self.next_job_id;
         self.next_job_id += 1;
 
-        let job = Job::new(
+        let mut job = Job::new(
             id,
             pri,
             Duration::from_secs(delay as u64),
@@ -487,31 +487,27 @@ impl ServerState {
             tube_name.clone(),
         );
 
-        self.jobs.insert(id, job);
+        // Set extension fields before inserting
+        job.idempotency_key = idempotency_key;
+        job.group = group;
+        job.after_group = after_group;
+        job.concurrency_key = concurrency_key;
 
-        // Set extension fields and register concurrency limit
-        if let Some((ref key, limit)) = concurrency_key {
+        // Register concurrency limit
+        if let Some((ref key, limit)) = job.concurrency_key {
             let entry = self.concurrency_limits.entry(key.clone()).or_insert(0);
             *entry = (*entry).max(limit);
         }
-        if let Some(job) = self.jobs.get_mut(&id) {
-            job.idempotency_key = idempotency_key;
-            job.group = group;
-            job.after_group = after_group;
-            job.concurrency_key = concurrency_key;
-        }
 
         // Register idempotency key in tube index
-        if let Some(job) = self.jobs.get(&id)
-            && let Some(ref key_tuple) = job.idempotency_key
-            && let Some(tube) = self.tubes.get_mut(&tube_name)
-        {
-            tube.idempotency_keys.insert(key_tuple.0.clone(), id);
+        if let Some(ref key_tuple) = job.idempotency_key {
+            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                tube.idempotency_keys.insert(key_tuple.0.clone(), id);
+            }
         }
 
         // Track group membership
-        let group_name = self.jobs.get(&id).and_then(|j| j.group.clone());
-        if let Some(ref grp) = group_name {
+        if let Some(ref grp) = job.group {
             let gs = self
                 .groups
                 .entry(grp.clone())
@@ -520,8 +516,7 @@ impl ServerState {
         }
 
         // Check if this is an after-group job that should be held
-        let after_group_name = self.jobs.get(&id).and_then(|j| j.after_group.clone());
-        let hold_for_group = if let Some(ref ag) = after_group_name {
+        let hold_for_group = if let Some(ref ag) = job.after_group {
             let gs = self
                 .groups
                 .entry(ag.clone())
@@ -534,19 +529,18 @@ impl ServerState {
         // Enqueue
         if delay > 0 {
             let deadline = Instant::now() + Duration::from_secs(delay as u64);
-            if let Some(job) = self.jobs.get_mut(&id) {
-                job.state = JobState::Delayed;
-                job.deadline_at = Some(deadline);
-            }
+            job.state = JobState::Delayed;
+            job.deadline_at = Some(deadline);
+            self.jobs.insert(id, job);
             if let Some(tube) = self.tubes.get_mut(&tube_name) {
                 tube.delay.insert((deadline, id), id);
             }
         } else if hold_for_group {
             // Hold this after-job: mark as delayed with no deadline (held indefinitely)
-            if let Some(job) = self.jobs.get_mut(&id) {
-                job.state = JobState::Delayed;
-                job.deadline_at = None;
-            }
+            job.state = JobState::Delayed;
+            job.deadline_at = None;
+            let after_group_name = job.after_group.clone();
+            self.jobs.insert(id, job);
             // Add to group's waiting list (will be promoted when group completes)
             if let Some(ref ag) = after_group_name
                 && let Some(gs) = self.groups.get_mut(ag)
@@ -554,11 +548,10 @@ impl ServerState {
                 gs.waiting_jobs.push(id);
             }
         } else {
-            if let Some(job) = self.jobs.get(&id) {
-                let key = job.ready_key();
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
-                    tube.ready.insert(key, id);
-                }
+            let key = job.ready_key();
+            self.jobs.insert(id, job);
+            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                tube.ready.insert(key, id);
             }
             self.ready_ct += 1;
             if pri < URGENT_THRESHOLD {
@@ -577,7 +570,9 @@ impl ServerState {
         // WAL: write put record
         self.wal_write_put(id);
 
-        self.process_queue();
+        if !self.waiters.is_empty() {
+            self.process_queue();
+        }
 
         Response::Inserted(id)
     }
@@ -697,50 +692,42 @@ impl ServerState {
 
     fn do_reserve(&mut self, conn_id: u64, job_id: u64) -> Response {
         // Remove from ready heap
-        let job = match self.jobs.get(&job_id) {
-            Some(j) => j,
+        let (tube_name, is_urgent) = match self.jobs.get(&job_id) {
+            Some(j) => (j.tube_name.clone(), j.priority < URGENT_THRESHOLD),
             None => return Response::NotFound,
         };
-        let tube_name = job.tube_name.clone();
         if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.ready.remove_by_id(job_id);
-        }
-        self.ready_ct = self.ready_ct.saturating_sub(1);
-        if let Some(j) = self.jobs.get(&job_id)
-            && j.priority < URGENT_THRESHOLD
-        {
-            self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if is_urgent {
                 tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
             }
+        }
+        self.ready_ct = self.ready_ct.saturating_sub(1);
+        if is_urgent {
+            self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
         }
 
         self.do_reserve_inner(conn_id, job_id)
     }
 
     fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64) -> Response {
-        let ttr = self
-            .jobs
-            .get(&job_id)
-            .map(|j| j.ttr)
-            .unwrap_or(Duration::from_secs(1));
-        let body = self
-            .jobs
-            .get(&job_id)
-            .map(|j| j.body.clone())
-            .unwrap_or_default();
-
-        if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.state = JobState::Reserved;
-            job.reserver_id = Some(conn_id);
-            job.reserved_at = Some(Instant::now());
-            job.deadline_at = Some(Instant::now() + ttr);
-            job.reserve_ct += 1;
-        }
+        let now = Instant::now();
+        let (body, _ttr, tube_name) = match self.jobs.get_mut(&job_id) {
+            Some(job) => {
+                let body = job.body.clone();
+                let ttr = job.ttr;
+                let tube_name = job.tube_name.clone();
+                job.state = JobState::Reserved;
+                job.reserver_id = Some(conn_id);
+                job.reserved_at = Some(now);
+                job.deadline_at = Some(now + ttr);
+                job.reserve_ct += 1;
+                (body, ttr, tube_name)
+            }
+            None => return Response::NotFound,
+        };
         self.acquire_concurrency_key(job_id);
-        if let Some(job) = self.jobs.get(&job_id)
-            && let Some(tube) = self.tubes.get_mut(&job.tube_name)
-        {
+        if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.stat.reserved_ct += 1;
             tube.stat.total_reserve_ct += 1;
         }
@@ -803,6 +790,9 @@ impl ServerState {
         let tube_name = job.tube_name.clone();
         let pri = job.priority;
         let reserved_at = job.reserved_at;
+        let idempotency_key = job.idempotency_key.clone();
+        let group_name = job.group.clone();
+        let has_concurrency_key = job.concurrency_key.is_some();
 
         match state {
             JobState::Reserved => {
@@ -810,9 +800,13 @@ impl ServerState {
                 if job.reserver_id != Some(conn_id) {
                     return Response::NotFound;
                 }
-                self.release_concurrency_key(id);
+                if has_concurrency_key {
+                    self.release_concurrency_key(id);
+                }
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    conn.reserved_jobs.retain(|&jid| jid != id);
+                    if let Some(pos) = conn.reserved_jobs.iter().position(|&jid| jid == id) {
+                        conn.reserved_jobs.swap_remove(pos);
+                    }
                 }
                 self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                 if let Some(tube) = self.tubes.get_mut(&tube_name) {
@@ -870,8 +864,7 @@ impl ServerState {
 
         // Remove idempotency key from tube index (with optional cooldown)
         let mut expiry_epoch_secs: u64 = 0;
-        if let Some(job) = self.jobs.get(&id)
-            && let Some(ref key_tuple) = job.idempotency_key
+        if let Some(ref key_tuple) = idempotency_key
             && let Some(tube) = self.tubes.get_mut(&tube_name)
         {
             tube.idempotency_keys.remove(&key_tuple.0);
@@ -885,9 +878,6 @@ impl ServerState {
                     .insert(key_tuple.0.clone(), (id, expires_at));
             }
         }
-
-        // Group tracking: decrement pending count and check completion
-        let group_name = self.jobs.get(&id).and_then(|j| j.group.clone());
         if let Some(ref grp) = group_name
             && let Some(gs) = self.groups.get_mut(grp)
         {
@@ -1802,6 +1792,9 @@ impl ServerState {
             Some(c) => c,
             None => return false,
         };
+        if conn.reserved_jobs.is_empty() {
+            return false;
+        }
         let margin = Duration::from_secs(1);
         for &job_id in &conn.reserved_jobs {
             if let Some(job) = self.jobs.get(&job_id)
@@ -2578,6 +2571,7 @@ pub async fn run_with_listener(
         tokio::select! {
             result = listener.accept() => {
                 let (socket, peer) = result?;
+                let _ = socket.set_nodelay(true);
                 tracing::debug!("accepted connection from {}", peer);
 
                 let tx = engine_tx.clone();
@@ -2644,6 +2638,7 @@ async fn handle_connection(
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut line_buf = String::new();
+    let mut resp_buf = Vec::with_capacity(256);
 
     loop {
         line_buf.clear();
@@ -2658,7 +2653,7 @@ async fn handle_connection(
             Ok(n) => {
                 if !line_buf.ends_with('\n') {
                     // Line exceeded MAX_LINE_LEN without a newline — bad client
-                    let _ = writer.write_all(&Response::BadFormat.serialize()).await;
+                    let _ = writer.write_all(b"BAD_FORMAT\r\n").await;
                     break;
                 }
                 n
@@ -2676,7 +2671,9 @@ async fn handle_connection(
         let cmd = match protocol::parse_command(cmd_str) {
             Ok(cmd) => cmd,
             Err(resp) => {
-                let _ = writer.write_all(&resp.serialize()).await;
+                resp_buf.clear();
+                resp.serialize_into(&mut resp_buf);
+                let _ = writer.write_all(&resp_buf).await;
                 continue;
             }
         };
@@ -2692,7 +2689,7 @@ async fn handle_connection(
 
             // Check size BEFORE allocating to prevent OOM from malicious clients
             if body_size > max_job_size as usize {
-                let _ = writer.write_all(&Response::JobTooBig.serialize()).await;
+                let _ = writer.write_all(b"JOB_TOO_BIG\r\n").await;
                 // Drain the body + \r\n so the connection stays usable
                 let to_drain = body_size as u64 + 2;
                 if tokio::io::copy(&mut (&mut reader).take(to_drain), &mut tokio::io::sink())
@@ -2709,7 +2706,7 @@ async fn handle_connection(
                 Ok(_) => {
                     // Verify trailing \r\n
                     if body_buf[body_size] != b'\r' || body_buf[body_size + 1] != b'\n' {
-                        let _ = writer.write_all(&Response::ExpectedCrlf.serialize()).await;
+                        let _ = writer.write_all(b"EXPECTED_CRLF\r\n").await;
                         continue;
                     }
                     body_buf.truncate(body_size);
@@ -2740,7 +2737,9 @@ async fn handle_connection(
 
         match reply_rx.await {
             Ok(resp) => {
-                if writer.write_all(&resp.serialize()).await.is_err() {
+                resp_buf.clear();
+                resp.serialize_into(&mut resp_buf);
+                if writer.write_all(&resp_buf).await.is_err() {
                     break;
                 }
             }
