@@ -4,6 +4,8 @@ An experimental, simple, fast job queue server. One binary, zero dependencies.
 
 Priority queues, delayed jobs, job reservations, named tubes — plus idempotency, concurrency control, and job group pipelines.
 
+Every line of Rust in this project was written by AI. The architecture, testing strategy, and design decisions were human-driven.
+
 ## Quick Start
 
 ```bash
