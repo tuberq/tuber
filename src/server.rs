@@ -2458,7 +2458,7 @@ pub async fn run(
     metrics_port: Option<u16>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind((addr, port)).await?;
-    tracing::info!("listening on {}:{}", addr, port);
+    tracing::info!("tuber v{} listening on {}:{}", env!("CARGO_PKG_VERSION"), addr, port);
 
     if let Some(mp) = metrics_port {
         let listen_addr = listener.local_addr()?.ip();
