@@ -2,7 +2,7 @@
 
 An experimental, simple, fast job queue server. One binary, zero dependencies.
 
-Tube is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds idempotency, concurrency control, job group pipelines and weighted queues. 
+Tuber is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds idempotency, concurrency control, job group pipelines and weighted queues.
 
 ## How was this built?
 
@@ -12,7 +12,7 @@ I used Beanstalkd's C source code and tests as the foundation, first building a 
 
 The docs/ directory contains the working files we used to plan and describe the implementation.
 
-I use Beanstalkd in [Booko](https://booko.au). In my dev environment, I've replaced Beanstalkd with Tuber. I'll replace it in production when I'm comfortable with it. 
+I use Beanstalkd in [Booko](https://booko.au). In my dev environment, I've replaced Beanstalkd with Tuber. I'll replace it in production when I'm comfortable with it.
 
 ## Quick Start
 
