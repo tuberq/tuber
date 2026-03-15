@@ -496,7 +496,24 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 
 ## Performance
 
-Tuber achieves throughput comparable to beanstalkd on standard workloads. The batch API (`reserve-batch`, `delete-batch`) can significantly improve throughput for high-volume consumers.
+Tuber achieves throughput comparable to beanstalkd on standard workloads. Indicative numbers from a single-client benchmark on localhost (100k jobs, Apple M-series):
+
+| Scenario | PUT/s | Reserve+Delete/s |
+|---|---|---|
+| Small body, no WAL | ~34,000 | ~7,300 |
+| Small body, WAL | ~26,500 | ~6,300 |
+| 4KB body, no WAL | ~27,000 | ~7,300 |
+| 4KB body, WAL | ~18,000 | ~6,600 |
+
+The batch API (`reserve-batch`, `delete-batch`) significantly improves throughput by amortising per-command overhead:
+
+| Scenario | Reserve+Delete/s |
+|---|---|
+| Individual reserve + delete | ~7,300 |
+| Batch reserve (1000) + individual delete | ~32,500 |
+| Batch reserve (1000) + batch delete (1000) | ~300,000 |
+
+Results will vary by hardware, network, and workload. Run your own benchmarks for production sizing.
 
 ## License
 
