@@ -8,8 +8,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
-use crate::job::{Job, JobState, MAX_TUBE_NAME_LEN, URGENT_THRESHOLD};
-use crate::protocol::{self, Command, Response};
+use crate::job::{Job, JobState, URGENT_THRESHOLD};
+use crate::protocol::{self, Command, Response, MAX_DELETE_BATCH};
 use crate::tube::Tube;
 use crate::wal::{IdpTombstone, Wal};
 
@@ -2607,25 +2607,20 @@ pub async fn run_with_listener(
 /// Atomic counter for connection IDs (simpler than engine round-trip).
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Maximum digits in a u32 value (4294967295).
-const MAX_U32_DIGITS: usize = 10;
+
+/// Maximum digits in a u64 value (18446744073709551615).
+const MAX_U64_DIGITS: usize = 20;
 
 /// Maximum command line length in bytes, including the trailing \r\n.
-/// Derived from the longest possible command (put with all extensions):
-///   "put "                                           =   4
-///   pri + " " + delay + " " + ttr + " " + bytes     =  43  (4 × u32 + 3 spaces)
-///   " idp:" + key + ":" + ttl                        = 216  (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS)
-///   " grp:" + name                                   = 205  (5 + MAX_TUBE_NAME_LEN)
-///   " aft:" + name                                   = 205  (5 + MAX_TUBE_NAME_LEN)
-///   " con:" + key + ":" + limit                      = 216  (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS)
+/// The longest possible command is delete-batch with MAX_DELETE_BATCH (1000) u64 IDs:
+///   "delete-batch "                                  =  13
+///   1000 × (u64 + space)                             = 21000  (1000 × (20 + 1))
 ///   "\r\n"                                           =   2
-///   Total                                            = 891
-const MAX_LINE_LEN: u64 = (4
-    + (MAX_U32_DIGITS * 4 + 3)
-    + (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS) // idp:key:ttl
-    + (5 + MAX_TUBE_NAME_LEN)                       // grp:name
-    + (5 + MAX_TUBE_NAME_LEN)                       // aft:name
-    + (5 + MAX_TUBE_NAME_LEN + 1 + MAX_U32_DIGITS) // con:key:limit
+///   Total                                            = 21015
+///
+/// For reference, put with all extensions is 891 bytes (well under this limit).
+const MAX_LINE_LEN: u64 = (13
+    + MAX_DELETE_BATCH * (MAX_U64_DIGITS + 1)
     + 2) as u64;
 
 async fn handle_connection(

@@ -388,7 +388,7 @@ fn parse_reserve_batch(rest: &str) -> Result<Command, Response> {
     Ok(Command::ReserveBatch { count })
 }
 
-const MAX_DELETE_BATCH: usize = 1000;
+pub const MAX_DELETE_BATCH: usize = 1000;
 
 fn parse_delete_batch(rest: &str) -> Result<Command, Response> {
     let parts: Vec<&str> = rest.split_whitespace().collect();
