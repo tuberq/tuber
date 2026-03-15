@@ -390,6 +390,7 @@ impl ServerState {
             Command::FlushTube { tube } => self.cmd_flush_tube(&tube),
             Command::Drain => {
                 self.drain_mode = true;
+                tracing::info!("entering drain mode (requested by connection {})", conn_id);
                 Response::Draining
             }
             Command::Quit => Response::Deleted, // handled at connection level
