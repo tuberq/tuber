@@ -492,6 +492,10 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `list-tubes-watched\r\n` | List watched tubes in YAML. |
 | `quit\r\n` | Close the connection. |
 
+## Performance
+
+Tuber achieves throughput comparable to beanstalkd on standard workloads. The batch API (`reserve-batch`, `delete-batch`) can significantly improve throughput for high-volume consumers.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
