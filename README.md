@@ -491,6 +491,7 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `list-tube-used\r\n` | Show the currently used tube. Returns `USING <tube>`. |
 | `list-tubes-watched\r\n` | List watched tubes in YAML. |
 | `drain\r\n` | Enter drain mode: rejects new `put` commands with `DRAINING` while allowing workers to finish existing jobs. Also triggered by `SIGUSR1`. |
+| **+** `undrain\r\n` | Exit drain mode: resumes accepting `put` commands. Returns `NOT_DRAINING`. |
 | `quit\r\n` | Close the connection. |
 
 ## Performance

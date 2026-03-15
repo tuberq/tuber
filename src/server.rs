@@ -393,6 +393,11 @@ impl ServerState {
                 tracing::info!("entering drain mode (requested by connection {})", conn_id);
                 Response::Draining
             }
+            Command::Undrain => {
+                self.drain_mode = false;
+                tracing::info!("exiting drain mode (requested by connection {})", conn_id);
+                Response::NotDraining
+            }
             Command::Quit => Response::Deleted, // handled at connection level
         }
     }
@@ -2962,6 +2967,28 @@ mod tests {
 
         let resp = s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
         assert!(matches!(resp, Response::Draining));
+    }
+
+    #[test]
+    fn test_undrain_mode() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Enter drain mode
+        let resp = s.handle_command(c, Command::Drain, None);
+        assert!(matches!(resp, Response::Draining));
+
+        // Put should fail
+        let resp = s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
+        assert!(matches!(resp, Response::Draining));
+
+        // Undrain
+        let resp = s.handle_command(c, Command::Undrain, None);
+        assert!(matches!(resp, Response::NotDraining));
+
+        // Put should work again
+        let resp = s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
+        assert!(matches!(resp, Response::Inserted(_)));
     }
 
     #[test]

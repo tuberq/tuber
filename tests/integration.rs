@@ -2592,6 +2592,36 @@ async fn test_drain_mode_reserve_and_delete_work() {
     assert!(body.contains("draining: true"));
 }
 
+/// undrain exits drain mode and resumes accepting puts.
+#[tokio::test]
+async fn test_undrain_mode() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Enter drain mode
+    c.mustsend("drain\r\n").await;
+    c.ckresp("DRAINING\r\n").await;
+
+    // put should fail
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("DRAINING\r\n").await;
+
+    // Exit drain mode
+    c.mustsend("undrain\r\n").await;
+    c.ckresp("NOT_DRAINING\r\n").await;
+
+    // put should work again
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // stats should show draining: false
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("draining: false"));
+}
+
 // ---------------------------------------------------------------------------
 // reserve-job edge cases
 // ---------------------------------------------------------------------------

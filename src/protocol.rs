@@ -87,6 +87,7 @@ pub enum Command {
         group: String,
     },
     Drain,
+    Undrain,
     Quit,
 }
 
@@ -118,6 +119,7 @@ pub enum Response {
     OutOfMemory,
     InternalError,
     Draining,
+    NotDraining,
     BadFormat,
     UnknownCommand,
     ExpectedCrlf,
@@ -175,6 +177,7 @@ impl Response {
             Response::OutOfMemory => buf.extend_from_slice(b"OUT_OF_MEMORY\r\n"),
             Response::InternalError => buf.extend_from_slice(b"INTERNAL_ERROR\r\n"),
             Response::Draining => buf.extend_from_slice(b"DRAINING\r\n"),
+            Response::NotDraining => buf.extend_from_slice(b"NOT_DRAINING\r\n"),
             Response::BadFormat => buf.extend_from_slice(b"BAD_FORMAT\r\n"),
             Response::UnknownCommand => buf.extend_from_slice(b"UNKNOWN_COMMAND\r\n"),
             Response::ExpectedCrlf => buf.extend_from_slice(b"EXPECTED_CRLF\r\n"),
@@ -279,6 +282,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_flush_tube(rest)
     } else if line == "drain" {
         Ok(Command::Drain)
+    } else if line == "undrain" {
+        Ok(Command::Undrain)
     } else {
         Err(Response::UnknownCommand)
     }
