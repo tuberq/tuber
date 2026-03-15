@@ -1703,6 +1703,7 @@ impl ServerState {
              binlog-records-migrated: 0\n\
              binlog-records-written: 0\n\
              binlog-max-size: {}\n\
+             binlog-enabled: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
              id: {}\n\
@@ -1754,6 +1755,7 @@ impl ServerState {
             binlog_oldest,
             binlog_current,
             binlog_max_size,
+            if self.wal.is_some() { "true" } else { "false" },
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
             self.instance_id,
