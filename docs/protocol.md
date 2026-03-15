@@ -25,6 +25,7 @@ Responses:
 - `EXPECTED_CRLF\r\n` (body not terminated correctly)
 - `JOB_TOO_BIG\r\n`
 - `DRAINING\r\n`
+- `NOT_DRAINING\r\n`
 
 ### use \<tube\>\r\n
 
@@ -153,7 +154,15 @@ Response: `FLUSHED <count>\r\n` or `NOT_FOUND\r\n`
 
 ### drain\r\n
 
-Enter drain mode — rejects new `put` commands with `DRAINING`, allows in-flight work to complete.
+Enter drain mode — rejects new `put` commands with `DRAINING`, allows in-flight work to complete. Also triggered by `SIGUSR1`.
+
+Response: `DRAINING\r\n`
+
+### undrain\r\n
+
+Exit drain mode — resumes accepting `put` commands. Idempotent.
+
+Response: `NOT_DRAINING\r\n`
 
 ### quit\r\n
 
