@@ -46,6 +46,27 @@ Tuber is purpose-built for this. A single binary, easy to deploy in Docker, with
 
 Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) already work out of the box. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/dkam/beaneater/tree/tuber) for Ruby.
 
+### Feature Comparison
+
+| Feature | Tuber | Beanstalkd | Sidekiq + Redis | GoodJob | Solid Queue | RabbitMQ |
+|---|---|---|---|---|---|---|
+| **Unique / idempotent jobs** | Yes | — | Enterprise only ¹ | Yes | Yes ² | — ³ |
+| **Concurrency control** | Yes (per-key) | — | Enterprise only ¹ | Yes | Yes | — |
+| **Job groups / DAG pipelines** | Yes | — | Pro only ¹ | Batches only ⁴ | — | — |
+| **Weighted queues** | Yes | — | Yes | — | — | — |
+| **Per-job priority** | Yes (numeric) | Yes (numeric) | — ⁵ | Yes | Yes | Yes |
+| **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Via plugin |
+| **Batch reserve / delete** | Yes | — | — | — | — | Prefetch |
+| **Persistence** | WAL (optional) | WAL (optional) | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
+| **Infrastructure** | None (single binary) | None (single binary) | Redis | PostgreSQL | DB ⁶ | Erlang runtime |
+
+<sub>¹ Sidekiq's unique jobs, concurrency controls, and batches require [paid tiers](https://sidekiq.org) (Pro/Enterprise). The OSS version has queue weights and basic job processing.<br>
+² Solid Queue unique jobs available from Rails 7.2+.<br>
+³ RabbitMQ has a community deduplication plugin, but no built-in uniqueness.<br>
+⁴ GoodJob batches support single-level fan-out/fan-in (enqueue N jobs, fire a callback when all complete). Multi-stage pipelines require manually chaining batches inside callbacks.<br>
+⁵ Sidekiq uses queue-level ordering (strict or weighted), not per-job numeric priority.<br>
+⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.</sub>
+
 ## What Can You Do With It?
 
 ### Background jobs
@@ -288,6 +309,15 @@ delete-batch 1 2 3 99
 Returns `DELETED_BATCH <deleted_count> <not_found_count>` — here 3 jobs were deleted and 1 was not found.
 
 ## Installation
+
+### Homebrew
+
+```bash
+brew tap dkam/tuber
+brew install tuber
+```
+
+### Cargo
 
 ```bash
 cargo install --git https://github.com/dkam/tuber

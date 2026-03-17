@@ -131,8 +131,6 @@ async fn main() {
                 _ => tracing::Level::DEBUG,
             };
             tracing_subscriber::fmt().with_max_level(level).init();
-            tracing::info!("tuber listening on {listen}:{port}");
-
             if let Err(e) = tuber::server::run(
                 &listen,
                 port,

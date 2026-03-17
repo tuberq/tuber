@@ -968,6 +968,7 @@ mod tests {
         assert!(parse_command("put 0 0 10 5 idp:key:abc").is_err());
     }
 
+
     #[test]
     fn test_response_serialize() {
         assert_eq!(Response::Deleted.serialize(), b"DELETED\r\n");
