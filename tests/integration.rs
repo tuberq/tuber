@@ -1320,6 +1320,10 @@ async fn test_stats_format_complete() {
         "binlog-records-migrated:",
         "binlog-records-written:",
         "binlog-max-size:",
+        "binlog-enabled:",
+        "binlog-file-count:",
+        "binlog-total-bytes:",
+        "rusage-maxrss:",
         "draining:",
         "id:",
         "hostname:",
@@ -1392,6 +1396,24 @@ async fn test_stats_format_complete() {
         body.contains("binlog-max-size: 0"),
         "binlog-max-size should be 0"
     );
+    assert!(
+        body.contains("binlog-file-count: 0"),
+        "binlog-file-count should be 0 when WAL disabled"
+    );
+    assert!(
+        body.contains("binlog-total-bytes: 0"),
+        "binlog-total-bytes should be 0 when WAL disabled"
+    );
+
+    // rusage-maxrss should be a non-negative integer
+    for line in body.lines() {
+        if line.starts_with("rusage-maxrss:") {
+            let val: i64 = line.split(':').nth(1).unwrap().trim().parse().expect(
+                "rusage-maxrss should be an integer",
+            );
+            assert!(val >= 0, "rusage-maxrss should be non-negative, got: {}", val);
+        }
+    }
 }
 
 #[tokio::test]

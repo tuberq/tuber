@@ -1655,10 +1655,17 @@ impl ServerState {
         };
 
         // WAL stats
-        let (binlog_oldest, binlog_current, binlog_max_size, binlog_file_count, binlog_total_bytes) = match &self.wal {
-            Some(wal) => (wal.oldest_seq(), wal.current_seq(), wal.max_file_size(), wal.file_count(), wal.total_disk_bytes()),
-            None => (0, 0, 0, 0, 0),
-        };
+        let (binlog_oldest, binlog_current, binlog_max_size, binlog_file_count, binlog_total_bytes) =
+            match &self.wal {
+                Some(wal) => (
+                    wal.oldest_seq(),
+                    wal.current_seq(),
+                    wal.max_file_size(),
+                    wal.file_count(),
+                    wal.total_disk_bytes(),
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
 
         let yaml = format!(
             "---\n\

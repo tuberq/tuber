@@ -1442,6 +1442,90 @@ mod tests {
     }
 
     #[test]
+    fn test_file_count_and_total_disk_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+
+        // Before any writes, no files
+        assert_eq!(wal.file_count(), 0);
+        assert_eq!(wal.total_disk_bytes(), 0);
+
+        // Write a job — triggers file creation
+        let mut job1 = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body1".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job1).unwrap();
+
+        assert_eq!(wal.file_count(), 1);
+        assert!(wal.total_disk_bytes() > 0, "should have bytes after a write");
+
+        let bytes_after_one = wal.total_disk_bytes();
+
+        // Write another job — same file
+        let mut job2 = Job::new(
+            2,
+            20,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body2".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job2).unwrap();
+
+        assert_eq!(wal.file_count(), 1);
+        assert!(
+            wal.total_disk_bytes() > bytes_after_one,
+            "total bytes should increase after second write"
+        );
+    }
+
+    #[test]
+    fn test_file_count_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Very small max file size to force rotation
+        let mut wal = Wal::open(dir_path, Some(64)).unwrap();
+
+        let mut job1 = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body1".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job1).unwrap();
+
+        let mut job2 = Job::new(
+            2,
+            20,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body2".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job2).unwrap();
+
+        assert!(
+            wal.file_count() >= 2,
+            "should have multiple files after rotation, got {}",
+            wal.file_count()
+        );
+
+        // total_disk_bytes should cover all files
+        let total = wal.total_disk_bytes();
+        assert!(total > 0);
+    }
+
+    #[test]
     fn test_wal_write_and_replay() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();

@@ -14,6 +14,8 @@ The docs/ directory contains the working files we used to plan and describe the 
 
 I use Beanstalkd in [Booko](https://booko.au). In my dev environment, I've replaced Beanstalkd with Tuber. I'll replace it in production when I'm comfortable with it.
 
+Read more about it [on my blog](https://da.nmilne.com/shipping-a-job-queue-system-without-reading-the-source-code/).
+
 ## Quick Start
 
 ```bash
