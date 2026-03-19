@@ -4435,3 +4435,42 @@ async fn test_concurrency_release_with_delay() {
     c.ckresp("RESERVED 2 1\r\n").await;
     c.ckresp("b\r\n").await;
 }
+
+#[tokio::test]
+async fn test_close_releases_tube_reserved_counter() {
+    let srv = TestServer::start().await;
+    let mut prod = srv.connect().await;
+    let mut cons = srv.connect().await;
+
+    // Put a job
+    prod.mustsend("put 0 0 100 1\r\n").await;
+    prod.mustsend("a\r\n").await;
+    prod.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve it
+    cons.mustsend("reserve-with-timeout 0\r\n").await;
+    cons.ckresp("RESERVED 1 1\r\n").await;
+    cons.ckresp("a\r\n").await;
+
+    // Verify tube stats show 1 reserved
+    prod.mustsend("stats-tube default\r\n").await;
+    let body = prod.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-reserved: 1"),
+        "should have 1 reserved, got: {}",
+        body
+    );
+
+    // Drop consumer — server should release the job and decrement tube reserved_ct
+    drop(cons);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify tube stats show 0 reserved
+    prod.mustsend("stats-tube default\r\n").await;
+    let body = prod.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-reserved: 0"),
+        "should have 0 reserved after disconnect, got: {}",
+        body
+    );
+}

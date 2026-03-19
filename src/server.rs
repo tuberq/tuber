@@ -237,6 +237,7 @@ impl ServerState {
                         tube.ready.insert(key, id);
                         self.ready_ct += 1;
                         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
+                        tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
                         if key.0 < URGENT_THRESHOLD {
                             self.stats.urgent_ct += 1;
                             tube.stat.urgent_ct += 1;
