@@ -54,6 +54,7 @@ pub enum Command {
     PeekReady,
     PeekDelayed,
     PeekBuried,
+    PeekReserved,
     Kick {
         bound: u32,
     },
@@ -228,6 +229,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         Ok(Command::PeekDelayed)
     } else if line == "peek-buried" {
         Ok(Command::PeekBuried)
+    } else if line == "peek-reserved" {
+        Ok(Command::PeekReserved)
     } else if let Some(rest) = line.strip_prefix("reserve-batch ") {
         parse_reserve_batch(rest)
     } else if let Some(rest) = line.strip_prefix("reserve-mode ") {
@@ -968,6 +971,14 @@ mod tests {
         assert!(parse_command("put 0 0 10 5 idp:key:abc").is_err());
     }
 
+
+    #[test]
+    fn test_parse_peek_reserved() {
+        assert_eq!(
+            parse_command("peek-reserved").unwrap(),
+            Command::PeekReserved
+        );
+    }
 
     #[test]
     fn test_response_serialize() {

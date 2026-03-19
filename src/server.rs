@@ -45,7 +45,7 @@ struct GlobalStats {
     total_jobs_ct: u64,
     total_delete_ct: u64,
     timeout_ct: u64,
-    op_ct: [u64; 27],
+    op_ct: [u64; 28],
     total_connections: u64,
 }
 
@@ -377,6 +377,7 @@ impl ServerState {
             Command::PeekReady => self.cmd_peek_ready(conn_id),
             Command::PeekDelayed => self.cmd_peek_delayed(conn_id),
             Command::PeekBuried => self.cmd_peek_buried(conn_id),
+            Command::PeekReserved => self.cmd_peek_reserved(conn_id),
             Command::Kick { bound } => self.cmd_kick(conn_id, bound),
             Command::KickJob { id } => self.cmd_kick_job(id),
             Command::StatsJob { id } => self.cmd_stats_job(id),
@@ -1285,6 +1286,26 @@ impl ServerState {
         Response::NotFound
     }
 
+    fn cmd_peek_reserved(&self, conn_id: u64) -> Response {
+        let tube_name = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.use_tube.as_str())
+            .unwrap_or("default");
+        let found = self
+            .jobs
+            .values()
+            .filter(|j| j.state == JobState::Reserved && j.tube_name == tube_name)
+            .min_by_key(|j| j.id);
+        match found {
+            Some(job) => Response::Found {
+                id: job.id,
+                body: job.body.clone(),
+            },
+            None => Response::NotFound,
+        }
+    }
+
     fn cmd_kick(&mut self, conn_id: u64, bound: u32) -> Response {
         let tube_name = self
             .conns
@@ -1679,6 +1700,7 @@ impl ServerState {
              cmd-peek-ready: {}\n\
              cmd-peek-delayed: {}\n\
              cmd-peek-buried: {}\n\
+             cmd-peek-reserved: {}\n\
              cmd-reserve: {}\n\
              cmd-reserve-with-timeout: {}\n\
              cmd-delete: {}\n\
@@ -1736,6 +1758,7 @@ impl ServerState {
             self.stats.op_ct[18], // OP_PEEK_READY
             self.stats.op_ct[19], // OP_PEEK_DELAYED
             self.stats.op_ct[10], // OP_PEEK_BURIED
+            self.stats.op_ct[27], // OP_PEEK_RESERVED
             self.stats.op_ct[3],  // OP_RESERVE
             self.stats.op_ct[20], // OP_RESERVE_TIMEOUT
             self.stats.op_ct[4],  // OP_DELETE

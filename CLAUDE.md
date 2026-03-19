@@ -53,6 +53,7 @@ Standard beanstalkd commands: `put`, `reserve`, `reserve-with-timeout`, `reserve
 
 Tuber extensions beyond standard beanstalkd:
 - `reserve-mode <default|weighted>` - switch between priority-first and weighted-random reserve strategies.
+- `peek-reserved` - peek at the oldest reserved job in the current `use` tube. Returns `FOUND <id> <bytes>` or `NOT_FOUND`.
 - `flush-tube <tube>` - delete all jobs from a tube. Returns `FLUSHED <count>`.
 - `put` extension tags (appended after `<bytes>`): `idp:<key>` (idempotency), `grp:<name>` (job group), `aft:<name>` (after-group dependency), `con:<key>` (concurrency key).
 - `watch <tube> [weight]` - optional weight parameter for weighted reserve mode.

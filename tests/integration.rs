@@ -1284,6 +1284,7 @@ async fn test_stats_format_complete() {
         "cmd-peek-ready:",
         "cmd-peek-delayed:",
         "cmd-peek-buried:",
+        "cmd-peek-reserved:",
         "cmd-reserve:",
         "cmd-reserve-with-timeout:",
         "cmd-delete:",
@@ -3280,6 +3281,87 @@ async fn test_peek_buried_empty() {
 
     c.mustsend("peek-buried\r\n").await;
     c.ckresp("NOT_FOUND\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
+// peek-reserved tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_peek_reserved() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a job, reserve it, then peek-reserved should find it
+    c.mustsend("put 0 0 120 5\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+
+    c.mustsend("peek-reserved\r\n").await;
+    c.ckresp("FOUND 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+
+    // Delete the job, peek-reserved should return NOT_FOUND
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("peek-reserved\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+#[tokio::test]
+async fn test_peek_reserved_empty() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("peek-reserved\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+#[tokio::test]
+async fn test_peek_reserved_multi_tube() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put and reserve a job on tube "a"
+    c.mustsend("use a\r\n").await;
+    c.ckresp("USING a\r\n").await;
+    c.mustsend("put 0 0 120 1\r\n").await;
+    c.mustsend("A\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("watch a\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("A\r\n").await;
+
+    // Put and reserve a job on tube "b"
+    c.mustsend("use b\r\n").await;
+    c.ckresp("USING b\r\n").await;
+    c.mustsend("put 0 0 120 1\r\n").await;
+    c.mustsend("B\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("watch b\r\n").await;
+    c.ckresp("WATCHING 3\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("B\r\n").await;
+
+    // peek-reserved while using tube "b" should find job 2, not job 1
+    c.mustsend("peek-reserved\r\n").await;
+    c.ckresp("FOUND 2 1\r\n").await;
+    c.ckresp("B\r\n").await;
+
+    // Switch to tube "a", should find job 1
+    c.mustsend("use a\r\n").await;
+    c.ckresp("USING a\r\n").await;
+    c.mustsend("peek-reserved\r\n").await;
+    c.ckresp("FOUND 1 1\r\n").await;
+    c.ckresp("A\r\n").await;
 }
 
 // ---------------------------------------------------------------------------

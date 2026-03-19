@@ -215,6 +215,7 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         "cmd-peek-ready",
         "cmd-peek-delayed",
         "cmd-peek-buried",
+        "cmd-peek-reserved",
         "cmd-reserve",
         "cmd-reserve-with-timeout",
         "cmd-reserve-mode",
