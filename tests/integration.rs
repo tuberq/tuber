@@ -4058,3 +4058,276 @@ async fn test_fuzz_very_long_line_no_newline() {
         "server survived long line attack"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency limit > 1, group+concurrency combos, idempotency+group combos
+// ---------------------------------------------------------------------------
+
+/// Concurrency limit greater than one: con:api:2 allows 2 concurrent reserves.
+#[tokio::test]
+async fn test_concurrency_limit_greater_than_one() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put 3 jobs with con:api:2 (limit 2)
+    c.mustsend("put 0 0 60 1 con:api:2\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:api:2\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:api:2\r\n").await;
+    c.mustsend("c\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve first two (both succeed, limit is 2)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+
+    // Third is blocked — limit of 2 reached
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Delete first reserved job, freeing a slot
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Third job is now available
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("c\r\n").await;
+}
+
+/// Group members with a concurrency key: concurrency blocks even within a group.
+#[tokio::test]
+async fn test_group_member_with_concurrency_key() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put 2 group members with con:api (default limit 1)
+    c.mustsend("put 0 0 60 1 grp:batch con:api\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 grp:batch con:api\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Put after-job
+    c.mustsend("put 0 0 60 1 aft:batch\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve first group member (succeeds, con:api slot taken)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Second group member blocked by concurrency
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Delete first job, freeing con:api slot
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Second group member now available
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+
+    // Delete second group member — group completes
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // After-job becomes ready
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// After-job with concurrency key: group completes but after-job is blocked by concurrency.
+#[tokio::test]
+async fn test_after_job_with_concurrency_key() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a plain job with con:held first and reserve it (takes the slot)
+    c.mustsend("put 0 0 60 7 con:held\r\n").await;
+    c.mustsend("blocker\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 7\r\n").await;
+    c.ckresp("blocker\r\n").await;
+
+    // Put a group child
+    c.mustsend("put 0 0 60 5 grp:batch\r\n").await;
+    c.mustsend("child\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Put after-job that also has con:held
+    c.mustsend("put 0 0 60 5 aft:batch con:held\r\n").await;
+    c.mustsend("after\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve and delete the group child — group completes
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 5\r\n").await;
+    c.ckresp("child\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // After-job should be blocked by con:held (blocker still reserved)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Delete the blocker — frees con:held slot
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // After-job now available
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 5\r\n").await;
+    c.ckresp("after\r\n").await;
+}
+
+/// Concurrency enforcement is global across tubes.
+#[tokio::test]
+async fn test_concurrency_cross_tube() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put job on tubeA with con:shared
+    c.mustsend("use tubeA\r\n").await;
+    c.ckresp("USING tubeA\r\n").await;
+    c.mustsend("put 0 0 60 1 con:shared\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Put job on tubeB with con:shared
+    c.mustsend("use tubeB\r\n").await;
+    c.ckresp("USING tubeB\r\n").await;
+    c.mustsend("put 0 0 60 1 con:shared\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Watch both tubes
+    c.mustsend("watch tubeA\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("watch tubeB\r\n").await;
+    c.ckresp("WATCHING 3\r\n").await;
+
+    // Reserve first → succeeds
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Reserve second → TIMED_OUT (global concurrency)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+}
+
+/// Idempotency dedup within a group: duplicate put returns same ID and does not inflate pending count.
+#[tokio::test]
+async fn test_group_idempotency_duplicate() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put first job with grp and idp
+    c.mustsend("put 0 0 60 5 grp:batch idp:key1\r\n").await;
+    c.mustsend("first\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Put duplicate with same grp and idp → returns same ID with state
+    c.mustsend("put 0 0 60 6 grp:batch idp:key1\r\n").await;
+    c.mustsend("second\r\n").await;
+    c.ckresp("INSERTED 1 READY\r\n").await;
+
+    // stats-group should show pending: 1 (not 2)
+    c.mustsend("stats-group batch\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("pending: 1"),
+        "expected pending: 1, got: {:?}",
+        body
+    );
+}
+
+/// Deleting an after-job while the group is still pending does not cause issues.
+#[tokio::test]
+async fn test_delete_after_job_while_group_pending() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put group child
+    c.mustsend("put 0 0 60 5 grp:batch\r\n").await;
+    c.mustsend("child\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Put after-job
+    c.mustsend("put 0 0 60 5 aft:batch\r\n").await;
+    c.mustsend("after\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Delete the after-job directly (it's in delayed/waiting state)
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Reserve and delete the child normally
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("child\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // No more jobs — should not crash
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Verify server still works with a normal job
+    c.mustsend("put 0 0 60 2\r\n").await;
+    c.mustsend("ok\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 2\r\n").await;
+    c.ckresp("ok\r\n").await;
+}
+
+/// Release with delay frees the concurrency slot so other jobs can be reserved.
+#[tokio::test]
+async fn test_concurrency_release_with_delay() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put 2 jobs with con:api
+    c.mustsend("put 0 0 60 1 con:api\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 con:api\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Reserve first
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Release with 1 second delay
+    c.mustsend("release 1 0 1\r\n").await;
+    c.ckresp("RELEASED\r\n").await;
+
+    // Immediately try reserve — should get second job (delayed job doesn't hold slot)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+}

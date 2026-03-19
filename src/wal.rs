@@ -544,6 +544,16 @@ impl Wal {
         self.max_file_size
     }
 
+    /// Number of WAL files currently on disk.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Total bytes written across all WAL files.
+    pub fn total_disk_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.bytes_written as u64).sum()
+    }
+
     pub fn open(dir: &Path, max_file_size: Option<usize>) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 

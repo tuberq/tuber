@@ -163,6 +163,27 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "uptime",
     );
+    prom_gauge(
+        &mut out,
+        "tuber_maxrss_bytes",
+        "Peak resident set size in bytes",
+        &stats,
+        "rusage-maxrss",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_binlog_file_count",
+        "Number of WAL files on disk",
+        &stats,
+        "binlog-file-count",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_binlog_total_bytes",
+        "Total bytes written across all WAL files",
+        &stats,
+        "binlog-total-bytes",
+    );
 
     // Counters
     prom_counter(

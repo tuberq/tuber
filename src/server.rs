@@ -1640,18 +1640,24 @@ impl ServerState {
         let uptime = Instant::now().duration_since(self.started_at).as_secs();
 
         // rusage stats
-        let (rusage_utime, rusage_stime) = {
+        let (rusage_utime, rusage_stime, rusage_maxrss) = {
             let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
             let utime = format!("{}.{:06}", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
             let stime = format!("{}.{:06}", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
-            (utime, stime)
+            // On macOS ru_maxrss is in bytes; on Linux it's in kilobytes
+            let maxrss = if cfg!(target_os = "linux") {
+                usage.ru_maxrss * 1024
+            } else {
+                usage.ru_maxrss
+            };
+            (utime, stime, maxrss)
         };
 
         // WAL stats
-        let (binlog_oldest, binlog_current, binlog_max_size) = match &self.wal {
-            Some(wal) => (wal.oldest_seq(), wal.current_seq(), wal.max_file_size()),
-            None => (0, 0, 0),
+        let (binlog_oldest, binlog_current, binlog_max_size, binlog_file_count, binlog_total_bytes) = match &self.wal {
+            Some(wal) => (wal.oldest_seq(), wal.current_seq(), wal.max_file_size(), wal.file_count(), wal.total_disk_bytes()),
+            None => (0, 0, 0, 0, 0),
         };
 
         let yaml = format!(
@@ -1697,6 +1703,7 @@ impl ServerState {
              version: \"{}\"\n\
              rusage-utime: {}\n\
              rusage-stime: {}\n\
+             rusage-maxrss: {}\n\
              uptime: {}\n\
              binlog-oldest-index: {}\n\
              binlog-current-index: {}\n\
@@ -1704,6 +1711,8 @@ impl ServerState {
              binlog-records-written: 0\n\
              binlog-max-size: {}\n\
              binlog-enabled: {}\n\
+             binlog-file-count: {}\n\
+             binlog-total-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
              id: {}\n\
@@ -1751,11 +1760,14 @@ impl ServerState {
             env!("CARGO_PKG_VERSION"),
             rusage_utime,
             rusage_stime,
+            rusage_maxrss,
             uptime,
             binlog_oldest,
             binlog_current,
             binlog_max_size,
             if self.wal.is_some() { "true" } else { "false" },
+            binlog_file_count,
+            binlog_total_bytes,
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
             self.instance_id,
