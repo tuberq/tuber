@@ -560,6 +560,16 @@ The batch API (`reserve-batch`, `delete-batch`) significantly improves throughpu
 
 Results will vary by hardware, network, and workload. Run your own benchmarks for production sizing.
 
+## Claude Code Skill
+
+The `skill/` directory contains a [Claude Code skill](https://support.claude.com/en/articles/12512198-how-to-create-custom-skills) that teaches AI coding agents how to interact with Tuber (and beanstalkd) using `echo` and `nc`. It covers the full protocol with copy-paste examples.
+
+To install it globally in Claude Code:
+
+```bash
+ln -s "$(pwd)/skill" ~/.claude/skills/tuber
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
