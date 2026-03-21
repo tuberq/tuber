@@ -1908,7 +1908,7 @@ impl ServerState {
             uptime,
             binlog_oldest,
             binlog_current,
-            self.wal.as_ref().map(|w| w.records_migrated).unwrap_or(0),
+            self.wal.as_ref().map(|w| w.records_migrated()).unwrap_or(0),
             binlog_max_size,
             if self.wal.is_some() { "true" } else { "false" },
             binlog_file_count,
@@ -2436,30 +2436,27 @@ impl ServerState {
         // WAL maintenance (GC, sync, compaction)
         if let Some(wal) = self.wal.as_mut() {
             wal.maintain();
+        }
+        if let Some(target) = self.wal.as_ref().and_then(|w| w.compaction_target()) {
+            let (target_seq, count) = target;
+            let migrate_ids: Vec<u64> = self
+                .jobs
+                .iter()
+                .filter(|(_, job)| job.wal_file_seq == Some(target_seq))
+                .map(|(id, _)| *id)
+                .take(count)
+                .collect();
 
-            // Compaction: migrate jobs from the oldest file when waste ratio >= 2
-            if let Some((target_seq, count)) = wal.compaction_target() {
-                let migrate_ids: Vec<u64> = self
-                    .jobs
-                    .iter()
-                    .filter(|(_, job)| job.wal_file_seq == Some(target_seq))
-                    .map(|(id, _)| *id)
-                    .take(count)
-                    .collect();
-
-                for job_id in migrate_ids {
-                    if let Some(wal) = self.wal.as_mut()
-                        && let Some(mut job) = self.jobs.remove(&job_id)
-                    {
-                        if let Err(e) = wal.write_put(&mut job) {
-                            tracing::error!("WAL compaction write error: {}, disabling WAL", e);
-                            self.wal = None;
-                            self.jobs.insert(job_id, job);
-                            break;
-                        }
-                        wal.records_migrated += 1;
-                        self.jobs.insert(job_id, job);
+            for job_id in migrate_ids {
+                if let (Some(wal), Some(job)) =
+                    (self.wal.as_mut(), self.jobs.get_mut(&job_id))
+                {
+                    if let Err(e) = wal.write_put(job) {
+                        tracing::error!("WAL compaction write error: {}, disabling WAL", e);
+                        self.wal = None;
+                        break;
                     }
+                    wal.record_migration();
                 }
             }
         }

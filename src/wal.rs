@@ -524,7 +524,7 @@ pub struct Wal {
     next_seq: u64,
     reserved_bytes: u64,
     alive_bytes: u64,
-    pub records_migrated: u64,
+    records_migrated: u64,
     #[allow(dead_code)] // held for flock side effect
     lock_fd: Option<File>,
 }
@@ -555,9 +555,19 @@ impl Wal {
         self.files.iter().map(|f| f.bytes_written as u64).sum()
     }
 
+    /// Number of job records migrated during compaction.
+    pub fn records_migrated(&self) -> u64 {
+        self.records_migrated
+    }
+
+    /// Increment the compaction migration counter.
+    pub fn record_migration(&mut self) {
+        self.records_migrated += 1;
+    }
+
     /// Returns the oldest file's seq and how many jobs to migrate, if compaction is needed.
     ///
-    /// Uses the beanstalkd waste-ratio strategy: ratio = waste / alive.
+    /// Uses the beanstalkd waste-ratio strategy: ratio = waste / live.
     /// When ratio >= 2 (i.e. 2/3+ of WAL space is dead), migrate `ratio` jobs per tick
     /// from the oldest file. Self-regulating: more waste = more jobs moved per tick.
     pub fn compaction_target(&self) -> Option<(u64, usize)> {
@@ -565,14 +575,14 @@ impl Wal {
             return None;
         }
 
-        let d = self.alive_bytes + self.reserved_bytes;
-        if d == 0 {
+        let live_bytes = self.alive_bytes + self.reserved_bytes;
+        if live_bytes == 0 {
             return None;
         }
 
         let total_space = self.files.len() as u64 * self.max_file_size as u64;
-        let waste = total_space.saturating_sub(d);
-        let ratio = waste / d;
+        let waste = total_space.saturating_sub(live_bytes);
+        let ratio = waste / live_bytes;
 
         if ratio < 2 {
             return None;
@@ -1622,11 +1632,11 @@ mod tests {
     #[test]
     fn test_compaction_target_none_when_low_waste() {
         let dir = tempfile::tempdir().unwrap();
-        // Small file size to force rotation
-        let mut wal = Wal::open(dir.path(), Some(128)).unwrap();
+        // Use a large file size so all jobs fit in two files with low waste
+        let mut wal = Wal::open(dir.path(), Some(4096)).unwrap();
 
-        // Write enough jobs to span multiple files, all still alive
-        for i in 1..=10 {
+        // Write jobs that span exactly 2 files
+        for i in 1..=50 {
             let mut job = Job::new(
                 i, 10, Duration::ZERO, Duration::from_secs(60),
                 b"body".to_vec(), "default".to_string(),
@@ -1635,16 +1645,12 @@ mod tests {
         }
 
         assert!(wal.file_count() > 1, "should have multiple files");
-        // All jobs alive — waste ratio should be low, no compaction needed
-        // (alive_bytes is substantial relative to total file space)
-        // With small files and all jobs alive, ratio should be < 2
-        let target = wal.compaction_target();
-        // May or may not trigger depending on overhead, but alive_bytes should be high
-        // relative to total space since every file is mostly full
-        if let Some((_, count)) = target {
-            // If it triggers, count should be small
-            assert!(count < 10);
-        }
+        // All jobs alive — alive_bytes is substantial relative to total space,
+        // so waste / live_bytes < 2 and no compaction should trigger
+        assert!(
+            wal.compaction_target().is_none(),
+            "should not trigger compaction when all jobs are alive"
+        );
     }
 
     #[test]
@@ -1682,7 +1688,8 @@ mod tests {
     #[test]
     fn test_gc_after_all_refs_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(dir.path(), Some(128)).unwrap();
+        // Very small file size to force each job into its own file
+        let mut wal = Wal::open(dir.path(), Some(64)).unwrap();
 
         let mut job1 = Job::new(
             1, 10, Duration::ZERO, Duration::from_secs(60),
@@ -1690,24 +1697,33 @@ mod tests {
         );
         wal.write_put(&mut job1).unwrap();
 
-        let initial_count = wal.file_count();
-
-        // Force a new file by writing more
         let mut job2 = Job::new(
             2, 10, Duration::ZERO, Duration::from_secs(60),
             b"body2".to_vec(), "default".to_string(),
         );
         wal.write_put(&mut job2).unwrap();
 
-        assert!(wal.file_count() >= initial_count);
+        let mut job3 = Job::new(
+            3, 10, Duration::ZERO, Duration::from_secs(60),
+            b"body3".to_vec(), "default".to_string(),
+        );
+        wal.write_put(&mut job3).unwrap();
 
-        // Delete job1 — its file should become reclaimable
+        let count_before_gc = wal.file_count();
+        assert!(count_before_gc > 1, "should have multiple files");
+
+        // Delete all jobs so all files become reclaimable except current
         wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0).unwrap();
+        wal.write_state_change(&mut job2, None, 0, Duration::ZERO, 0).unwrap();
+        wal.write_state_change(&mut job3, None, 0, Duration::ZERO, 0).unwrap();
 
-        // GC should remove the old file
         wal.gc();
-        // File count should have decreased (old file with 0 refs removed)
-        // The exact count depends on where job2 landed
+        assert!(
+            wal.file_count() < count_before_gc,
+            "gc should remove files with 0 refs: before={}, after={}",
+            count_before_gc,
+            wal.file_count()
+        );
     }
 
     #[test]
@@ -1751,7 +1767,7 @@ mod tests {
             if old_seq != current_seq {
                 // Re-write to current file (this is what the server does)
                 wal.write_put(job20).unwrap();
-                wal.records_migrated += 1;
+                wal.record_migration();
                 wal.maintain(); // gc again
                 // Should have fewer files now
                 assert!(
