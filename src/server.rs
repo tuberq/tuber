@@ -1730,7 +1730,7 @@ impl ServerState {
              current-waiting: {}\n\
              total-connections: {}\n\
              pid: {}\n\
-             version: \"{}\"\n\
+             version: \"tuber {}\"\n\
              rusage-utime: {}\n\
              rusage-stime: {}\n\
              rusage-maxrss: {}\n\
