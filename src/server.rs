@@ -1737,7 +1737,7 @@ impl ServerState {
              uptime: {}\n\
              binlog-oldest-index: {}\n\
              binlog-current-index: {}\n\
-             binlog-records-migrated: 0\n\
+             binlog-records-migrated: {}\n\
              binlog-records-written: 0\n\
              binlog-max-size: {}\n\
              binlog-enabled: {}\n\
@@ -1795,6 +1795,7 @@ impl ServerState {
             uptime,
             binlog_oldest,
             binlog_current,
+            self.wal.as_ref().map(|w| w.records_migrated).unwrap_or(0),
             binlog_max_size,
             if self.wal.is_some() { "true" } else { "false" },
             binlog_file_count,
@@ -2319,12 +2320,21 @@ impl ServerState {
                 .retain(|_, (_, expiry)| *expiry > sys_now);
         }
 
-        // WAL maintenance (GC, sync)
+        // WAL maintenance (GC, sync, compaction)
         if let Some(wal) = self.wal.as_mut() {
-            let migrate_ids = wal.maintain();
-            for job_id in migrate_ids {
-                if self.jobs.contains_key(&job_id) {
-                    // Re-write the full job record for compaction
+            wal.maintain();
+
+            // Compaction: migrate jobs from the oldest file when waste ratio >= 2
+            if let Some((target_seq, count)) = wal.compaction_target() {
+                let migrate_ids: Vec<u64> = self
+                    .jobs
+                    .iter()
+                    .filter(|(_, job)| job.wal_file_seq == Some(target_seq))
+                    .map(|(id, _)| *id)
+                    .take(count)
+                    .collect();
+
+                for job_id in migrate_ids {
                     if let Some(wal) = self.wal.as_mut()
                         && let Some(mut job) = self.jobs.remove(&job_id)
                     {
@@ -2334,6 +2344,7 @@ impl ServerState {
                             self.jobs.insert(job_id, job);
                             break;
                         }
+                        wal.records_migrated += 1;
                         self.jobs.insert(job_id, job);
                     }
                 }
