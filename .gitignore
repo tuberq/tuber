@@ -2,3 +2,4 @@
 /data/
 /tmp/
 autoresearch-*.jsonl
+.claude/settings.local.json
