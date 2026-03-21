@@ -828,18 +828,11 @@ impl Wal {
             job.wal_file_seq = None;
             job.wal_used = 0;
         } else {
-            // For state changes (bury, release, kick), update tracking
-            let old_seq = job.wal_file_seq;
-            let old_used = job.wal_used;
-
-            let seq = self.files.back().unwrap().seq;
-            job.wal_file_seq = Some(seq);
-            job.wal_used = record_len;
-
-            if let Some(old) = old_seq {
-                self.decref_file(old, old_used);
-            }
-            self.incref_file(seq, record_len);
+            // For non-delete state changes (bury, release, kick), do NOT move
+            // the job's WAL ref. The wal_file_seq must keep pointing at the file
+            // containing the FullJob record, since StateChange records don't
+            // carry the full job body. Moving the ref would allow GC to delete
+            // the FullJob's file, causing silent data loss on replay.
         }
 
         Ok(())
@@ -976,13 +969,9 @@ impl Wal {
                                             }
                                             job.reserver_id = None;
 
-                                            // Update WAL tracking
-                                            if let Some(old_seq) = job.wal_file_seq {
-                                                self.decref_file(old_seq, job.wal_used);
-                                            }
-                                            job.wal_file_seq = Some(*seq);
-                                            job.wal_used = consumed;
-                                            self.incref_file(*seq, consumed);
+                                            // Do NOT update WAL tracking here.
+                                            // The job's wal_file_seq must keep
+                                            // pointing at its FullJob record.
                                         }
                                     }
                                 }
@@ -1775,6 +1764,64 @@ mod tests {
                     "compaction should reduce file count"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_state_change_does_not_lose_job_after_gc() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Use a tiny max file size so the put and state change land in different files
+        {
+            let mut wal = Wal::open(dir.path(), Some(64)).unwrap();
+
+            let mut job = Job::new(
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"important-data".to_vec(),
+                "default".to_string(),
+            );
+            wal.write_put(&mut job).unwrap();
+
+            // State change goes to a new file due to small max_file_size
+            let pri = job.priority;
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Buried),
+                pri,
+                Duration::ZERO,
+                0,
+            )
+            .unwrap();
+
+            assert!(
+                wal.file_count() >= 2,
+                "expected multiple WAL files, got {}",
+                wal.file_count()
+            );
+
+            // GC should NOT remove the file containing the FullJob
+            wal.gc();
+            assert!(
+                wal.file_count() >= 2,
+                "GC must not delete the FullJob's file"
+            );
+        }
+
+        // Reopen and replay — job must survive
+        {
+            let mut wal = Wal::open(dir.path(), Some(64)).unwrap();
+            let (jobs, _next_id, _tombstones) = wal.replay().unwrap();
+
+            assert!(
+                jobs.contains_key(&1),
+                "job 1 must survive replay after GC"
+            );
+            let job = jobs.get(&1).unwrap();
+            assert_eq!(job.state, JobState::Buried);
+            assert_eq!(job.body, b"important-data");
         }
     }
 }
