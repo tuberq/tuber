@@ -13,6 +13,32 @@ use crate::protocol::{self, Command, Response, MAX_DELETE_BATCH};
 use crate::tube::Tube;
 use crate::wal::{IdpTombstone, Wal};
 
+// Op index constants matching beanstalkd (see tmp/prot.c)
+const OP_PUT: usize = 1;
+const OP_PEEKJOB: usize = 2;
+const OP_RESERVE: usize = 3;
+const OP_DELETE: usize = 4;
+const OP_RELEASE: usize = 5;
+const OP_BURY: usize = 6;
+const OP_KICK: usize = 7;
+const OP_STATS: usize = 8;
+const OP_STATSJOB: usize = 9;
+const OP_PEEK_BURIED: usize = 10;
+const OP_USE: usize = 11;
+const OP_WATCH: usize = 12;
+const OP_IGNORE: usize = 13;
+const OP_LIST_TUBES: usize = 14;
+const OP_LIST_TUBE_USED: usize = 15;
+const OP_LIST_TUBES_WATCHED: usize = 16;
+const OP_STATS_TUBE: usize = 17;
+const OP_PEEK_READY: usize = 18;
+const OP_PEEK_DELAYED: usize = 19;
+const OP_RESERVE_TIMEOUT: usize = 20;
+const OP_TOUCH: usize = 21;
+const OP_PAUSE_TUBE: usize = 23;
+const OP_RESERVE_MODE: usize = 26;
+const OP_PEEK_RESERVED: usize = 27;
+
 /// Message from a connection task to the engine.
 struct EngineMsg {
     conn_id: u64,
@@ -349,46 +375,133 @@ impl ServerState {
                 group,
                 after_group,
                 concurrency_key,
-            } => self.cmd_put(
-                conn_id,
-                pri,
-                delay,
-                ttr,
-                bytes,
-                body,
-                idempotency_key,
-                group,
-                after_group,
-                concurrency_key,
-            ),
-            Command::Use { tube } => self.cmd_use(conn_id, &tube),
-            Command::Reserve => self.cmd_reserve(conn_id, None),
-            Command::ReserveWithTimeout { timeout } => self.cmd_reserve(conn_id, Some(timeout)),
-            Command::ReserveJob { id } => self.cmd_reserve_job(conn_id, id),
-            Command::ReserveMode { mode } => self.cmd_reserve_mode(conn_id, &mode),
-            Command::ReserveBatch { count } => self.cmd_reserve_batch(conn_id, count),
-            Command::Delete { id } => self.cmd_delete(conn_id, id),
-            Command::DeleteBatch { ids } => self.cmd_delete_batch(conn_id, ids),
-            Command::Release { id, pri, delay } => self.cmd_release(conn_id, id, pri, delay),
-            Command::Bury { id, pri } => self.cmd_bury(conn_id, id, pri),
-            Command::Touch { id } => self.cmd_touch(conn_id, id),
-            Command::Watch { tube, weight } => self.cmd_watch(conn_id, &tube, weight),
-            Command::Ignore { tube } => self.cmd_ignore(conn_id, &tube),
-            Command::Peek { id } => self.cmd_peek(id),
-            Command::PeekReady => self.cmd_peek_ready(conn_id),
-            Command::PeekDelayed => self.cmd_peek_delayed(conn_id),
-            Command::PeekBuried => self.cmd_peek_buried(conn_id),
-            Command::PeekReserved => self.cmd_peek_reserved(conn_id),
-            Command::Kick { bound } => self.cmd_kick(conn_id, bound),
-            Command::KickJob { id } => self.cmd_kick_job(id),
-            Command::StatsJob { id } => self.cmd_stats_job(id),
-            Command::StatsTube { tube } => self.cmd_stats_tube(&tube),
-            Command::StatsGroup { group } => self.cmd_stats_group(&group),
-            Command::Stats => self.cmd_stats(),
-            Command::ListTubes => self.cmd_list_tubes(),
-            Command::ListTubeUsed => self.cmd_list_tube_used(conn_id),
-            Command::ListTubesWatched => self.cmd_list_tubes_watched(conn_id),
-            Command::PauseTube { tube, delay } => self.cmd_pause_tube(&tube, delay),
+            } => {
+                self.stats.op_ct[OP_PUT] += 1;
+                self.cmd_put(
+                    conn_id,
+                    pri,
+                    delay,
+                    ttr,
+                    bytes,
+                    body,
+                    idempotency_key,
+                    group,
+                    after_group,
+                    concurrency_key,
+                )
+            }
+            Command::Use { tube } => {
+                self.stats.op_ct[OP_USE] += 1;
+                self.cmd_use(conn_id, &tube)
+            }
+            Command::Reserve => {
+                self.stats.op_ct[OP_RESERVE] += 1;
+                self.cmd_reserve(conn_id, None)
+            }
+            Command::ReserveWithTimeout { timeout } => {
+                self.stats.op_ct[OP_RESERVE_TIMEOUT] += 1;
+                self.cmd_reserve(conn_id, Some(timeout))
+            }
+            Command::ReserveJob { id } => {
+                self.stats.op_ct[OP_RESERVE] += 1;
+                self.cmd_reserve_job(conn_id, id)
+            }
+            Command::ReserveMode { mode } => {
+                self.stats.op_ct[OP_RESERVE_MODE] += 1;
+                self.cmd_reserve_mode(conn_id, &mode)
+            }
+            Command::ReserveBatch { count } => {
+                self.stats.op_ct[OP_RESERVE] += 1;
+                self.cmd_reserve_batch(conn_id, count)
+            }
+            Command::Delete { id } => {
+                self.stats.op_ct[OP_DELETE] += 1;
+                self.cmd_delete(conn_id, id)
+            }
+            Command::DeleteBatch { ids } => {
+                self.stats.op_ct[OP_DELETE] += ids.len() as u64;
+                self.cmd_delete_batch(conn_id, ids)
+            }
+            Command::Release { id, pri, delay } => {
+                self.stats.op_ct[OP_RELEASE] += 1;
+                self.cmd_release(conn_id, id, pri, delay)
+            }
+            Command::Bury { id, pri } => {
+                self.stats.op_ct[OP_BURY] += 1;
+                self.cmd_bury(conn_id, id, pri)
+            }
+            Command::Touch { id } => {
+                self.stats.op_ct[OP_TOUCH] += 1;
+                self.cmd_touch(conn_id, id)
+            }
+            Command::Watch { tube, weight } => {
+                self.stats.op_ct[OP_WATCH] += 1;
+                self.cmd_watch(conn_id, &tube, weight)
+            }
+            Command::Ignore { tube } => {
+                self.stats.op_ct[OP_IGNORE] += 1;
+                self.cmd_ignore(conn_id, &tube)
+            }
+            Command::Peek { id } => {
+                self.stats.op_ct[OP_PEEKJOB] += 1;
+                self.cmd_peek(id)
+            }
+            Command::PeekReady => {
+                self.stats.op_ct[OP_PEEK_READY] += 1;
+                self.cmd_peek_ready(conn_id)
+            }
+            Command::PeekDelayed => {
+                self.stats.op_ct[OP_PEEK_DELAYED] += 1;
+                self.cmd_peek_delayed(conn_id)
+            }
+            Command::PeekBuried => {
+                self.stats.op_ct[OP_PEEK_BURIED] += 1;
+                self.cmd_peek_buried(conn_id)
+            }
+            Command::PeekReserved => {
+                self.stats.op_ct[OP_PEEK_RESERVED] += 1;
+                self.cmd_peek_reserved(conn_id)
+            }
+            Command::Kick { bound } => {
+                self.stats.op_ct[OP_KICK] += 1;
+                self.cmd_kick(conn_id, bound)
+            }
+            Command::KickJob { id } => {
+                self.stats.op_ct[OP_KICK] += 1;
+                self.cmd_kick_job(id)
+            }
+            Command::StatsJob { id } => {
+                self.stats.op_ct[OP_STATSJOB] += 1;
+                self.cmd_stats_job(id)
+            }
+            Command::StatsTube { tube } => {
+                self.stats.op_ct[OP_STATS_TUBE] += 1;
+                self.cmd_stats_tube(&tube)
+            }
+            Command::StatsGroup { group } => {
+                self.stats.op_ct[OP_STATS] += 1;
+                self.cmd_stats_group(&group)
+            }
+            Command::Stats => {
+                self.stats.op_ct[OP_STATS] += 1;
+                self.cmd_stats()
+            }
+            Command::ListTubes => {
+                self.stats.op_ct[OP_LIST_TUBES] += 1;
+                self.cmd_list_tubes()
+            }
+            Command::ListTubeUsed => {
+                self.stats.op_ct[OP_LIST_TUBE_USED] += 1;
+                self.cmd_list_tube_used(conn_id)
+            }
+            Command::ListTubesWatched => {
+                self.stats.op_ct[OP_LIST_TUBES_WATCHED] += 1;
+                self.cmd_list_tubes_watched(conn_id)
+            }
+            Command::PauseTube { tube, delay } => {
+                self.stats.op_ct[OP_PAUSE_TUBE] += 1;
+                self.cmd_pause_tube(&tube, delay)
+            }
             Command::FlushTube { tube } => self.cmd_flush_tube(&tube),
             Command::Drain => {
                 self.drain_mode = true;
@@ -1754,30 +1867,30 @@ impl ServerState {
             self.stats.reserved_ct,
             delayed_ct,
             self.stats.buried_ct,
-            self.stats.op_ct[1],  // OP_PUT
-            self.stats.op_ct[2],  // OP_PEEKJOB
-            self.stats.op_ct[18], // OP_PEEK_READY
-            self.stats.op_ct[19], // OP_PEEK_DELAYED
-            self.stats.op_ct[10], // OP_PEEK_BURIED
-            self.stats.op_ct[27], // OP_PEEK_RESERVED
-            self.stats.op_ct[3],  // OP_RESERVE
-            self.stats.op_ct[20], // OP_RESERVE_TIMEOUT
-            self.stats.op_ct[4],  // OP_DELETE
-            self.stats.op_ct[5],  // OP_RELEASE
-            self.stats.op_ct[11], // OP_USE
-            self.stats.op_ct[12], // OP_WATCH
-            self.stats.op_ct[13], // OP_IGNORE
-            self.stats.op_ct[6],  // OP_BURY
-            self.stats.op_ct[7],  // OP_KICK
-            self.stats.op_ct[21], // OP_TOUCH
-            self.stats.op_ct[8],  // OP_STATS
-            self.stats.op_ct[9],  // OP_STATSJOB
-            self.stats.op_ct[17], // OP_STATS_TUBE
-            self.stats.op_ct[14], // OP_LIST_TUBES
-            self.stats.op_ct[15], // OP_LIST_TUBE_USED
-            self.stats.op_ct[16], // OP_LIST_TUBES_WATCHED
-            self.stats.op_ct[23], // OP_PAUSE_TUBE
-            self.stats.op_ct[26], // OP_RESERVE_MODE
+            self.stats.op_ct[OP_PUT],
+            self.stats.op_ct[OP_PEEKJOB],
+            self.stats.op_ct[OP_PEEK_READY],
+            self.stats.op_ct[OP_PEEK_DELAYED],
+            self.stats.op_ct[OP_PEEK_BURIED],
+            self.stats.op_ct[OP_PEEK_RESERVED],
+            self.stats.op_ct[OP_RESERVE],
+            self.stats.op_ct[OP_RESERVE_TIMEOUT],
+            self.stats.op_ct[OP_DELETE],
+            self.stats.op_ct[OP_RELEASE],
+            self.stats.op_ct[OP_USE],
+            self.stats.op_ct[OP_WATCH],
+            self.stats.op_ct[OP_IGNORE],
+            self.stats.op_ct[OP_BURY],
+            self.stats.op_ct[OP_KICK],
+            self.stats.op_ct[OP_TOUCH],
+            self.stats.op_ct[OP_STATS],
+            self.stats.op_ct[OP_STATSJOB],
+            self.stats.op_ct[OP_STATS_TUBE],
+            self.stats.op_ct[OP_LIST_TUBES],
+            self.stats.op_ct[OP_LIST_TUBE_USED],
+            self.stats.op_ct[OP_LIST_TUBES_WATCHED],
+            self.stats.op_ct[OP_PAUSE_TUBE],
+            self.stats.op_ct[OP_RESERVE_MODE],
             self.stats.timeout_ct,
             self.stats.total_jobs_ct,
             self.max_job_size,
