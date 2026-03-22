@@ -592,6 +592,10 @@ impl ServerState {
                 &concurrency_key,
             );
             if !wal.reserve_put(est_size) {
+                tracing::warn!(
+                    "WAL: OUT_OF_MEMORY — job record ({est_size} bytes) exceeds max file size ({})",
+                    wal.max_file_size(),
+                );
                 return Response::OutOfMemory;
             }
         }

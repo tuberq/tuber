@@ -729,17 +729,10 @@ impl Wal {
     // --- Space reservation ---
 
     pub fn reserve_put(&self, record_size: usize) -> bool {
-        let current_free = self
-            .files
-            .back()
-            .map(|f| self.max_file_size.saturating_sub(f.bytes_written))
-            .unwrap_or(self.max_file_size);
-
-        // Conservative: only count current file's free space + one new file
-        let total_free = current_free + self.max_file_size;
+        // The WAL creates new files on demand, so total space is unbounded.
+        // Just verify the record + its future delete fit in a single file.
         let needed = record_size + STATE_CHANGE_RECORD_SIZE;
-
-        total_free as u64 >= self.reserved_bytes + needed as u64
+        needed <= self.max_file_size
     }
 
     // --- Write operations ---
@@ -773,8 +766,14 @@ impl Wal {
         let seq = job.wal_file_seq.unwrap();
         self.incref_file(seq, record_len);
 
-        // Reserve space for future state change (delete)
-        self.reserved_bytes += STATE_CHANGE_RECORD_SIZE as u64;
+        // Reserve space for future state change (delete).
+        // Only add a reservation for NEW jobs (old_seq is None).
+        // Compaction migrations (old_seq is Some) already have a reservation
+        // from the original put — adding another would leak reserved_bytes
+        // on every migration cycle.
+        if old_seq.is_none() {
+            self.reserved_bytes += STATE_CHANGE_RECORD_SIZE as u64;
+        }
 
         Ok(())
     }
@@ -1823,5 +1822,56 @@ mod tests {
             assert_eq!(job.state, JobState::Buried);
             assert_eq!(job.body, b"important-data");
         }
+    }
+
+    #[test]
+    fn test_compaction_migration_does_not_leak_reserved_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), Some(512)).unwrap();
+
+        let mut job = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"hello".to_vec(),
+            "default".to_string(),
+        );
+
+        // Initial put — should add one reservation
+        wal.write_put(&mut job).unwrap();
+        let after_put = wal.reserved_bytes;
+        assert_eq!(after_put, STATE_CHANGE_RECORD_SIZE as u64);
+
+        // Simulate compaction migration — should NOT add another reservation
+        wal.write_put(&mut job).unwrap();
+        assert_eq!(
+            wal.reserved_bytes, after_put,
+            "compaction migration must not increase reserved_bytes"
+        );
+
+        // A third migration — still no increase
+        wal.write_put(&mut job).unwrap();
+        assert_eq!(
+            wal.reserved_bytes, after_put,
+            "repeated migrations must not leak reserved_bytes"
+        );
+
+        // State change (delete) should consume the single reservation
+        wal.write_state_change(&mut job, None, 10, Duration::ZERO, 0)
+            .unwrap();
+        assert_eq!(wal.reserved_bytes, 0, "delete should consume reservation");
+    }
+
+    #[test]
+    fn test_reserve_put_rejects_oversized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::open(dir.path(), Some(512)).unwrap();
+
+        // A record that fits
+        assert!(wal.reserve_put(100));
+
+        // A record larger than max_file_size
+        assert!(!wal.reserve_put(1024));
     }
 }
