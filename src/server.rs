@@ -2464,6 +2464,9 @@ impl ServerState {
                 }
             }
         }
+
+        // New connections default to "use default" + "watch default", so always keep it
+        self.tubes.retain(|name, tube| name == "default" || !tube.is_idle());
     }
 
     /// Restore jobs from WAL replay into server state.

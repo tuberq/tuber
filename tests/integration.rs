@@ -4474,3 +4474,53 @@ async fn test_close_releases_tube_reserved_counter() {
         body
     );
 }
+
+// --- idle tube reaping ---
+
+#[tokio::test]
+async fn test_idle_tubes_reaped() {
+    let srv = TestServer::start().await;
+
+    // Scope the connection so it drops (disconnects) before we check reaping
+    {
+        let mut c = srv.connect().await;
+        c.mustsend("use ephemeral\r\n").await;
+        c.ckresp("USING ephemeral\r\n").await;
+
+        // Put and delete a job so the tube exists but ends up empty
+        c.mustsend("put 0 0 60 4\r\n").await;
+        c.mustsend("test\r\n").await;
+        let resp = c.readline().await;
+        let id = resp.trim().strip_prefix("INSERTED ").unwrap().to_string();
+
+        c.mustsend(&format!("delete {}\r\n", id)).await;
+        c.ckresp("DELETED\r\n").await;
+
+        // Tube should still be visible while connection is using it
+        c.mustsend("list-tubes\r\n").await;
+        let body = c.read_ok_body().await;
+        assert!(body.contains("ephemeral"), "tube should exist while in use");
+
+        // Switch away so using_ct drops to 0
+        c.mustsend("use default\r\n").await;
+        c.ckresp("USING default\r\n").await;
+    }
+    // Connection dropped — watching_ct and using_ct should be 0
+
+    // Wait for at least one tick (100ms interval) to reap the idle tube
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut c2 = srv.connect().await;
+    c2.mustsend("list-tubes\r\n").await;
+    let body = c2.read_ok_body().await;
+    assert!(
+        !body.contains("ephemeral"),
+        "idle tube should have been reaped, got: {}",
+        body
+    );
+    assert!(
+        body.contains("default"),
+        "default tube should never be reaped, got: {}",
+        body
+    );
+}
