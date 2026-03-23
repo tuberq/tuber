@@ -27,7 +27,7 @@ impl TestServer {
         let wal_dir_clone = wal_dir.clone();
 
         let handle = tokio::spawn(async move {
-            tuber::server::run_with_listener(listener, max_job_size, Some(wal_dir_clone.as_path()))
+            tuber::server::run_with_listener(listener, max_job_size, Some(wal_dir_clone.as_path()), None)
                 .await
                 .ok();
         });

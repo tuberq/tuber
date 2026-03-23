@@ -85,6 +85,18 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     let stats_yaml = client.stats().await?;
     let stats = parse_yaml_map(&stats_yaml);
 
+    // Info metric with instance name and version labels
+    {
+        let name = stats.get("name").unwrap_or(&"");
+        let version = stats.get("version").unwrap_or(&"");
+        let id = stats.get("id").unwrap_or(&"");
+        out.push_str("# HELP tuber_info Tuber instance information\n");
+        out.push_str("# TYPE tuber_info gauge\n");
+        out.push_str(&format!(
+            "tuber_info{{name=\"{name}\",version={version},id=\"{id}\"}} 1\n\n"
+        ));
+    }
+
     // Gauges
     prom_gauge(
         &mut out,

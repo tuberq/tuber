@@ -124,6 +124,8 @@ struct ServerState {
     wal: Option<Wal>,
     /// Hex-encoded random instance ID (16 chars).
     instance_id: String,
+    /// Optional user-assigned instance name.
+    name: Option<String>,
     /// Cached system info from uname.
     hostname: String,
     os: String,
@@ -137,7 +139,7 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(max_job_size: u32) -> Self {
+    fn new(max_job_size: u32, name: Option<String>) -> Self {
         let mut tubes = HashMap::new();
         tubes.insert("default".to_string(), Tube::new("default"));
 
@@ -223,6 +225,7 @@ impl ServerState {
             waiters: Vec::new(),
             wal: None,
             instance_id,
+            name,
             hostname,
             os,
             platform,
@@ -1863,6 +1866,7 @@ impl ServerState {
              current-concurrency-keys: {}\n\
              draining: {}\n\
              id: {}\n\
+             name: {}\n\
              hostname: {}\n\
              os: {}\n\
              platform: {}\n",
@@ -1920,6 +1924,7 @@ impl ServerState {
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
             self.instance_id,
+            self.name.as_deref().unwrap_or(""),
             self.hostname,
             self.os,
             self.platform,
@@ -2629,9 +2634,14 @@ pub async fn run(
     max_job_size: u32,
     wal_dir: Option<&str>,
     metrics_port: Option<u16>,
+    name: Option<String>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind((addr, port)).await?;
-    tracing::info!("tuber v{} listening on {}:{}", env!("CARGO_PKG_VERSION"), addr, port);
+    if let Some(ref n) = name {
+        tracing::info!("tuber v{} [{}] listening on {}:{}", env!("CARGO_PKG_VERSION"), n, addr, port);
+    } else {
+        tracing::info!("tuber v{} listening on {}:{}", env!("CARGO_PKG_VERSION"), addr, port);
+    }
 
     if let Some(mp) = metrics_port {
         let listen_addr = listener.local_addr()?.ip();
@@ -2644,16 +2654,17 @@ pub async fn run(
     }
 
     let wal_path = wal_dir.map(Path::new);
-    run_with_listener(listener, max_job_size, wal_path).await
+    run_with_listener(listener, max_job_size, wal_path, name).await
 }
 
 pub async fn run_with_listener(
     listener: TcpListener,
     max_job_size: u32,
     wal_dir: Option<&Path>,
+    name: Option<String>,
 ) -> io::Result<()> {
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
-    let mut state = ServerState::new(max_job_size);
+    let mut state = ServerState::new(max_job_size, name);
 
     // WAL: open and replay if configured
     if let Some(dir) = wal_dir {
@@ -2935,7 +2946,7 @@ mod tests {
     use super::*;
 
     fn make_state() -> ServerState {
-        ServerState::new(65535)
+        ServerState::new(65535, None)
     }
 
     fn register(state: &mut ServerState) -> u64 {

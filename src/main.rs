@@ -37,6 +37,10 @@ enum Commands {
         /// Enable Prometheus metrics endpoint on this port
         #[arg(long)]
         metrics_port: Option<u16>,
+
+        /// Instance name (falls back to TUBER_NAME env var)
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Put a job onto a tube
@@ -127,6 +131,7 @@ async fn main() {
             max_job_size,
             verbose,
             metrics_port,
+            name,
         } => {
             let level = match verbose {
                 0 => tracing::Level::WARN,
@@ -134,12 +139,14 @@ async fn main() {
                 _ => tracing::Level::DEBUG,
             };
             tracing_subscriber::fmt().with_max_level(level).init();
+            let instance_name = name.or_else(|| std::env::var("TUBER_NAME").ok());
             if let Err(e) = tuber::server::run(
                 &listen,
                 port,
                 max_job_size,
                 binlog_dir.as_deref(),
                 metrics_port,
+                instance_name,
             )
             .await
             {

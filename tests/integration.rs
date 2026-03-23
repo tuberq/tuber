@@ -23,7 +23,7 @@ impl TestServer {
         let port = listener.local_addr().unwrap().port();
 
         let handle = tokio::spawn(async move {
-            tuber::server::run_with_listener(listener, max_job_size, None)
+            tuber::server::run_with_listener(listener, max_job_size, None, None)
                 .await
                 .ok();
         });

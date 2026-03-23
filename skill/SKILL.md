@@ -97,6 +97,12 @@ echo -e "ignore default\r\n" | nc localhost 11300
 # Idempotent put (deduplicates by key within the tube)
 echo -e "put 0 0 60 5 idp:unique-key\r\nhello\r\n" | nc localhost 11300
 
+# Idempotent put with TTL (key expires after 300 seconds)
+echo -e "put 0 0 60 5 idp:unique-key:300\r\nhello\r\n" | nc localhost 11300
+# ⚠ Format is idp:<key> or idp:<key>:<ttl> — the LAST colon separates key from TTL.
+# So idp:series:123 means key="series", TTL=123 — NOT key="series:123".
+# Use dashes or dots instead of colons in keys: idp:series-123 or idp:series.123
+
 # Job groups + after-group dependencies (fan-out/fan-in)
 echo -e "put 0 0 60 5 grp:batch-1\r\nhello\r\n" | nc localhost 11300
 echo -e "put 0 0 60 7 aft:batch-1\r\ncleanup\r\n" | nc localhost 11300

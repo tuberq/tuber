@@ -83,7 +83,7 @@ impl BenchServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
-            tuber::server::run_with_listener(listener, 65535, None)
+            tuber::server::run_with_listener(listener, 65535, None, None)
                 .await
                 .ok();
         });

@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "tuber"
-version = "0.3.8"
+version = "0.3.10"
 dependencies = [
  "bytes",
  "clap",
