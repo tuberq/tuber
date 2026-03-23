@@ -360,6 +360,7 @@ tuber server [OPTIONS]
 | `-z`, `--max-job-size` | `65535` | Max job size in bytes |
 | `-V` | warn | Verbosity (`-V` info, `-VV` debug) |
 | `--metrics-port` | — | Prometheus metrics endpoint port |
+| `--name` | `TUBER_NAME` env | Instance name (shown in stats and metrics) |
 
 ```bash
 # Listen on a custom port with persistence

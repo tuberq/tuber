@@ -519,3 +519,75 @@ async fn test_wal_replay_idempotency() {
     c2.mustsend("other\r\n").await;
     c2.ckresp("INSERTED 2\r\n").await;
 }
+
+/// Test 12: Concurrency limit >1 survives WAL replay
+///
+/// Before the fix, restore_jobs() never populated concurrency_limits,
+/// so after restart is_concurrency_blocked() would default to limit 1
+/// instead of the configured limit (e.g. 3).
+///
+/// The bug: cmd_put() registers the limit at put-time, but restore_jobs()
+/// doesn't. After restart, acquire_concurrency_key() lazily sets the limit
+/// on the first reserve — but is_concurrency_blocked() runs BEFORE acquire,
+/// so once 1 job is reserved (count=1), the next check sees count(1) >= limit(1)
+/// and blocks. The limit never gets a chance to update to 3.
+#[tokio::test]
+async fn test_wal_replay_concurrency_limit() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // Put 3 jobs with con:api:3 (limit 3)
+    for i in 1..=3 {
+        let body = format!("{}", i);
+        c.mustsend(&format!("put 0 0 60 {} con:api:3\r\n", body.len()))
+            .await;
+        c.mustsend(&format!("{}\r\n", body)).await;
+        c.ckresp(&format!("INSERTED {}\r\n", i)).await;
+    }
+
+    // Before restart: reserve 1 job so count=1, then verify 2nd is still allowed
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("2\r\n").await;
+
+    // Release both so all 3 are ready for restart
+    c.mustsend("release 1 0 0\r\n").await;
+    c.ckresp("RELEASED\r\n").await;
+    c.mustsend("release 2 0 0\r\n").await;
+    c.ckresp("RELEASED\r\n").await;
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Restart — concurrency_limits is now empty
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    // Reserve first job — this always works (count=0 < default limit=1)
+    // acquire_concurrency_key sets count=1, limit=3
+    c2.mustsend("reserve-with-timeout 0\r\n").await;
+    let line = c2.readline().await;
+    assert!(line.starts_with("RESERVED"), "expected RESERVED, got {:?}", line);
+    let _ = c2.readline().await;
+
+    // Reserve second job — BUG: without the fix, is_concurrency_blocked sees
+    // count=1 >= limit=1 (default) and blocks, even though limit should be 3.
+    // With the fix, limit is correctly restored to 3 so count=1 < 3 passes.
+    c2.mustsend("reserve-with-timeout 0\r\n").await;
+    let line = c2.readline().await;
+    assert!(line.starts_with("RESERVED"), "expected second RESERVED after restart, got {:?} (concurrency limit not restored)", line);
+    let _ = c2.readline().await;
+
+    // Reserve third — should also succeed (count=2 < limit=3)
+    c2.mustsend("reserve-with-timeout 0\r\n").await;
+    let line = c2.readline().await;
+    assert!(line.starts_with("RESERVED"), "expected third RESERVED after restart, got {:?}", line);
+    let _ = c2.readline().await;
+}

@@ -2553,6 +2553,14 @@ impl ServerState {
                 }
             }
 
+            // Register concurrency limit
+            if let Some(job) = self.jobs.get(&id) {
+                if let Some((ref key, limit)) = job.concurrency_key {
+                    let entry = self.concurrency_limits.entry(key.clone()).or_insert(0);
+                    *entry = (*entry).max(limit);
+                }
+            }
+
             // Register idempotency key in tube index
             if let Some(ref key_tuple) = idempotency_key
                 && let Some(tube) = self.tubes.get_mut(&tube_name)
