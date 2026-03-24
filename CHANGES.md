@@ -1,5 +1,29 @@
 # Changes
 
+## v0.3.11
+
+**Restore concurrency limits from WAL on restart**
+
+`restore_jobs()` was not populating `concurrency_limits` during WAL replay, so after restart `is_concurrency_blocked()` would default to limit 1 instead of the configured limit.
+
+## v0.3.10
+
+**Add `--name` flag and `TUBER_NAME` env for instance naming**
+
+New `--name` flag (and `TUBER_NAME` environment variable) to label server instances. The name appears in stats YAML output, startup log, and Prometheus `tuber_info` gauge with name/version/id labels.
+
+## v0.3.9
+
+**Reap idle tubes during maintenance tick**
+
+Empty non-default tubes are now removed during the periodic maintenance tick when they have no jobs, no watchers, and no active connections — matching beanstalkd's cleanup behavior.
+
+## v0.3.8
+
+**Fix WAL `reserved_bytes` leak causing spurious `OUT_OF_MEMORY`**
+
+Compaction migrations called `write_put()` which unconditionally incremented `reserved_bytes`. Long-lived idle jobs migrated repeatedly inflated the counter until `reserve_put()` rejected new puts. Fixed by only reserving for new jobs. Also simplified `reserve_put()` to match beanstalkd: the WAL creates files on demand, so the only constraint is that a record fits in one file.
+
 ## v0.3.7
 
 **Fix WAL state change ref counting causing data loss after GC**

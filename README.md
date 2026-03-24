@@ -49,7 +49,7 @@ SQLite-backed queues are simple and fast, but limited to a single host. PostgreS
 
 Tuber is purpose-built for this. A single binary, easy to deploy in Docker, with optional write-ahead log for durability. No capacity planning, no tuning, no surprises. Workers wait efficiently at any scale.
 
-Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) already work out of the box. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/dkam/beaneater/tree/tuber) for Ruby.
+Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) already work out of the box. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/tuberq/beaneater/tree/tuber) for Ruby.
 
 ### Feature Comparison
 
@@ -77,6 +77,8 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 ### Background jobs
 
 Offload slow work from your web app. Your request handler queues a job and returns immediately — workers process it in the background.
+
+These examples use shell commands for clarity, but in practice you'd typically interact with the queue programmatically via a client library.
 
 ```bash
 tuber put -t emails "send-welcome user@example.com"
@@ -149,7 +151,7 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 
 ### Weighted Reserve
 
-By default, `reserve` picks the highest-priority job across all watched tubes (FIFO). Switch to weighted mode and each tube is chosen randomly in proportion to its weight:
+By default, `reserve` picks the highest-priority job across all watched tubes. In weighted mode, a tube is chosen randomly in proportion to its weight, then the highest-priority job from that tube is returned:
 
 ```text
 watch email
@@ -163,7 +165,7 @@ Tubes default to weight 1. Here, `another-tube` is selected 3x as often as `noti
 
 ### Unique Jobs (Idempotency)
 
-Prevent duplicate jobs with an `idp:` key on `put`. If a live job with the same key already exists in the tube, the original job ID is returned along with the existing job's state:
+Prevent duplicate jobs with an `idp:` key on `put`. If a job with the same key already exists in the tube, the original job ID is returned along with the existing job's state:
 
 ```text
 put 100 0 30 5 idp:my-key
@@ -223,7 +225,7 @@ send-summary
 
 The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish. If an `aft:` job isn't running and you're not sure why, use `stats-group <name>` to check whether the group still has pending or buried members.
 
-Chain stages together by combining `aft:` and `grp:` on the same job — the after-job becomes a member of the next group:
+Chain stages together by combining `aft:` and `grp:` on the same job — the job waits on one group while belonging to another:
 
 ```text
 put 0 0 30 5 grp:extract
@@ -236,7 +238,7 @@ put 0 0 30 5 aft:transform
 load
 ```
 
-Here `transform` waits for the extract group to finish, then becomes part of the `transform` group. `load` waits for `transform` to complete — giving you a simple DAG pipeline.
+Here `transform` waits for the `extract` group to finish and is itself a member of the `transform` group. `load` waits for `transform` to complete — giving you a simple DAG pipeline.
 
 Use `stats-group <name>` to inspect group state — useful for debugging why `aft:` jobs aren't running:
 
@@ -318,22 +320,22 @@ Returns `DELETED_BATCH <deleted_count> <not_found_count>` — here 3 jobs were d
 ### Homebrew
 
 ```bash
-brew tap dkam/tuber
+brew tap tuberq/tuber
 brew install tuber
 ```
 
 ### Cargo
 
 ```bash
-cargo install --git https://github.com/dkam/tuber
+cargo install --git https://github.com/tuberq/tuber
 ```
 
-Pre-built binaries for Linux and macOS are available on the [releases page](https://github.com/dkam/tuber/releases).
+Pre-built binaries for Linux and macOS are available on the [releases page](https://github.com/tuberq/tuber/releases).
 
 ### Docker
 
 ```bash
-docker run ghcr.io/dkam/tuber server -l 0.0.0.0 -p 11300
+docker run ghcr.io/tuberq/tuber server -l 0.0.0.0 -p 11300
 ```
 
 ### Building from source
