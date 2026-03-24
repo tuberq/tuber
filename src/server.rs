@@ -3745,6 +3745,138 @@ mod tests {
     }
 
     #[test]
+    fn test_chained_aft_pipeline() {
+        // Verify the ETL pipeline scenario: extract -> transform -> load
+        // where each stage is held until the previous stage's group completes.
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Step 1: Put 2 extract jobs tagged with grp:extract
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: Some("extract".into()),
+                after_group: None,
+                concurrency_key: None,
+            },
+            Some(b"ext-1".to_vec()),
+        );
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: Some("extract".into()),
+                after_group: None,
+                concurrency_key: None,
+            },
+            Some(b"ext-2".to_vec()),
+        );
+        assert!(matches!(resp, Response::Inserted(2)));
+
+        // Step 2: Put 1 transform job with aft:extract grp:transform
+        // It should be held because the extract group is not yet complete.
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: Some("transform".into()),
+                after_group: Some("extract".into()),
+                concurrency_key: None,
+            },
+            Some(b"xform".to_vec()),
+        );
+        assert!(matches!(resp, Response::Inserted(3)));
+
+        // Step 3: Put 1 load job with aft:transform
+        // It should be held because the transform group is not yet complete.
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 5,
+                idempotency_key: None,
+                group: None,
+                after_group: Some("transform".into()),
+                concurrency_key: None,
+            },
+            Some(b"load!".to_vec()),
+        );
+        assert!(matches!(resp, Response::Inserted(4)));
+
+        // Step 4: Verify the transform job (3) and load job (4) are not reservable
+        // while the extract group still has pending jobs.
+        // Only extract jobs 1 and 2 should be available.
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(
+            matches!(r, Response::Reserved { id: 1, .. }),
+            "expected extract job 1, got {:?}",
+            r
+        );
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(
+            matches!(r, Response::Reserved { id: 2, .. }),
+            "expected extract job 2, got {:?}",
+            r
+        );
+        // No more ready jobs -- transform is still held
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(
+            matches!(r, Response::TimedOut),
+            "expected TimedOut (transform held), got {:?}",
+            r
+        );
+
+        // Step 5: Delete both extract jobs. This completes the extract group,
+        // which should promote the transform job to ready.
+        s.handle_command(c, Command::Delete { id: 1 }, None);
+        s.handle_command(c, Command::Delete { id: 2 }, None);
+
+        // Step 6: Verify the transform job is now reservable.
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(
+            matches!(r, Response::Reserved { id: 3, .. }),
+            "expected transform job 3 after extract completes, got {:?}",
+            r
+        );
+        // Load job is still held -- transform group not yet complete
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(
+            matches!(r, Response::TimedOut),
+            "expected TimedOut (load held), got {:?}",
+            r
+        );
+
+        // Step 7: Delete the transform job. This completes the transform group,
+        // which should promote the load job to ready.
+        s.handle_command(c, Command::Delete { id: 3 }, None);
+
+        // Step 8: Verify the load job is now reservable.
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(
+            matches!(r, Response::Reserved { id: 4, .. }),
+            "expected load job 4 after transform completes, got {:?}",
+            r
+        );
+    }
+
+    #[test]
     fn test_stats_group_buried() {
         let mut s = make_state();
         let c = register(&mut s);
