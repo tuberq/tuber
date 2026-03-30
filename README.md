@@ -4,7 +4,7 @@ An experimental, simple, fast job queue server. One binary, zero dependencies.
 
 Tuber is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds unique jobs, concurrency control, job group pipelines, batch operations and weighted queues.
 
-[![tuber-tui](screenshots/tui-05.png)](https://github.com/tuberq/tuber-tui)
+[![tuber-tui](screenshots/tui-06.jpg)](https://github.com/tuberq/tuber-tui)
 *[tuber-tui](https://github.com/tuberq/tuber-tui) — a terminal dashboard compatible with both Tuber and Beanstalkd.*
 
 ## How was this built?
@@ -62,6 +62,8 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Per-job priority** | Yes (numeric) | Yes (numeric) | — ⁵ | Yes | Yes | Yes |
 | **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Via plugin |
 | **Batch reserve / delete** | Yes | — | — | — | — | Prefetch |
+| **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | In DB ⁸ | — | — |
+| **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | In DB ⁸ | — | — |
 | **Persistence** | WAL (optional) | WAL (optional) | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
 | **Infrastructure** | None (single binary) | None (single binary) | Redis | PostgreSQL | DB ⁶ | Erlang runtime |
 
@@ -70,7 +72,10 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 ³ RabbitMQ has a community deduplication plugin, but no built-in uniqueness.<br>
 ⁴ GoodJob batches support single-level fan-out/fan-in (enqueue N jobs, fire a callback when all complete). Multi-stage pipelines require manually chaining batches inside callbacks.<br>
 ⁵ Sidekiq uses queue-level ordering (strict or weighted), not per-job numeric priority.<br>
-⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.</sub>
+⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.<br>
+⁷ Sidekiq 7+ tracks execution time per job class in exponential histogram buckets. No percentiles without external APM.<br>
+⁸ GoodJob stores timestamps in PostgreSQL — you can query for percentiles with SQL, but nothing is computed or displayed by default.<br>
+⁹ Sidekiq's `Queue#latency` returns the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.</sub>
 
 ## What Can You Do With It?
 
@@ -151,15 +156,15 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 
 ### Statistics
 
-Tuber provides detailed per-tube processing statistics that most job queue systems don't expose. Every `stats-tube` response includes:
+Most job queue systems treat performance monitoring as the application's problem. Tuber tracks it at the broker, per tube, with no external tooling required:
 
 - **Processing time** — EWMA, min, max, and sample count for how long workers take to complete jobs (reserve-to-delete).
 - **Dual EWMA** — jobs are automatically split at a 100ms threshold into fast and slow buckets, each with its own EWMA. This surfaces bimodal distributions (e.g. idempotent fast-exits vs real work) that a single average would hide.
 - **Percentiles** — p50, p95, p99 from the last 1000 samples. Uses slow-job samples when available, falls back to fast-job samples for tubes where all jobs are quick.
-- **Queue time (time-in-queue)** — EWMA, min, and max of how long jobs waited from `put` to `reserve`. Growing queue time means you need more workers.
+- **Queue time (time-in-queue)** — EWMA, min, and max of how long jobs waited from `put` to `reserve`. Growing queue time means you need more workers — and you'll know before your users do.
 - **Bury rate** — fraction of reserves that ended in a bury, for quick failure monitoring.
 
-All stats are also available via the Prometheus `/metrics` endpoint. See the full [Statistics Reference](docs/statistics.md) for field details.
+All stats are available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-tui). See the full [Statistics Reference](docs/statistics.md) for field details.
 
 ### Weighted Reserve
 
