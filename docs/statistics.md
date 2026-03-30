@@ -141,6 +141,19 @@ behavior — percentiles are most useful for understanding the slow-job tail.
 
 All percentile fields return 0 when no slow samples have been recorded.
 
+### Queue time (time-in-queue)
+
+Queue time measures how long a job waited from `put` to `reserve` — the time
+spent in the queue before a worker picked it up. Growing queue time indicates
+you need more workers.
+
+| Field | Description |
+|---|---|
+| `queue-time-ewma` | EWMA of queue time (seconds, alpha=0.1) |
+| `queue-time-min` | Minimum observed queue time (seconds) |
+| `queue-time-max` | Maximum observed queue time (seconds) |
+| `queue-time-samples` | Number of reserves included in queue-time stats |
+
 ## Job Stats (`stats-job <id>`)
 
 Returns per-job statistics in YAML format.
@@ -231,3 +244,4 @@ Each has a `tube` label:
 | `tuber_tube_processing_time_p50{tube="..."}` | Processing time p50 (slow jobs) |
 | `tuber_tube_processing_time_p95{tube="..."}` | Processing time p95 (slow jobs) |
 | `tuber_tube_processing_time_p99{tube="..."}` | Processing time p99 (slow jobs) |
+| `tuber_tube_queue_time_ewma{tube="..."}` | Queue time EWMA |

@@ -37,6 +37,12 @@ pub struct TubeStats {
     pub processing_time_samples_slow: u64,
 
     pub processing_time_ring_slow: VecDeque<f64>,
+
+    // Queue time (put-to-reserve)
+    pub queue_time_ewma: f64,
+    pub queue_time_min: Option<f64>,
+    pub queue_time_max: Option<f64>,
+    pub queue_time_samples: u64,
 }
 
 const SLOW_RING_CAPACITY: usize = 1000;

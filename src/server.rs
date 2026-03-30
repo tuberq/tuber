@@ -843,17 +843,18 @@ impl ServerState {
 
     fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64) -> Response {
         let now = Instant::now();
-        let (body, _ttr, tube_name) = match self.jobs.get_mut(&job_id) {
+        let (body, _ttr, tube_name, created_at) = match self.jobs.get_mut(&job_id) {
             Some(job) => {
                 let body = job.body.clone();
                 let ttr = job.ttr;
                 let tube_name = job.tube_name.clone();
+                let created_at = job.created_at;
                 job.state = JobState::Reserved;
                 job.reserver_id = Some(conn_id);
                 job.reserved_at = Some(now);
                 job.deadline_at = Some(now + ttr);
                 job.reserve_ct += 1;
-                (body, ttr, tube_name)
+                (body, ttr, tube_name, created_at)
             }
             None => return Response::NotFound,
         };
@@ -861,6 +862,18 @@ impl ServerState {
         if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.stat.reserved_ct += 1;
             tube.stat.total_reserve_ct += 1;
+
+            const ALPHA: f64 = 0.1;
+            let queue_secs = now.duration_since(created_at).as_secs_f64();
+            TubeStats::update_ewma(
+                &mut tube.stat.queue_time_ewma,
+                &mut tube.stat.queue_time_samples,
+                queue_secs, ALPHA,
+            );
+            tube.stat.queue_time_min =
+                Some(tube.stat.queue_time_min.map_or(queue_secs, |m| m.min(queue_secs)));
+            tube.stat.queue_time_max =
+                Some(tube.stat.queue_time_max.map_or(queue_secs, |m| m.max(queue_secs)));
         }
         self.stats.reserved_ct += 1;
 
@@ -1759,7 +1772,11 @@ impl ServerState {
              processing-time-samples-slow: {}\n\
              processing-time-p50: {:.6}\n\
              processing-time-p95: {:.6}\n\
-             processing-time-p99: {:.6}\n",
+             processing-time-p99: {:.6}\n\
+             queue-time-ewma: {:.6}\n\
+             queue-time-min: {:.6}\n\
+             queue-time-max: {:.6}\n\
+             queue-time-samples: {}\n",
             tube.name,
             tube.stat.urgent_ct,
             tube.ready.len(),
@@ -1790,6 +1807,10 @@ impl ServerState {
             p50,
             p95,
             p99,
+            tube.stat.queue_time_ewma,
+            tube.stat.queue_time_min.unwrap_or(0.0),
+            tube.stat.queue_time_max.unwrap_or(0.0),
+            tube.stat.queue_time_samples,
         );
         Response::Ok(yaml.into_bytes())
     }

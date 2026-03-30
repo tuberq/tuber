@@ -291,6 +291,8 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         out.push_str("# TYPE tuber_tube_processing_time_p95 gauge\n");
         out.push_str("# HELP tuber_tube_processing_time_p99 Processing time p99 (slow jobs) per tube\n");
         out.push_str("# TYPE tuber_tube_processing_time_p99 gauge\n");
+        out.push_str("# HELP tuber_tube_queue_time_ewma Queue time EWMA per tube\n");
+        out.push_str("# TYPE tuber_tube_queue_time_ewma gauge\n");
 
         for name in &tube_names {
             if let Ok(tube_yaml) = client.stats_tube(name).await {
@@ -339,6 +341,7 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
                 tube_metric(&mut out, "tuber_tube_processing_time_p50", name, &ts, "processing-time-p50");
                 tube_metric(&mut out, "tuber_tube_processing_time_p95", name, &ts, "processing-time-p95");
                 tube_metric(&mut out, "tuber_tube_processing_time_p99", name, &ts, "processing-time-p99");
+                tube_metric(&mut out, "tuber_tube_queue_time_ewma", name, &ts, "queue-time-ewma");
             }
         }
         out.push('\n');

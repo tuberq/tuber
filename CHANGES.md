@@ -1,5 +1,11 @@
 # Changes
 
+## v0.3.13
+
+**Add queue-time (time-in-queue) stats to `stats-tube`**
+
+Tracks how long jobs wait from `put` to `reserve` via EWMA, min, max, and sample count. Growing queue time indicates you need more workers. Exposed in `stats-tube` and Prometheus `/metrics`.
+
 ## v0.3.12
 
 **Enhanced processing time stats: dual EWMA, percentiles, and bury rate**

@@ -4708,3 +4708,244 @@ async fn test_stats_tube_bury_rate_zero() {
         body
     );
 }
+
+/// Parse a f64 value from a YAML stats body for a given key.
+fn parse_stat_f64(body: &str, key: &str) -> f64 {
+    body.lines()
+        .find(|l| l.trim().starts_with(key))
+        .unwrap_or_else(|| panic!("{} not found in: {}", key, body))
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .parse::<f64>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_stats_tube_ewma_values_plausible() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // 3 fast jobs (immediate delete) + 3 slow jobs (200ms each)
+    for _ in 0..3 {
+        let id = c.put_and_reserve(0, 0, 60, "fast").await;
+        c.mustsend(&format!("delete {}\r\n", id)).await;
+        c.ckresp("DELETED\r\n").await;
+    }
+    for _ in 0..3 {
+        let id = c.put_and_reserve(0, 0, 60, "slow").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        c.mustsend(&format!("delete {}\r\n", id)).await;
+        c.ckresp("DELETED\r\n").await;
+    }
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    let ewma_fast = parse_stat_f64(&body, "processing-time-ewma-fast:");
+    let ewma_slow = parse_stat_f64(&body, "processing-time-ewma-slow:");
+    let samples_fast = parse_stat_f64(&body, "processing-time-samples-fast:") as u64;
+    let samples_slow = parse_stat_f64(&body, "processing-time-samples-slow:") as u64;
+
+    assert_eq!(samples_fast, 3, "expected 3 fast samples: {}", body);
+    assert_eq!(samples_slow, 3, "expected 3 slow samples: {}", body);
+
+    // Fast EWMA should be well under 100ms
+    assert!(
+        ewma_fast < 0.1,
+        "fast ewma {:.6} should be < 0.1s: {}",
+        ewma_fast, body
+    );
+
+    // Slow EWMA should be roughly 200ms (between 150ms and 400ms to allow for scheduling jitter)
+    assert!(
+        ewma_slow > 0.15 && ewma_slow < 0.4,
+        "slow ewma {:.6} should be ~0.2s: {}",
+        ewma_slow, body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_percentiles_with_varied_times() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Create slow jobs with varying sleep times to test percentile ordering
+    let sleep_times = [120, 150, 200, 250, 300];
+    for ms in &sleep_times {
+        let id = c.put_and_reserve(0, 0, 60, "x").await;
+        tokio::time::sleep(Duration::from_millis(*ms)).await;
+        c.mustsend(&format!("delete {}\r\n", id)).await;
+        c.ckresp("DELETED\r\n").await;
+    }
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    let p50 = parse_stat_f64(&body, "processing-time-p50:");
+    let p95 = parse_stat_f64(&body, "processing-time-p95:");
+    let p99 = parse_stat_f64(&body, "processing-time-p99:");
+
+    // p50 <= p95 <= p99
+    assert!(
+        p50 <= p95 && p95 <= p99,
+        "percentiles should be ordered: p50={:.6} p95={:.6} p99={:.6}: {}",
+        p50, p95, p99, body
+    );
+
+    // All should be in the 100ms-500ms range (with scheduling jitter margin)
+    assert!(
+        p50 > 0.1 && p50 < 0.5,
+        "p50 {:.6} should be ~0.2s: {}",
+        p50, body
+    );
+    assert!(
+        p99 > 0.1 && p99 < 0.6,
+        "p99 {:.6} should be ~0.3s: {}",
+        p99, body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_bimodal_split() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Simulate bimodal: 5 instant jobs + 2 slow (250ms) jobs
+    for _ in 0..5 {
+        let id = c.put_and_reserve(0, 0, 60, "fast").await;
+        c.mustsend(&format!("delete {}\r\n", id)).await;
+        c.ckresp("DELETED\r\n").await;
+    }
+    for _ in 0..2 {
+        let id = c.put_and_reserve(0, 0, 60, "slow").await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        c.mustsend(&format!("delete {}\r\n", id)).await;
+        c.ckresp("DELETED\r\n").await;
+    }
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    let ewma_fast = parse_stat_f64(&body, "processing-time-ewma-fast:");
+    let ewma_slow = parse_stat_f64(&body, "processing-time-ewma-slow:");
+    let ewma_overall = parse_stat_f64(&body, "processing-time-ewma:");
+    let samples_fast = parse_stat_f64(&body, "processing-time-samples-fast:") as u64;
+    let samples_slow = parse_stat_f64(&body, "processing-time-samples-slow:") as u64;
+
+    assert_eq!(samples_fast, 5);
+    assert_eq!(samples_slow, 2);
+
+    // The overall EWMA blends both — it should be between the fast and slow EWMAs
+    assert!(
+        ewma_overall > ewma_fast && ewma_overall < ewma_slow,
+        "overall ewma {:.6} should be between fast {:.6} and slow {:.6}: {}",
+        ewma_overall, ewma_fast, ewma_slow, body
+    );
+
+    // The split EWMAs should be far apart (orders of magnitude)
+    assert!(
+        ewma_slow / ewma_fast > 100.0,
+        "slow/fast ratio should be large: slow={:.6} fast={:.6}: {}",
+        ewma_slow, ewma_fast, body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_queue_time_fields_present() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    for field in &[
+        "queue-time-ewma:",
+        "queue-time-min:",
+        "queue-time-max:",
+        "queue-time-samples:",
+    ] {
+        assert!(body.contains(field), "{} missing from stats-tube: {}", field, body);
+    }
+}
+
+#[tokio::test]
+async fn test_stats_tube_queue_time_immediate_reserve() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put and immediately reserve — queue time should be near zero
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    let ewma = parse_stat_f64(&body, "queue-time-ewma:");
+    let samples = parse_stat_f64(&body, "queue-time-samples:") as u64;
+
+    assert_eq!(samples, 1, "queue-time-samples should be 1: {}", body);
+    assert!(
+        ewma < 0.1,
+        "queue-time-ewma {:.6} should be near zero for immediate reserve: {}",
+        ewma, body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_queue_time_delayed_reserve() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a job, wait 200ms, then reserve — queue time should reflect the wait
+    c.put_job(0, 0, 60, "x").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    let line = c.readline().await;
+    assert!(line.starts_with("RESERVED "), "expected RESERVED: {}", line);
+    c.readline().await; // consume body
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    let ewma = parse_stat_f64(&body, "queue-time-ewma:");
+    let samples = parse_stat_f64(&body, "queue-time-samples:") as u64;
+
+    assert_eq!(samples, 1, "queue-time-samples should be 1: {}", body);
+    // Queue time should be ~200ms (between 150ms and 400ms with jitter)
+    assert!(
+        ewma > 0.15 && ewma < 0.4,
+        "queue-time-ewma {:.6} should be ~0.2s: {}",
+        ewma, body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_queue_time_no_reserves() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put a job but don't reserve — queue-time should be zero
+    c.put_job(0, 0, 60, "x").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    assert!(
+        body.contains("queue-time-ewma: 0.000000"),
+        "queue-time-ewma should be 0 with no reserves: {}",
+        body
+    );
+    assert!(
+        body.contains("queue-time-samples: 0"),
+        "queue-time-samples should be 0: {}",
+        body
+    );
+}
