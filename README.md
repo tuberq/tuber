@@ -149,6 +149,18 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 - **Persistence** — optional write-ahead log (`-b` flag) for crash recovery.
 - **Prometheus metrics** — expose a `/metrics` endpoint for monitoring. See [Statistics Reference](docs/statistics.md#prometheus-metrics).
 
+### Statistics
+
+Tuber provides detailed per-tube processing statistics that most job queue systems don't expose. Every `stats-tube` response includes:
+
+- **Processing time** — EWMA, min, max, and sample count for how long workers take to complete jobs (reserve-to-delete).
+- **Dual EWMA** — jobs are automatically split at a 100ms threshold into fast and slow buckets, each with its own EWMA. This surfaces bimodal distributions (e.g. idempotent fast-exits vs real work) that a single average would hide.
+- **Percentiles** — p50, p95, p99 from the last 1000 samples. Uses slow-job samples when available, falls back to fast-job samples for tubes where all jobs are quick.
+- **Queue time (time-in-queue)** — EWMA, min, and max of how long jobs waited from `put` to `reserve`. Growing queue time means you need more workers.
+- **Bury rate** — fraction of reserves that ended in a bury, for quick failure monitoring.
+
+All stats are also available via the Prometheus `/metrics` endpoint. See the full [Statistics Reference](docs/statistics.md) for field details.
+
 ### Weighted Reserve
 
 By default, `reserve` picks the highest-priority job across all watched tubes. In weighted mode, a tube is chosen randomly in proportion to its weight, then the highest-priority job from that tube is returned:
