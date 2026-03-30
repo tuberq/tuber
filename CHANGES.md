@@ -1,5 +1,17 @@
 # Changes
 
+## v0.3.12
+
+**Enhanced processing time stats: dual EWMA, percentiles, and bury rate**
+
+`stats-tube` now exposes bimodal-aware processing time tracking:
+- **Dual EWMA** — jobs are split at a 100ms threshold into fast (e.g. idempotent exits) and slow (real work) buckets, each with its own EWMA.
+- **Percentiles** — p50/p95/p99 computed from the last 1000 slow-job samples.
+- **Bury rate** — `total-buries / total-reserves` for quick failure monitoring.
+- All new fields are also exposed via the Prometheus `/metrics` endpoint.
+
+The existing `processing-time-ewma` field is unchanged for backwards compatibility.
+
 ## v0.3.11
 
 **Restore concurrency limits from WAL on restart**

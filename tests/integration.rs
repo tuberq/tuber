@@ -4524,3 +4524,187 @@ async fn test_idle_tubes_reaped() {
         body
     );
 }
+
+#[tokio::test]
+async fn test_stats_tube_new_fields_present() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Put, reserve, delete to populate stats
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    for field in &[
+        "processing-time-fast-threshold:",
+        "processing-time-ewma-fast:",
+        "processing-time-samples-fast:",
+        "processing-time-ewma-slow:",
+        "processing-time-samples-slow:",
+        "processing-time-p50:",
+        "processing-time-p95:",
+        "processing-time-p99:",
+        "bury-rate:",
+    ] {
+        assert!(body.contains(field), "{} missing from stats-tube: {}", field, body);
+    }
+}
+
+#[tokio::test]
+async fn test_stats_tube_fast_ewma() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Reserve and immediately delete — processing time will be microseconds (< 100ms threshold)
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    assert!(
+        body.contains("processing-time-samples-fast: 1"),
+        "fast sample should be 1: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-samples-slow: 0"),
+        "slow sample should be 0: {}",
+        body
+    );
+    assert!(
+        !body.contains("processing-time-ewma-fast: 0.000000"),
+        "fast ewma should be non-zero: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-ewma-slow: 0.000000"),
+        "slow ewma should be zero: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_slow_ewma_and_percentiles() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Reserve and sleep >100ms to land in the slow bucket
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    assert!(
+        body.contains("processing-time-samples-slow: 1"),
+        "slow sample should be 1: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-samples-fast: 0"),
+        "fast sample should be 0: {}",
+        body
+    );
+    assert!(
+        !body.contains("processing-time-ewma-slow: 0.000000"),
+        "slow ewma should be non-zero: {}",
+        body
+    );
+    // Percentiles should be non-zero with a slow sample
+    assert!(
+        !body.contains("processing-time-p50: 0.000000"),
+        "p50 should be non-zero: {}",
+        body
+    );
+    assert!(
+        !body.contains("processing-time-p95: 0.000000"),
+        "p95 should be non-zero: {}",
+        body
+    );
+    assert!(
+        !body.contains("processing-time-p99: 0.000000"),
+        "p99 should be non-zero: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_percentiles_zero_without_slow_jobs() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Fast job only — percentiles (slow-only) should be zero
+    let id = c.put_and_reserve(0, 0, 60, "x").await;
+    c.mustsend(&format!("delete {}\r\n", id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    assert!(
+        body.contains("processing-time-p50: 0.000000"),
+        "p50 should be 0 with no slow jobs: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-p95: 0.000000"),
+        "p95 should be 0 with no slow jobs: {}",
+        body
+    );
+    assert!(
+        body.contains("processing-time-p99: 0.000000"),
+        "p99 should be 0 with no slow jobs: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_bury_rate() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Reserve and bury 1 job
+    let id1 = c.put_and_reserve(0, 0, 60, "a").await;
+    c.mustsend(&format!("bury {} 0\r\n", id1)).await;
+    c.ckresp("BURIED\r\n").await;
+
+    // Reserve and delete 1 job
+    let id2 = c.put_and_reserve(0, 0, 60, "b").await;
+    c.mustsend(&format!("delete {}\r\n", id2)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    // 1 bury / 2 reserves = 0.5
+    assert!(
+        body.contains("bury-rate: 0.500000"),
+        "bury-rate should be 0.5: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_stats_tube_bury_rate_zero() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // No reserves at all — bury rate should be 0
+    c.put_job(0, 0, 60, "x").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+
+    assert!(
+        body.contains("bury-rate: 0.000000"),
+        "bury-rate should be 0 with no reserves: {}",
+        body
+    );
+}

@@ -277,6 +277,20 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         out.push_str("# TYPE tuber_tube_jobs_total counter\n");
         out.push_str("# HELP tuber_tube_deletes_total Total deletes per tube\n");
         out.push_str("# TYPE tuber_tube_deletes_total counter\n");
+        out.push_str("# HELP tuber_tube_bury_rate Bury rate per tube\n");
+        out.push_str("# TYPE tuber_tube_bury_rate gauge\n");
+        out.push_str("# HELP tuber_tube_processing_time_ewma Processing time EWMA per tube\n");
+        out.push_str("# TYPE tuber_tube_processing_time_ewma gauge\n");
+        out.push_str("# HELP tuber_tube_processing_time_ewma_fast Processing time EWMA for fast jobs per tube\n");
+        out.push_str("# TYPE tuber_tube_processing_time_ewma_fast gauge\n");
+        out.push_str("# HELP tuber_tube_processing_time_ewma_slow Processing time EWMA for slow jobs per tube\n");
+        out.push_str("# TYPE tuber_tube_processing_time_ewma_slow gauge\n");
+        out.push_str("# HELP tuber_tube_processing_time_p50 Processing time p50 (slow jobs) per tube\n");
+        out.push_str("# TYPE tuber_tube_processing_time_p50 gauge\n");
+        out.push_str("# HELP tuber_tube_processing_time_p95 Processing time p95 (slow jobs) per tube\n");
+        out.push_str("# TYPE tuber_tube_processing_time_p95 gauge\n");
+        out.push_str("# HELP tuber_tube_processing_time_p99 Processing time p99 (slow jobs) per tube\n");
+        out.push_str("# TYPE tuber_tube_processing_time_p99 gauge\n");
 
         for name in &tube_names {
             if let Ok(tube_yaml) = client.stats_tube(name).await {
@@ -318,6 +332,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
                     &ts,
                     "cmd-delete",
                 );
+                tube_metric(&mut out, "tuber_tube_bury_rate", name, &ts, "bury-rate");
+                tube_metric(&mut out, "tuber_tube_processing_time_ewma", name, &ts, "processing-time-ewma");
+                tube_metric(&mut out, "tuber_tube_processing_time_ewma_fast", name, &ts, "processing-time-ewma-fast");
+                tube_metric(&mut out, "tuber_tube_processing_time_ewma_slow", name, &ts, "processing-time-ewma-slow");
+                tube_metric(&mut out, "tuber_tube_processing_time_p50", name, &ts, "processing-time-p50");
+                tube_metric(&mut out, "tuber_tube_processing_time_p95", name, &ts, "processing-time-p95");
+                tube_metric(&mut out, "tuber_tube_processing_time_p99", name, &ts, "processing-time-p99");
             }
         }
         out.push('\n');

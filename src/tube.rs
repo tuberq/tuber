@@ -29,6 +29,56 @@ pub struct TubeStats {
     pub processing_time_min: Option<f64>,
     pub processing_time_max: Option<f64>,
     pub processing_time_samples: u64,
+
+    // Dual EWMA: fast (<100ms) vs slow (>=100ms)
+    pub processing_time_ewma_fast: f64,
+    pub processing_time_samples_fast: u64,
+    pub processing_time_ewma_slow: f64,
+    pub processing_time_samples_slow: u64,
+
+    pub processing_time_ring_slow: VecDeque<f64>,
+}
+
+const SLOW_RING_CAPACITY: usize = 1000;
+
+impl TubeStats {
+    pub fn update_ewma(ewma: &mut f64, samples: &mut u64, value: f64, alpha: f64) {
+        *samples += 1;
+        if *samples == 1 {
+            *ewma = value;
+        } else {
+            *ewma = alpha * value + (1.0 - alpha) * *ewma;
+        }
+    }
+
+    pub fn record_slow_sample(&mut self, secs: f64) {
+        if self.processing_time_ring_slow.len() >= SLOW_RING_CAPACITY {
+            self.processing_time_ring_slow.pop_front();
+        }
+        self.processing_time_ring_slow.push_back(secs);
+    }
+
+    pub fn bury_rate(&self) -> f64 {
+        if self.total_reserve_ct > 0 {
+            self.total_bury_ct as f64 / self.total_reserve_ct as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn slow_percentiles(&self) -> (f64, f64, f64) {
+        if self.processing_time_ring_slow.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let mut sorted: Vec<f64> = self.processing_time_ring_slow.iter().copied().collect();
+        sorted.sort_unstable_by(f64::total_cmp);
+        let len = sorted.len();
+        let p = |pct: f64| -> f64 {
+            let idx = ((pct / 100.0) * (len - 1) as f64).round() as usize;
+            sorted[idx.min(len - 1)]
+        };
+        (p(50.0), p(95.0), p(99.0))
+    }
 }
 
 #[derive(Debug)]

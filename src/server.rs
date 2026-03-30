@@ -10,8 +10,11 @@ use tokio::sync::{mpsc, oneshot};
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{Job, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, Response, MAX_DELETE_BATCH};
-use crate::tube::Tube;
+use crate::tube::{Tube, TubeStats};
 use crate::wal::{IdpTombstone, Wal};
+
+/// Threshold separating "fast" from "slow" jobs for dual EWMA tracking (seconds).
+const FAST_THRESHOLD: f64 = 0.1;
 
 // Op index constants matching beanstalkd (see tmp/prot.c)
 const OP_PUT: usize = 1;
@@ -974,18 +977,32 @@ impl ServerState {
                 && let Some(ra) = reserved_at
             {
                 let secs = Instant::now().duration_since(ra).as_secs_f64();
-                tube.stat.processing_time_samples += 1;
-                if tube.stat.processing_time_samples == 1 {
-                    tube.stat.processing_time_ewma = secs;
-                } else {
-                    const ALPHA: f64 = 0.1;
-                    tube.stat.processing_time_ewma =
-                        ALPHA * secs + (1.0 - ALPHA) * tube.stat.processing_time_ewma;
-                }
+                const ALPHA: f64 = 0.1;
+
+                TubeStats::update_ewma(
+                    &mut tube.stat.processing_time_ewma,
+                    &mut tube.stat.processing_time_samples,
+                    secs, ALPHA,
+                );
                 tube.stat.processing_time_min =
                     Some(tube.stat.processing_time_min.map_or(secs, |m| m.min(secs)));
                 tube.stat.processing_time_max =
                     Some(tube.stat.processing_time_max.map_or(secs, |m| m.max(secs)));
+
+                if secs < FAST_THRESHOLD {
+                    TubeStats::update_ewma(
+                        &mut tube.stat.processing_time_ewma_fast,
+                        &mut tube.stat.processing_time_samples_fast,
+                        secs, ALPHA,
+                    );
+                } else {
+                    TubeStats::update_ewma(
+                        &mut tube.stat.processing_time_ewma_slow,
+                        &mut tube.stat.processing_time_samples_slow,
+                        secs, ALPHA,
+                    );
+                    tube.stat.record_slow_sample(secs);
+                }
             }
         }
         self.stats.total_delete_ct += 1;
@@ -1707,6 +1724,10 @@ impl ServerState {
             })
             .unwrap_or(0);
 
+        let (p50, p95, p99) = tube.stat.slow_percentiles();
+
+        let bury_rate = tube.stat.bury_rate();
+
         let yaml = format!(
             "---\n\
              name: \"{}\"\n\
@@ -1726,10 +1747,19 @@ impl ServerState {
              total-reserves: {}\n\
              total-timeouts: {}\n\
              total-buries: {}\n\
+             bury-rate: {:.6}\n\
              processing-time-ewma: {:.6}\n\
              processing-time-min: {:.6}\n\
              processing-time-max: {:.6}\n\
-             processing-time-samples: {}\n",
+             processing-time-samples: {}\n\
+             processing-time-fast-threshold: {:.6}\n\
+             processing-time-ewma-fast: {:.6}\n\
+             processing-time-samples-fast: {}\n\
+             processing-time-ewma-slow: {:.6}\n\
+             processing-time-samples-slow: {}\n\
+             processing-time-p50: {:.6}\n\
+             processing-time-p95: {:.6}\n\
+             processing-time-p99: {:.6}\n",
             tube.name,
             tube.stat.urgent_ct,
             tube.ready.len(),
@@ -1747,10 +1777,19 @@ impl ServerState {
             tube.stat.total_reserve_ct,
             tube.stat.total_timeout_ct,
             tube.stat.total_bury_ct,
+            bury_rate,
             tube.stat.processing_time_ewma,
             tube.stat.processing_time_min.unwrap_or(0.0),
             tube.stat.processing_time_max.unwrap_or(0.0),
             tube.stat.processing_time_samples,
+            FAST_THRESHOLD,
+            tube.stat.processing_time_ewma_fast,
+            tube.stat.processing_time_samples_fast,
+            tube.stat.processing_time_ewma_slow,
+            tube.stat.processing_time_samples_slow,
+            p50,
+            p95,
+            p99,
         );
         Response::Ok(yaml.into_bytes())
     }

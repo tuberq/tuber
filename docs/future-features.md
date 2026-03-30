@@ -91,11 +91,11 @@ Switch between priority-first and weighted-random reserve strategies. Used with 
 
 ### Per-Tube Processing Time Stats (EWMA)
 
-Tracks min/max/average processing time per tube using an exponentially weighted moving average. Updated on each successful delete.
+Tracks min/max/average processing time per tube using an exponentially weighted moving average. Updated on each successful delete. Extended with dual EWMA (fast/slow split at 100ms), percentiles (p50/p95/p99 from last 1000 slow samples), and bury rate.
 
 ### Enhanced `stats-tube` Output
 
-([#37](https://github.com/beanstalkd/beanstalkd/issues/37)) — Includes processing time stats (EWMA, min, max, samples) and throughput counters.
+([#37](https://github.com/beanstalkd/beanstalkd/issues/37)) — Includes processing time stats (EWMA, min, max, samples), dual EWMA (fast/slow), percentiles, bury rate, and throughput counters.
 
 ### Prometheus Metrics Endpoint
 
