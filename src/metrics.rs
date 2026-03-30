@@ -285,11 +285,11 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         out.push_str("# TYPE tuber_tube_processing_time_ewma_fast gauge\n");
         out.push_str("# HELP tuber_tube_processing_time_ewma_slow Processing time EWMA for slow jobs per tube\n");
         out.push_str("# TYPE tuber_tube_processing_time_ewma_slow gauge\n");
-        out.push_str("# HELP tuber_tube_processing_time_p50 Processing time p50 (slow jobs) per tube\n");
+        out.push_str("# HELP tuber_tube_processing_time_p50 Processing time p50 per tube\n");
         out.push_str("# TYPE tuber_tube_processing_time_p50 gauge\n");
-        out.push_str("# HELP tuber_tube_processing_time_p95 Processing time p95 (slow jobs) per tube\n");
+        out.push_str("# HELP tuber_tube_processing_time_p95 Processing time p95 per tube\n");
         out.push_str("# TYPE tuber_tube_processing_time_p95 gauge\n");
-        out.push_str("# HELP tuber_tube_processing_time_p99 Processing time p99 (slow jobs) per tube\n");
+        out.push_str("# HELP tuber_tube_processing_time_p99 Processing time p99 per tube\n");
         out.push_str("# TYPE tuber_tube_processing_time_p99 gauge\n");
         out.push_str("# HELP tuber_tube_queue_time_ewma Queue time EWMA per tube\n");
         out.push_str("# TYPE tuber_tube_queue_time_ewma gauge\n");

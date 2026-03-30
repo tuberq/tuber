@@ -36,6 +36,7 @@ pub struct TubeStats {
     pub processing_time_ewma_slow: f64,
     pub processing_time_samples_slow: u64,
 
+    pub processing_time_ring_fast: VecDeque<f64>,
     pub processing_time_ring_slow: VecDeque<f64>,
 
     // Queue time (put-to-reserve)
@@ -45,7 +46,7 @@ pub struct TubeStats {
     pub queue_time_samples: u64,
 }
 
-const SLOW_RING_CAPACITY: usize = 1000;
+const RING_CAPACITY: usize = 1000;
 
 impl TubeStats {
     pub fn update_ewma(ewma: &mut f64, samples: &mut u64, value: f64, alpha: f64) {
@@ -57,11 +58,29 @@ impl TubeStats {
         }
     }
 
-    pub fn record_slow_sample(&mut self, secs: f64) {
-        if self.processing_time_ring_slow.len() >= SLOW_RING_CAPACITY {
-            self.processing_time_ring_slow.pop_front();
+    pub fn record_timing(
+        ewma: &mut f64, samples: &mut u64,
+        min: &mut Option<f64>, max: &mut Option<f64>,
+        value: f64, alpha: f64,
+    ) {
+        Self::update_ewma(ewma, samples, value, alpha);
+        *min = Some(min.map_or(value, |m| m.min(value)));
+        *max = Some(max.map_or(value, |m| m.max(value)));
+    }
+
+    fn push_ring(ring: &mut VecDeque<f64>, value: f64) {
+        if ring.len() >= RING_CAPACITY {
+            ring.pop_front();
         }
-        self.processing_time_ring_slow.push_back(secs);
+        ring.push_back(value);
+    }
+
+    pub fn record_fast_sample(&mut self, secs: f64) {
+        Self::push_ring(&mut self.processing_time_ring_fast, secs);
+    }
+
+    pub fn record_slow_sample(&mut self, secs: f64) {
+        Self::push_ring(&mut self.processing_time_ring_slow, secs);
     }
 
     pub fn bury_rate(&self) -> f64 {
@@ -72,11 +91,16 @@ impl TubeStats {
         }
     }
 
-    pub fn slow_percentiles(&self) -> (f64, f64, f64) {
-        if self.processing_time_ring_slow.is_empty() {
+    /// Compute p50/p95/p99 from slow samples if available, otherwise fast samples.
+    pub fn percentiles(&self) -> (f64, f64, f64) {
+        let ring = if !self.processing_time_ring_slow.is_empty() {
+            &self.processing_time_ring_slow
+        } else if !self.processing_time_ring_fast.is_empty() {
+            &self.processing_time_ring_fast
+        } else {
             return (0.0, 0.0, 0.0);
-        }
-        let mut sorted: Vec<f64> = self.processing_time_ring_slow.iter().copied().collect();
+        };
+        let mut sorted: Vec<f64> = ring.iter().copied().collect();
         sorted.sort_unstable_by(f64::total_cmp);
         let len = sorted.len();
         let p = |pct: f64| -> f64 {

@@ -1,5 +1,11 @@
 # Changes
 
+## v0.3.14
+
+**Percentile fallback, record_timing helper, EWMA_ALPHA cleanup**
+
+Percentiles now fall back to fast-job samples when no slow samples exist, so tubes where all jobs complete in < 100ms get useful p50/p95/p99 instead of zeros. Also extracted `record_timing()` and `push_ring()` helpers to reduce duplication, and hoisted `EWMA_ALPHA` to module level.
+
 ## v0.3.13
 
 **Add queue-time (time-in-queue) stats to `stats-tube`**

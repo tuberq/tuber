@@ -127,19 +127,19 @@ into a misleading middle value. Tuber splits samples at a 100ms threshold:
 | `processing-time-ewma-slow` | EWMA for jobs completing in >= 100ms (alpha=0.1) |
 | `processing-time-samples-slow` | Number of slow samples |
 
-### Percentiles (slow jobs)
+### Percentiles
 
-Percentiles are computed from the last 1000 slow-job samples (>= 100ms).
-Fast jobs are excluded because their EWMA already captures their uniform
-behavior — percentiles are most useful for understanding the slow-job tail.
+Percentiles are computed from the last 1000 samples in the slow ring buffer
+(>= 100ms). If there are no slow samples, they fall back to the fast ring
+buffer (< 100ms), so tubes where all jobs are fast still get useful percentiles.
 
 | Field | Description |
 |---|---|
-| `processing-time-p50` | Median processing time of recent slow jobs (seconds) |
+| `processing-time-p50` | Median processing time (seconds) |
 | `processing-time-p95` | 95th percentile processing time (seconds) |
 | `processing-time-p99` | 99th percentile processing time (seconds) |
 
-All percentile fields return 0 when no slow samples have been recorded.
+All percentile fields return 0 when no samples have been recorded.
 
 ### Queue time (time-in-queue)
 
@@ -241,7 +241,7 @@ Each has a `tube` label:
 | `tuber_tube_processing_time_ewma{tube="..."}` | Processing time EWMA |
 | `tuber_tube_processing_time_ewma_fast{tube="..."}` | Processing time EWMA (fast jobs) |
 | `tuber_tube_processing_time_ewma_slow{tube="..."}` | Processing time EWMA (slow jobs) |
-| `tuber_tube_processing_time_p50{tube="..."}` | Processing time p50 (slow jobs) |
-| `tuber_tube_processing_time_p95{tube="..."}` | Processing time p95 (slow jobs) |
-| `tuber_tube_processing_time_p99{tube="..."}` | Processing time p99 (slow jobs) |
+| `tuber_tube_processing_time_p50{tube="..."}` | Processing time p50 |
+| `tuber_tube_processing_time_p95{tube="..."}` | Processing time p95 |
+| `tuber_tube_processing_time_p99{tube="..."}` | Processing time p99 |
 | `tuber_tube_queue_time_ewma{tube="..."}` | Queue time EWMA |

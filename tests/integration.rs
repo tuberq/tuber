@@ -4636,11 +4636,11 @@ async fn test_stats_tube_slow_ewma_and_percentiles() {
 }
 
 #[tokio::test]
-async fn test_stats_tube_percentiles_zero_without_slow_jobs() {
+async fn test_stats_tube_percentiles_fallback_to_fast() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    // Fast job only — percentiles (slow-only) should be zero
+    // Fast jobs only — percentiles should fall back to fast ring buffer
     let id = c.put_and_reserve(0, 0, 60, "x").await;
     c.mustsend(&format!("delete {}\r\n", id)).await;
     c.ckresp("DELETED\r\n").await;
@@ -4648,19 +4648,10 @@ async fn test_stats_tube_percentiles_zero_without_slow_jobs() {
     c.mustsend("stats-tube default\r\n").await;
     let body = c.read_ok_body().await;
 
+    // With no slow samples, percentiles come from fast ring — should be non-zero
     assert!(
-        body.contains("processing-time-p50: 0.000000"),
-        "p50 should be 0 with no slow jobs: {}",
-        body
-    );
-    assert!(
-        body.contains("processing-time-p95: 0.000000"),
-        "p95 should be 0 with no slow jobs: {}",
-        body
-    );
-    assert!(
-        body.contains("processing-time-p99: 0.000000"),
-        "p99 should be 0 with no slow jobs: {}",
+        !body.contains("processing-time-p50: 0.000000"),
+        "p50 should be non-zero with fast jobs: {}",
         body
     );
 }

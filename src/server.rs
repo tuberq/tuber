@@ -13,6 +13,9 @@ use crate::protocol::{self, Command, Response, MAX_DELETE_BATCH};
 use crate::tube::{Tube, TubeStats};
 use crate::wal::{IdpTombstone, Wal};
 
+/// EWMA smoothing factor for all timing stats (processing time, queue time).
+const EWMA_ALPHA: f64 = 0.1;
+
 /// Threshold separating "fast" from "slow" jobs for dual EWMA tracking (seconds).
 const FAST_THRESHOLD: f64 = 0.1;
 
@@ -843,18 +846,17 @@ impl ServerState {
 
     fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64) -> Response {
         let now = Instant::now();
-        let (body, _ttr, tube_name, created_at) = match self.jobs.get_mut(&job_id) {
+        let (body, tube_name, created_at) = match self.jobs.get_mut(&job_id) {
             Some(job) => {
                 let body = job.body.clone();
-                let ttr = job.ttr;
                 let tube_name = job.tube_name.clone();
                 let created_at = job.created_at;
                 job.state = JobState::Reserved;
                 job.reserver_id = Some(conn_id);
                 job.reserved_at = Some(now);
-                job.deadline_at = Some(now + ttr);
+                job.deadline_at = Some(now + job.ttr);
                 job.reserve_ct += 1;
-                (body, ttr, tube_name, created_at)
+                (body, tube_name, created_at)
             }
             None => return Response::NotFound,
         };
@@ -863,17 +865,12 @@ impl ServerState {
             tube.stat.reserved_ct += 1;
             tube.stat.total_reserve_ct += 1;
 
-            const ALPHA: f64 = 0.1;
             let queue_secs = now.duration_since(created_at).as_secs_f64();
-            TubeStats::update_ewma(
-                &mut tube.stat.queue_time_ewma,
-                &mut tube.stat.queue_time_samples,
-                queue_secs, ALPHA,
+            TubeStats::record_timing(
+                &mut tube.stat.queue_time_ewma, &mut tube.stat.queue_time_samples,
+                &mut tube.stat.queue_time_min, &mut tube.stat.queue_time_max,
+                queue_secs, EWMA_ALPHA,
             );
-            tube.stat.queue_time_min =
-                Some(tube.stat.queue_time_min.map_or(queue_secs, |m| m.min(queue_secs)));
-            tube.stat.queue_time_max =
-                Some(tube.stat.queue_time_max.map_or(queue_secs, |m| m.max(queue_secs)));
         }
         self.stats.reserved_ct += 1;
 
@@ -990,29 +987,25 @@ impl ServerState {
                 && let Some(ra) = reserved_at
             {
                 let secs = Instant::now().duration_since(ra).as_secs_f64();
-                const ALPHA: f64 = 0.1;
 
-                TubeStats::update_ewma(
-                    &mut tube.stat.processing_time_ewma,
-                    &mut tube.stat.processing_time_samples,
-                    secs, ALPHA,
+                TubeStats::record_timing(
+                    &mut tube.stat.processing_time_ewma, &mut tube.stat.processing_time_samples,
+                    &mut tube.stat.processing_time_min, &mut tube.stat.processing_time_max,
+                    secs, EWMA_ALPHA,
                 );
-                tube.stat.processing_time_min =
-                    Some(tube.stat.processing_time_min.map_or(secs, |m| m.min(secs)));
-                tube.stat.processing_time_max =
-                    Some(tube.stat.processing_time_max.map_or(secs, |m| m.max(secs)));
 
                 if secs < FAST_THRESHOLD {
                     TubeStats::update_ewma(
                         &mut tube.stat.processing_time_ewma_fast,
                         &mut tube.stat.processing_time_samples_fast,
-                        secs, ALPHA,
+                        secs, EWMA_ALPHA,
                     );
+                    tube.stat.record_fast_sample(secs);
                 } else {
                     TubeStats::update_ewma(
                         &mut tube.stat.processing_time_ewma_slow,
                         &mut tube.stat.processing_time_samples_slow,
-                        secs, ALPHA,
+                        secs, EWMA_ALPHA,
                     );
                     tube.stat.record_slow_sample(secs);
                 }
@@ -1737,7 +1730,7 @@ impl ServerState {
             })
             .unwrap_or(0);
 
-        let (p50, p95, p99) = tube.stat.slow_percentiles();
+        let (p50, p95, p99) = tube.stat.percentiles();
 
         let bury_rate = tube.stat.bury_rate();
 
