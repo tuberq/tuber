@@ -567,13 +567,52 @@ impl ServerState {
 
         self.ensure_tube(&tube_name);
 
-        // Idempotency dedup: if key already exists for a live job, return original ID + state
+        // Idempotency dedup: if key already exists for a live job, return original ID + state.
+        // If the new put has a higher priority (lower number), upgrade the existing job's priority.
         if let Some(ref key_tuple) = idempotency_key
-            && let Some(tube) = self.tubes.get(&tube_name)
-            && let Some(&existing_id) = tube.idempotency_keys.get(&key_tuple.0)
-            && let Some(existing_job) = self.jobs.get(&existing_id)
+            && let Some(&existing_id) = self.tubes.get(&tube_name).and_then(|t| t.idempotency_keys.get(&key_tuple.0))
         {
-            return Response::InsertedDup(existing_id, existing_job.state.as_protocol_str());
+            let upgraded_pri = if let Some(existing_job) = self.jobs.get_mut(&existing_id)
+                && pri < existing_job.priority
+            {
+                let old_pri = existing_job.priority;
+                existing_job.priority = pri;
+
+                // If job is Ready, re-sort the ready heap
+                if existing_job.state == JobState::Ready {
+                    let new_key = existing_job.ready_key();
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.ready.remove_by_id(existing_id);
+                        tube.ready.insert(new_key, existing_id);
+                    }
+                }
+
+                // Update urgent stats if crossing threshold
+                if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
+                    self.stats.urgent_ct += 1;
+                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                        tube.stat.urgent_ct += 1;
+                    }
+                }
+
+                // WAL: persist priority change
+                self.wal_write_state_change(
+                    existing_id,
+                    self.jobs.get(&existing_id).map(|j| j.state),
+                    pri,
+                    self.jobs.get(&existing_id).map_or(Duration::ZERO, |j| j.delay),
+                    0,
+                );
+
+                Some(pri)
+            } else {
+                None
+            };
+
+            let state_str = self.jobs.get(&existing_id)
+                .map(|j| j.state.as_protocol_str())
+                .unwrap_or("READY");
+            return Response::InsertedDup(existing_id, state_str, upgraded_pri);
         }
 
         // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
@@ -582,7 +621,7 @@ impl ServerState {
             && let Some(&(original_id, expiry)) = tube.idempotency_cooldowns.get(&key_tuple.0)
         {
             if SystemTime::now() < expiry {
-                return Response::InsertedDup(original_id, "DELETED");
+                return Response::InsertedDup(original_id, "DELETED", None);
             } else {
                 tube.idempotency_cooldowns.remove(&key_tuple.0);
             }
@@ -3534,7 +3573,7 @@ mod tests {
             concurrency_key: None,
         };
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "DELETED")));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELETED", None)));
     }
 
     #[test]
@@ -3647,7 +3686,7 @@ mod tests {
 
         // Duplicate put returns InsertedDup with READY state
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "READY")));
+        assert!(matches!(resp, Response::InsertedDup(1, "READY", None)));
     }
 
     #[test]
@@ -3672,7 +3711,7 @@ mod tests {
 
         // Duplicate put returns InsertedDup with RESERVED state
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "RESERVED")));
+        assert!(matches!(resp, Response::InsertedDup(1, "RESERVED", None)));
     }
 
     #[test]
@@ -3698,7 +3737,7 @@ mod tests {
 
         // Duplicate put returns InsertedDup with BURIED state
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "BURIED")));
+        assert!(matches!(resp, Response::InsertedDup(1, "BURIED", None)));
     }
 
     #[test]
@@ -3720,7 +3759,7 @@ mod tests {
 
         // Duplicate put returns InsertedDup with DELAYED state
         let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "DELAYED")));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELAYED", None)));
     }
 
     #[test]
@@ -3756,7 +3795,246 @@ mod tests {
             concurrency_key: None,
         };
         let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "DELETED")));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELETED", None)));
+    }
+
+    #[test]
+    fn test_idempotency_priority_upgrade_ready() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put job at pri 100
+        let cmd1 = Command::Put {
+            pri: 100,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd1, Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Put another job at pri 75 (no IDP) to compare ordering
+        let cmd2 = Command::Put {
+            pri: 75,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: None,
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"other".to_vec()));
+        assert!(matches!(resp, Response::Inserted(2)));
+
+        // Duplicate put at pri 50 — should upgrade
+        let cmd3 = Command::Put {
+            pri: 50,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd3, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "READY", Some(50))));
+
+        // Verify job 1 (now pri 50) is reserved before job 2 (pri 75)
+        let reserve = Command::ReserveWithTimeout { timeout: 0 };
+        let resp = s.handle_command(c, reserve, None);
+        match resp {
+            Response::Reserved { id, .. } => assert_eq!(id, 1),
+            other => panic!("expected Reserved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_idempotency_priority_upgrade_no_downgrade() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put job at pri 50
+        let cmd1 = Command::Put {
+            pri: 50,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd1, Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Duplicate put at pri 100 — should NOT downgrade
+        let cmd2 = Command::Put {
+            pri: 100,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "READY", None)));
+
+        // Verify job still has pri 50
+        assert_eq!(s.jobs.get(&1).unwrap().priority, 50);
+    }
+
+    #[test]
+    fn test_idempotency_priority_upgrade_reserved() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put and reserve a job at pri 100
+        let cmd1 = Command::Put {
+            pri: 100,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd1, Some(b"hello".to_vec()));
+        let reserve = Command::ReserveWithTimeout { timeout: 0 };
+        s.handle_command(c, reserve, None);
+
+        // Duplicate put at pri 30 — should upgrade even though reserved
+        let cmd2 = Command::Put {
+            pri: 30,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "RESERVED", Some(30))));
+
+        // Verify the job's priority was updated
+        assert_eq!(s.jobs.get(&1).unwrap().priority, 30);
+    }
+
+    #[test]
+    fn test_idempotency_priority_upgrade_buried() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put, reserve, and bury a job at pri 100
+        let cmd1 = Command::Put {
+            pri: 100,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd1, Some(b"hello".to_vec()));
+        let reserve = Command::ReserveWithTimeout { timeout: 0 };
+        s.handle_command(c, reserve, None);
+        let bury = Command::Bury { id: 1, pri: 100 };
+        s.handle_command(c, bury, None);
+
+        // Duplicate put at pri 20 — should upgrade buried job
+        let cmd2 = Command::Put {
+            pri: 20,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "BURIED", Some(20))));
+        assert_eq!(s.jobs.get(&1).unwrap().priority, 20);
+    }
+
+    #[test]
+    fn test_idempotency_priority_upgrade_delayed() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put a delayed job at pri 100
+        let cmd1 = Command::Put {
+            pri: 100,
+            delay: 3600,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd1, Some(b"hello".to_vec()));
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Duplicate put at pri 40 — should upgrade delayed job
+        let cmd2 = Command::Put {
+            pri: 40,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "DELAYED", Some(40))));
+        assert_eq!(s.jobs.get(&1).unwrap().priority, 40);
+    }
+
+    #[test]
+    fn test_idempotency_priority_upgrade_urgent_stats() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put job at pri 2000 (not urgent)
+        let cmd1 = Command::Put {
+            pri: 2000,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd1, Some(b"hello".to_vec()));
+        assert_eq!(s.stats.urgent_ct, 0);
+
+        // Duplicate put at pri 500 (urgent, < 1024) — should update urgent count
+        let cmd2 = Command::Put {
+            pri: 500,
+            delay: 0,
+            ttr: 10,
+            bytes: 5,
+            idempotency_key: Some(("mykey".into(), 0)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
+        assert!(matches!(resp, Response::InsertedDup(1, "READY", Some(500))));
+        assert_eq!(s.stats.urgent_ct, 1);
     }
 
     #[test]

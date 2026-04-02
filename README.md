@@ -194,15 +194,39 @@ put 100 0 30 5 idp:my-key
 → INSERTED 1 READY       (dedup hit — job is ready)
 ```
 
+#### Priority Escalation
+
+If a duplicate `put` arrives with a higher priority (lower number) than the existing job, the job's priority is upgraded and the new priority is included in the response:
+
+```text
+put 100 0 30 5 idp:my-key
+<body>
+→ INSERTED 1
+
+put 50 0 30 5 idp:my-key
+<body>
+→ INSERTED 1 READY 50    (dedup hit — priority upgraded to 50)
+
+put 200 0 30 5 idp:my-key
+<body>
+→ INSERTED 1 READY       (dedup hit — priority NOT downgraded)
+```
+
+Priority can only increase (lower number), never decrease — this prevents flapping when multiple producers disagree. The upgrade applies regardless of job state (ready, reserved, delayed, or buried); for non-ready jobs, the new priority takes effect on the next state transition.
+
 The response state tells you exactly what happened to the original job:
 
 | Response | Meaning |
 |---|---|
 | `INSERTED <id>` | Fresh insert, new job created |
 | `INSERTED <id> READY` | Dedup hit — original job is waiting to be reserved |
+| `INSERTED <id> READY <pri>` | Dedup hit — priority upgraded to `<pri>` |
 | `INSERTED <id> RESERVED` | Dedup hit — original job is being processed |
+| `INSERTED <id> RESERVED <pri>` | Dedup hit — priority upgraded (applies on release) |
 | `INSERTED <id> DELAYED` | Dedup hit — original job is delayed |
+| `INSERTED <id> DELAYED <pri>` | Dedup hit — priority upgraded (applies when ready) |
 | `INSERTED <id> BURIED` | Dedup hit — original job is buried |
+| `INSERTED <id> BURIED <pri>` | Dedup hit — priority upgraded (applies on kick) |
 | `INSERTED <id> DELETED` | Dedup hit during TTL cooldown (see below) |
 
 The state suffix only appears on dedup hits — a `put` without `idp:` always returns plain `INSERTED <id>`, keeping the response fully backwards-compatible with standard beanstalkd clients.

@@ -96,7 +96,7 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     Inserted(u64),
-    InsertedDup(u64, &'static str),
+    InsertedDup(u64, &'static str, Option<u32>),
     BuriedId(u64),
     Buried,
     Using(String),
@@ -133,7 +133,8 @@ impl Response {
         use std::io::Write;
         match self {
             Response::Inserted(id) => { let _ = write!(buf, "INSERTED {id}\r\n"); }
-            Response::InsertedDup(id, state) => { let _ = write!(buf, "INSERTED {id} {state}\r\n"); }
+            Response::InsertedDup(id, state, None) => { let _ = write!(buf, "INSERTED {id} {state}\r\n"); }
+            Response::InsertedDup(id, state, Some(pri)) => { let _ = write!(buf, "INSERTED {id} {state} {pri}\r\n"); }
             Response::BuriedId(id) => { let _ = write!(buf, "BURIED {id}\r\n"); }
             Response::Buried => buf.extend_from_slice(b"BURIED\r\n"),
             Response::Using(name) => { let _ = write!(buf, "USING {name}\r\n"); }
@@ -990,15 +991,15 @@ mod tests {
     #[test]
     fn test_response_inserted_dup_serialize() {
         assert_eq!(
-            Response::InsertedDup(42, "READY").serialize(),
+            Response::InsertedDup(42, "READY", None).serialize(),
             b"INSERTED 42 READY\r\n"
         );
         assert_eq!(
-            Response::InsertedDup(7, "BURIED").serialize(),
+            Response::InsertedDup(7, "BURIED", None).serialize(),
             b"INSERTED 7 BURIED\r\n"
         );
         assert_eq!(
-            Response::InsertedDup(1, "DELETED").serialize(),
+            Response::InsertedDup(1, "DELETED", None).serialize(),
             b"INSERTED 1 DELETED\r\n"
         );
     }
