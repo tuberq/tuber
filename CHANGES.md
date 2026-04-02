@@ -1,5 +1,11 @@
 # Changes
 
+## v0.3.15
+
+**IDP priority upgrade on duplicate put**
+
+When a duplicate idempotency put arrives with a higher priority (lower number), the existing job's priority is now upgraded instead of being silently ignored. Only upgrades are allowed — never downgrades — to prevent flapping. Works for all job states (ready, reserved, delayed, buried); for non-ready jobs the new priority takes effect on the next state transition. The response includes the new priority when an upgrade occurs: `INSERTED <id> <state> <pri>`.
+
 ## v0.3.14
 
 **Percentile fallback, record_timing helper, EWMA_ALPHA cleanup**
