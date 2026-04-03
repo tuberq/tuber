@@ -15,7 +15,7 @@ I used Beanstalkd's C source code and tests as the foundation, first building a 
 
 The docs/ directory contains the working files we used to plan and describe the implementation.
 
-I use Beanstalkd in [Booko](https://booko.au). In my dev environment, I've replaced Beanstalkd with Tuber. I'll replace it in production when I'm comfortable with it.
+I use Beanstalkd in [Booko](https://booko.au) in several places requiring queues.  It's working very well.  Claude Code can use the tuber-cli to interact with the queue, finding buried (failed) jobs, which helps with debugging. 
 
 Read more about it [on my blog](https://da.nmilne.com/shipping-a-job-queue-system-without-reading-the-source-code/).
 
