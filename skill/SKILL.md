@@ -1,17 +1,90 @@
 ---
-name: Tuber / Beanstalkd Client
-description: Interact with a Tuber or beanstalkd work queue server using echo and nc (netcat). Use when tasks involve job queues, background workers, or beanstalkd protocol commands.
+name: tuber
+description: Interact with a Tuber or beanstalkd work queue server using tuber-cli (preferred) or echo and nc (netcat). Use when tasks involve job queues, background workers, or beanstalkd protocol commands.
 ---
 
 # Tuber / Beanstalkd Work Queue Client
 
-Tuber (and beanstalkd) use a text protocol over TCP (default port 11300). All commands are `\r\n` terminated. No client libraries needed — just `echo` and `nc`.
+Use `tuber-cli` if available — it provides structured JSON output and proper error handling. Fall back to `echo`/`nc` if tuber-cli is not installed.
+
+## Check for tuber-cli
+
+```bash
+command -v tuber-cli
+```
+
+---
+
+## Using tuber-cli (preferred)
+
+tuber-cli outputs JSON by default. Use `--format text` for human-readable output.
+
+### Inspecting State
+
+```bash
+# Server-wide statistics
+tuber-cli stats
+
+# List all tubes
+tuber-cli list-tubes
+
+# Tube statistics
+tuber-cli stats-tube default
+
+# Peek at a specific job by ID
+tuber-cli peek 42
+```
+
+### Producing Jobs
+
+```bash
+# Put a job into the default tube
+tuber-cli put "hello world"
+
+# Put into a specific tube with options
+tuber-cli put --tube emails --priority 0 --delay 0 --ttr 120 "send user@example.com"
+
+# Put from stdin (pipe or heredoc)
+echo '{"user": "alice"}' | tuber-cli put --tube notifications
+```
+
+### Consuming & Managing Jobs
+
+```bash
+# Reserve the next available job (returns id + body as JSON)
+tuber-cli reserve --timeout 5
+
+# Delete a job by ID
+tuber-cli delete 42
+
+# Bury a reserved job
+tuber-cli bury 42
+
+# Kick buried/delayed jobs back to ready
+tuber-cli kick 10 --tube emails
+
+# Pause a tube for 60 seconds
+tuber-cli pause emails --delay 60
+```
+
+### Global Options
+
+```
+-a, --addr <ADDR>      Server address (default: localhost:11300)
+-f, --format <FORMAT>  Output format: json (default) or text
+```
+
+---
+
+## Using echo + nc (fallback)
+
+Tuber (and beanstalkd) use a text protocol over TCP (default port 11300). All commands are `\r\n` terminated.
 
 ```bash
 echo -e "stats\r\n" | nc localhost 11300
 ```
 
-## Inspecting State
+### Inspecting State
 
 ```bash
 # Server-wide statistics
@@ -36,7 +109,7 @@ echo -e "peek 42\r\n" | nc localhost 11300
 echo -e "stats-job 42\r\n" | nc localhost 11300
 ```
 
-## Debugging & Fixing
+### Debugging & Fixing
 
 ```bash
 # Kick up to 10 buried jobs back to ready
@@ -57,7 +130,7 @@ echo -e "flush-tube mytube\r\n" | nc localhost 11300
 echo -e "delete 42\r\n" | nc localhost 11300
 ```
 
-## Producing Jobs
+### Producing Jobs
 
 ```bash
 # put <priority> <delay> <ttr> <bytes>\r\n<body>\r\n
@@ -73,7 +146,7 @@ echo -e "put 0 0 60 5\r\nhello\r\n" | nc localhost 11300
 printf "use emails\r\nput 0 0 120 19\r\nsend user@example.com\r\n" | nc localhost 11300
 ```
 
-## Consuming Jobs
+### Consuming Jobs
 
 ```bash
 # Reserve with timeout (0 = immediate return if empty)
@@ -93,13 +166,15 @@ echo -e "ignore default\r\n" | nc localhost 11300
 
 ## Tuber Extensions
 
+These work with both tuber-cli and echo/nc (the extensions are server-side).
+
 ```bash
 # Idempotent put (deduplicates by key within the tube)
 echo -e "put 0 0 60 5 idp:unique-key\r\nhello\r\n" | nc localhost 11300
 
 # Idempotent put with TTL (key expires after 300 seconds)
 echo -e "put 0 0 60 5 idp:unique-key:300\r\nhello\r\n" | nc localhost 11300
-# ⚠ Format is idp:<key> or idp:<key>:<ttl> — the LAST colon separates key from TTL.
+# Warning: Format is idp:<key> or idp:<key>:<ttl> — the LAST colon separates key from TTL.
 # So idp:series:123 means key="series", TTL=123 — NOT key="series:123".
 # Use dashes or dots instead of colons in keys: idp:series-123 or idp:series.123
 
@@ -120,8 +195,9 @@ echo -e "delete-batch 1 2 3 4 5\r\n" | nc localhost 11300
 
 ## Tips
 
-- **Byte count must be exact** in `put` or you'll get `BAD_FORMAT` / `EXPECTED_CRLF`.
-- **Use `printf`** over `echo -e` for multi-command sessions.
+- **Prefer tuber-cli** — it handles byte counting, connection management, and outputs structured JSON.
+- **Byte count must be exact** in `put` via nc/echo or you'll get `BAD_FORMAT` / `EXPECTED_CRLF`.
+- **Use `printf`** over `echo -e` for multi-command nc sessions.
 - **Default tube** is "default" — no `use`/`watch` needed for it.
 - **TTR matters** — unreleased jobs auto-return to ready after TTR expires.
 - **Job IDs** are sequential integers starting from 1.

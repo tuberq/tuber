@@ -80,3 +80,7 @@ Port tests from `tmp/test*.c`:
               \-> `Buried` -> `Kicked` -> `Ready`
               \-> `Delayed` -> `Ready` (after deadline)
 `Reserved` -> `Released` -> `Ready`
+
+## Skill
+
+The `skill/SKILL.md` file is mirrored from `tuber-tui` (tuberq/tuber-rs). When updating it, keep both copies in sync.

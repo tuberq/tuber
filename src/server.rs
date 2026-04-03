@@ -576,33 +576,24 @@ impl ServerState {
                 && pri < existing_job.priority
             {
                 let old_pri = existing_job.priority;
+                let state = existing_job.state;
+                let delay = existing_job.delay;
                 existing_job.priority = pri;
 
-                // If job is Ready, re-sort the ready heap
-                if existing_job.state == JobState::Ready {
-                    let new_key = existing_job.ready_key();
-                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                    // If job is Ready, re-sort the ready heap
+                    if state == JobState::Ready {
                         tube.ready.remove_by_id(existing_id);
-                        tube.ready.insert(new_key, existing_id);
+                        tube.ready.insert((pri, existing_id), existing_id);
                     }
-                }
-
-                // Update urgent stats if crossing threshold
-                if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
-                    self.stats.urgent_ct += 1;
-                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                    // Update urgent stats if crossing threshold
+                    if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
+                        self.stats.urgent_ct += 1;
                         tube.stat.urgent_ct += 1;
                     }
                 }
 
-                // WAL: persist priority change
-                self.wal_write_state_change(
-                    existing_id,
-                    self.jobs.get(&existing_id).map(|j| j.state),
-                    pri,
-                    self.jobs.get(&existing_id).map_or(Duration::ZERO, |j| j.delay),
-                    0,
-                );
+                self.wal_write_state_change(existing_id, Some(state), pri, delay, 0);
 
                 Some(pri)
             } else {
@@ -610,8 +601,9 @@ impl ServerState {
             };
 
             let state_str = self.jobs.get(&existing_id)
-                .map(|j| j.state.as_protocol_str())
-                .unwrap_or("READY");
+                .expect("job must exist — just looked up by idempotency key")
+                .state
+                .as_protocol_str();
             return Response::InsertedDup(existing_id, state_str, upgraded_pri);
         }
 
