@@ -765,11 +765,14 @@ impl ServerState {
             .map(|c| c.reserve_mode)
             .unwrap_or(ReserveMode::Fifo);
 
-        if reserve_mode == ReserveMode::Weighted {
-            self.select_weighted_job(conn_id)
-                .or_else(|| self.find_ready_job_for_conn(conn_id))
-        } else {
-            self.find_ready_job_for_conn(conn_id)
+        match reserve_mode {
+            ReserveMode::Weighted => self
+                .select_weighted_job(conn_id)
+                .or_else(|| self.find_ready_job_for_conn(conn_id)),
+            ReserveMode::WeightedFair => self
+                .select_weighted_fair_job(conn_id)
+                .or_else(|| self.find_ready_job_for_conn(conn_id)),
+            ReserveMode::Fifo => self.find_ready_job_for_conn(conn_id),
         }
     }
 
@@ -925,6 +928,12 @@ impl ServerState {
                     conn.reserve_mode = ReserveMode::Weighted;
                 }
                 Response::Using("weighted".to_string())
+            }
+            "weighted-fair" => {
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    conn.reserve_mode = ReserveMode::WeightedFair;
+                }
+                Response::Using("weighted-fair".to_string())
             }
             _ => Response::BadFormat,
         }
@@ -2151,6 +2160,58 @@ impl ServerState {
         candidates.last().map(|(id, _)| *id)
     }
 
+    /// Weighted-fair job selection: adjusts weights by processing time so that
+    /// worker-time (not job-count) is allocated proportional to weights.
+    /// effective_weight = raw_weight / processing_time_ewma
+    fn select_weighted_fair_job(&mut self, conn_id: u64) -> Option<u64> {
+        let conn = self.conns.get(&conn_id)?;
+
+        let mut candidates: Vec<(u64, f64)> = Vec::new(); // (job_id, effective_weight)
+        let mut total_weight: f64 = 0.0;
+
+        for w in &conn.watched {
+            if let Some(tube) = self.tubes.get(&w.name) {
+                if tube.is_paused() || !tube.has_ready() {
+                    continue;
+                }
+                if let Some((_, job_id)) = self.find_best_unblocked_ready(tube) {
+                    let ewma = tube.stat.processing_time_ewma;
+                    let effective = if ewma > 0.0 {
+                        w.weight as f64 / ewma
+                    } else {
+                        w.weight as f64
+                    };
+                    total_weight += effective;
+                    candidates.push((job_id, effective));
+                }
+            }
+        }
+
+        if total_weight == 0.0 {
+            return None;
+        }
+
+        // Same xorshift PRNG as select_weighted_job
+        self.rng_state = self.rng_state.wrapping_add(1);
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+
+        // Use f64 for the random threshold to match f64 weights
+        let r = (x as f64 / u64::MAX as f64) * total_weight;
+        let mut cumulative: f64 = 0.0;
+        for (job_id, weight) in &candidates {
+            cumulative += weight;
+            if r < cumulative {
+                return Some(*job_id);
+            }
+        }
+
+        candidates.last().map(|(id, _)| *id)
+    }
+
     /// Check if a group is complete and promote any waiting after-jobs to ready.
     fn check_group_completion(&mut self, group_name: &str) {
         let is_complete = self
@@ -2301,6 +2362,7 @@ impl ServerState {
         let mode = self.conns.get(&conn_id)?.reserve_mode;
         match mode {
             ReserveMode::Weighted => self.select_weighted_job(conn_id),
+            ReserveMode::WeightedFair => self.select_weighted_fair_job(conn_id),
             ReserveMode::Fifo => self.find_ready_job_for_conn_inner(conn_id),
         }
     }
@@ -3313,6 +3375,175 @@ mod tests {
             None,
         );
         assert!(matches!(resp, Response::BadFormat));
+    }
+
+    #[test]
+    fn test_reserve_mode_weighted_fair() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let resp = s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "weighted-fair".into(),
+            },
+            None,
+        );
+        assert!(matches!(resp, Response::Using(m) if m == "weighted-fair"));
+
+        // Switch back to fifo
+        let resp = s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "fifo".into(),
+            },
+            None,
+        );
+        assert!(matches!(resp, Response::Using(m) if m == "fifo"));
+    }
+
+    #[test]
+    fn test_weighted_fair_favors_fast_tubes() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Set up weighted-fair mode
+        s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "weighted-fair".into(),
+            },
+            None,
+        );
+
+        // Watch "fast" tube (weight 1) and "slow" tube (weight 1)
+        s.handle_command(
+            c,
+            Command::Watch {
+                tube: "fast".into(),
+                weight: 1,
+            },
+            None,
+        );
+        s.handle_command(
+            c,
+            Command::Watch {
+                tube: "slow".into(),
+                weight: 1,
+            },
+            None,
+        );
+        s.handle_command(
+            c,
+            Command::Ignore {
+                tube: "default".into(),
+            },
+            None,
+        );
+
+        // Put jobs into both tubes
+        s.handle_command(
+            c,
+            Command::Use {
+                tube: "fast".into(),
+            },
+            None,
+        );
+        for _ in 0..100 {
+            s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"f".to_vec()));
+        }
+
+        s.handle_command(
+            c,
+            Command::Use {
+                tube: "slow".into(),
+            },
+            None,
+        );
+        for _ in 0..100 {
+            s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"s".to_vec()));
+        }
+
+        // Set processing time EWMAs: fast=0.1s, slow=10.0s (100x slower)
+        s.tubes.get_mut("fast").unwrap().stat.processing_time_ewma = 0.1;
+        s.tubes.get_mut("fast").unwrap().stat.processing_time_samples = 100;
+        s.tubes.get_mut("slow").unwrap().stat.processing_time_ewma = 10.0;
+        s.tubes.get_mut("slow").unwrap().stat.processing_time_samples = 100;
+
+        // Reserve many jobs and count which tube they came from
+        let mut fast_count = 0u32;
+        let mut slow_count = 0u32;
+        for _ in 0..50 {
+            let resp = s.handle_command(c, Command::Reserve, None);
+            if let Response::Reserved { id, .. } = resp {
+                let job = s.jobs.get(&id).unwrap();
+                if job.tube_name == "fast" {
+                    fast_count += 1;
+                } else {
+                    slow_count += 1;
+                }
+                // Delete so the job doesn't stay reserved
+                s.handle_command(c, Command::Delete { id }, None);
+            }
+        }
+
+        // With equal weights and 100x processing time difference,
+        // fast tube should get ~99% of reserves.
+        // Be generous: fast should get at least 80% (40 out of 50).
+        assert!(
+            fast_count > 40,
+            "weighted-fair should heavily favor fast tube: fast={fast_count}, slow={slow_count}"
+        );
+    }
+
+    #[test]
+    fn test_weighted_fair_fallback_no_ewma() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        s.handle_command(
+            c,
+            Command::ReserveMode {
+                mode: "weighted-fair".into(),
+            },
+            None,
+        );
+
+        // Watch two tubes, neither has processing time data
+        s.handle_command(
+            c,
+            Command::Watch {
+                tube: "a".into(),
+                weight: 3,
+            },
+            None,
+        );
+        s.handle_command(
+            c,
+            Command::Watch {
+                tube: "b".into(),
+                weight: 1,
+            },
+            None,
+        );
+        s.handle_command(
+            c,
+            Command::Ignore {
+                tube: "default".into(),
+            },
+            None,
+        );
+
+        // Put one job in each
+        s.handle_command(c, Command::Use { tube: "a".into() }, None);
+        s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+        s.handle_command(c, Command::Use { tube: "b".into() }, None);
+        s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"b".to_vec()));
+
+        // Both tubes have ewma=0 so effective weights should fall back to raw weights.
+        // Just verify we can reserve both without panicking.
+        let resp = s.handle_command(c, Command::Reserve, None);
+        assert!(matches!(resp, Response::Reserved { .. }));
     }
 
     #[test]

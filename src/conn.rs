@@ -9,6 +9,7 @@ pub const MAX_TUBE_WEIGHT: u32 = 9999;
 pub enum ReserveMode {
     Fifo,
     Weighted,
+    WeightedFair,
 }
 
 /// A watched tube entry with its weight for weighted reserve mode.
