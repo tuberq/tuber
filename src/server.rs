@@ -916,27 +916,16 @@ impl ServerState {
     }
 
     fn cmd_reserve_mode(&mut self, conn_id: u64, mode: &str) -> Response {
-        match mode {
-            "fifo" => {
-                if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    conn.reserve_mode = ReserveMode::Fifo;
-                }
-                Response::Using("fifo".to_string())
-            }
-            "weighted" => {
-                if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    conn.reserve_mode = ReserveMode::Weighted;
-                }
-                Response::Using("weighted".to_string())
-            }
-            "weighted-fair" => {
-                if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    conn.reserve_mode = ReserveMode::WeightedFair;
-                }
-                Response::Using("weighted-fair".to_string())
-            }
-            _ => Response::BadFormat,
+        let reserve_mode = match mode {
+            "fifo" => ReserveMode::Fifo,
+            "weighted" => ReserveMode::Weighted,
+            "weighted-fair" => ReserveMode::WeightedFair,
+            _ => return Response::BadFormat,
+        };
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.reserve_mode = reserve_mode;
         }
+        Response::Using(mode.to_string())
     }
 
     fn cmd_reserve_batch(&mut self, conn_id: u64, count: u32) -> Response {
@@ -2118,55 +2107,27 @@ impl ServerState {
         best.map(|(_, id)| id)
     }
 
-    fn select_weighted_job(&mut self, conn_id: u64) -> Option<u64> {
-        let conn = self.conns.get(&conn_id)?;
-
-        // Sum weights of tubes with ready, unpaused jobs
-        let mut total_weight: u32 = 0;
-        let mut candidates: Vec<(u64, u32)> = Vec::new(); // (job_id, weight)
-
-        for w in &conn.watched {
-            if let Some(tube) = self.tubes.get(&w.name) {
-                if tube.is_paused() || !tube.has_ready() {
-                    continue;
-                }
-                if let Some((_, job_id)) = self.find_best_unblocked_ready(tube) {
-                    total_weight += w.weight;
-                    candidates.push((job_id, w.weight));
-                }
-            }
-        }
-
-        if total_weight == 0 {
-            return None;
-        }
-
-        // Simple xorshift-based PRNG for weighted selection
+    fn next_rng(&mut self) -> u64 {
         self.rng_state = self.rng_state.wrapping_add(1);
         let mut x = self.rng_state;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.rng_state = x;
-        let r = (x as u32) % total_weight;
-        let mut cumulative = 0u32;
-        for (job_id, weight) in &candidates {
-            cumulative += weight;
-            if r < cumulative {
-                return Some(*job_id);
-            }
-        }
-
-        candidates.last().map(|(id, _)| *id)
+        x
     }
 
-    /// Weighted-fair job selection: adjusts weights by processing time so that
-    /// worker-time (not job-count) is allocated proportional to weights.
-    /// effective_weight = raw_weight / processing_time_ewma
-    fn select_weighted_fair_job(&mut self, conn_id: u64) -> Option<u64> {
+    /// Weighted job selection with a caller-supplied weight function.
+    /// For standard weighted mode, weight = raw tube weight.
+    /// For weighted-fair mode, weight = raw weight / processing_time_ewma.
+    fn select_weighted_job_with(
+        &mut self,
+        conn_id: u64,
+        weight_fn: fn(&WatchedTube, &Tube) -> f64,
+    ) -> Option<u64> {
         let conn = self.conns.get(&conn_id)?;
 
-        let mut candidates: Vec<(u64, f64)> = Vec::new(); // (job_id, effective_weight)
+        let mut candidates: Vec<(u64, f64)> = Vec::new();
         let mut total_weight: f64 = 0.0;
 
         for w in &conn.watched {
@@ -2175,12 +2136,7 @@ impl ServerState {
                     continue;
                 }
                 if let Some((_, job_id)) = self.find_best_unblocked_ready(tube) {
-                    let ewma = tube.stat.processing_time_ewma;
-                    let effective = if ewma > 0.0 {
-                        w.weight as f64 / ewma
-                    } else {
-                        w.weight as f64
-                    };
+                    let effective = weight_fn(w, tube);
                     total_weight += effective;
                     candidates.push((job_id, effective));
                 }
@@ -2191,15 +2147,7 @@ impl ServerState {
             return None;
         }
 
-        // Same xorshift PRNG as select_weighted_job
-        self.rng_state = self.rng_state.wrapping_add(1);
-        let mut x = self.rng_state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng_state = x;
-
-        // Use f64 for the random threshold to match f64 weights
+        let x = self.next_rng();
         let r = (x as f64 / u64::MAX as f64) * total_weight;
         let mut cumulative: f64 = 0.0;
         for (job_id, weight) in &candidates {
@@ -2210,6 +2158,21 @@ impl ServerState {
         }
 
         candidates.last().map(|(id, _)| *id)
+    }
+
+    fn select_weighted_job(&mut self, conn_id: u64) -> Option<u64> {
+        self.select_weighted_job_with(conn_id, |w, _| w.weight as f64)
+    }
+
+    fn select_weighted_fair_job(&mut self, conn_id: u64) -> Option<u64> {
+        self.select_weighted_job_with(conn_id, |w, tube| {
+            let ewma = tube.stat.processing_time_ewma;
+            if ewma > 0.0 {
+                w.weight as f64 / ewma
+            } else {
+                w.weight as f64
+            }
+        })
     }
 
     /// Check if a group is complete and promote any waiting after-jobs to ready.
