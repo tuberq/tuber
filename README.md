@@ -168,7 +168,9 @@ All stats are available via `stats-tube`, the Prometheus `/metrics` endpoint, an
 
 ### Weighted Reserve
 
-By default, `reserve` picks the highest-priority job across all watched tubes. In weighted mode, a tube is chosen randomly in proportion to its weight, then the highest-priority job from that tube is returned:
+By default, `reserve` picks the highest-priority job across all watched tubes. Two weighted modes let you distribute work across tubes:
+
+**`weighted`** — a tube is chosen randomly in proportion to its weight, then the highest-priority job from that tube is returned:
 
 ```text
 watch email
@@ -179,6 +181,14 @@ reserve
 ```
 
 Tubes default to weight 1. Here, `another-tube` is selected 3x as often as `notifications` and 6x as often as `email`.
+
+**`weighted-fair`** — like `weighted`, but adjusts for processing time so that **worker-time** (not job count) is allocated proportional to weights. Each tube's effective weight is `weight / processing_time_ewma`:
+
+```text
+reserve-mode weighted-fair
+```
+
+This prevents slow tubes from starving fast ones. For example, if `alerter` jobs take 0.1s and `fetcher` jobs take 10s, standard `weighted` with equal weights would lock workers on `fetcher` 99% of the time. With `weighted-fair`, selection compensates for the processing time difference so both tubes get an equal share of worker capacity. Tubes with no processing history yet fall back to raw weights.
 
 ### Unique Jobs (Idempotency)
 
@@ -546,7 +556,7 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `reserve-with-timeout <seconds>\r\n` | Like `reserve` but times out. Returns `RESERVED …` or `TIMED_OUT`. |
 | `reserve-job <id>\r\n` | Reserve a specific job by ID. Returns `RESERVED …` or `NOT_FOUND`. |
 | **+** `reserve-batch <count>\r\n` | Reserve up to `<count>` jobs at once (1–1000). Non-blocking — returns whatever is available. See [Batch Operations](#batch-operations). |
-| **+** `reserve-mode <mode>\r\n` | Set reserve strategy: `default` (priority-first) or `weighted` (random by tube weight). See [Weighted Reserve](#weighted-reserve). |
+| **+** `reserve-mode <mode>\r\n` | Set reserve strategy: `default` (priority-first), `weighted` (random by tube weight), or `weighted-fair` (adjusted for processing time). See [Weighted Reserve](#weighted-reserve). |
 | `delete <id>\r\n` | Delete a job. Returns `DELETED` or `NOT_FOUND`. |
 | **+** `delete-batch <id> …\r\n` | Delete multiple jobs by ID (1–1000, space-separated). Returns `DELETED_BATCH <deleted> <not_found>`. See [Batch Operations](#batch-operations). |
 | `release <id> <pri> <delay>\r\n` | Release a reserved job back to ready (or delayed). Returns `RELEASED`. |
