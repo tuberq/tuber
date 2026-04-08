@@ -19,6 +19,14 @@ const EWMA_ALPHA: f64 = 0.1;
 /// Threshold separating "fast" from "slow" jobs for dual EWMA tracking (seconds).
 const FAST_THRESHOLD: f64 = 0.1;
 
+/// Minimum processing time EWMA (seconds) used in weighted-fair mode to prevent
+/// tubes with very fast jobs from dominating selection.
+const FAIR_EWMA_FLOOR: f64 = 0.01;
+
+/// Minimum number of processing time samples before weighted-fair uses EWMA.
+/// Below this threshold, raw weights are used.
+const FAIR_MIN_SAMPLES: u64 = 10;
+
 // Op index constants matching beanstalkd (see tmp/prot.c)
 const OP_PUT: usize = 1;
 const OP_PEEKJOB: usize = 2;
@@ -2167,8 +2175,8 @@ impl ServerState {
     fn select_weighted_fair_job(&mut self, conn_id: u64) -> Option<u64> {
         self.select_weighted_job_with(conn_id, |w, tube| {
             let ewma = tube.stat.processing_time_ewma;
-            if ewma > 0.0 {
-                w.weight as f64 / ewma
+            if ewma > 0.0 && tube.stat.processing_time_samples >= FAIR_MIN_SAMPLES {
+                w.weight as f64 / ewma.max(FAIR_EWMA_FLOOR)
             } else {
                 w.weight as f64
             }
