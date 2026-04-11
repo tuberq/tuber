@@ -31,6 +31,25 @@ impl TestServer {
         TestServer { port, handle }
     }
 
+    async fn start_with_max_jobs_size(max_jobs_size: u64) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_limited(
+                listener,
+                65535,
+                Some(max_jobs_size),
+                None,
+                None,
+            )
+            .await
+            .ok();
+        });
+
+        TestServer { port, handle }
+    }
+
     async fn connect(&self) -> TestConn {
         let stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
         stream.set_nodelay(true).unwrap();
@@ -4939,4 +4958,116 @@ async fn test_stats_tube_queue_time_no_reserves() {
         "queue-time-samples should be 0: {}",
         body
     );
+}
+
+// ---------------------------------------------------------------------------
+// --max-jobs-size memory limit
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_max_jobs_size_rejects_put_over_budget() {
+    // JOB_OVERHEAD_BYTES = 512 per job. Budget for exactly one 100-byte body
+    // (100 + 512 = 612). A second 100-byte put must get OUT_OF_MEMORY.
+    let srv = TestServer::start_with_max_jobs_size(612).await;
+    let mut c = srv.connect().await;
+
+    // First put fits.
+    c.mustsend("put 0 0 60 100\r\n").await;
+    c.mustsend(&format!("{}\r\n", "a".repeat(100))).await;
+    c.ckrespsub("INSERTED ").await;
+
+    // Second put is rejected.
+    c.mustsend("put 0 0 60 100\r\n").await;
+    c.mustsend(&format!("{}\r\n", "b".repeat(100))).await;
+    c.ckresp("OUT_OF_MEMORY\r\n").await;
+
+    // Delete the first job, freeing the budget.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Now another put succeeds.
+    c.mustsend("put 0 0 60 100\r\n").await;
+    c.mustsend(&format!("{}\r\n", "c".repeat(100))).await;
+    c.ckrespsub("INSERTED ").await;
+}
+
+#[tokio::test]
+async fn test_max_jobs_size_allows_reserve_release_at_capacity() {
+    // Fill to exactly the limit, then confirm reserve/release/bury/kick/delete
+    // never return OUT_OF_MEMORY.
+    let srv = TestServer::start_with_max_jobs_size(612).await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 100\r\n").await;
+    c.mustsend(&format!("{}\r\n", "x".repeat(100))).await;
+    c.ckrespsub("INSERTED ").await;
+
+    // Reserve at capacity — must succeed.
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckrespsub("RESERVED ").await;
+    c.readline().await; // consume body line
+
+    // Release at capacity — must succeed.
+    c.mustsend("release 1 0 0\r\n").await;
+    c.ckresp("RELEASED\r\n").await;
+
+    // Reserve again.
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckrespsub("RESERVED ").await;
+    c.readline().await;
+
+    // Bury at capacity — must succeed.
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // Kick at capacity — must succeed.
+    c.mustsend("kick 1\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+}
+
+#[tokio::test]
+async fn test_max_jobs_size_stats_fields_present() {
+    let srv = TestServer::start_with_max_jobs_size(10_000).await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+
+    assert!(
+        body.contains("max-jobs-size: 10000"),
+        "max-jobs-size missing or wrong: {body}"
+    );
+    assert!(
+        body.contains("current-jobs-size: 0"),
+        "current-jobs-size should start at 0: {body}"
+    );
+
+    // Put one 5-byte body, expect current-jobs-size = 5 + 512 = 517.
+    c.put_job(0, 0, 60, "hello").await;
+    c.mustsend("stats\r\n").await;
+    let body2 = c.read_ok_body().await;
+    assert!(
+        body2.contains("current-jobs-size: 517"),
+        "current-jobs-size after one put should be 517: {body2}"
+    );
+}
+
+#[tokio::test]
+async fn test_max_jobs_size_default_unlimited() {
+    // When --max-jobs-size is not set, stats should report 0 (unlimited
+    // sentinel) and put should never be rejected by the memory check.
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("max-jobs-size: 0"),
+        "unlimited should show max-jobs-size: 0, got: {body}"
+    );
+
+    // 100 puts should all succeed on an unlimited server.
+    for i in 0..100 {
+        c.put_job(0, 0, 60, &format!("job-{i}")).await;
+    }
 }

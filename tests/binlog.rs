@@ -42,6 +42,51 @@ impl TestServer {
         }
     }
 
+    /// Start with an explicit `max_jobs_size` budget. Used to exercise the
+    /// replay pre-check in src/server.rs:build_state.
+    async fn try_start_with_wal_and_max_jobs_size(
+        dir: &Path,
+        max_jobs_size: u64,
+    ) -> Result<Self, std::io::Error> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wal_dir = dir.to_path_buf();
+        let wal_dir_clone = wal_dir.clone();
+
+        // Startup error (e.g. replay over budget) is delivered via the oneshot;
+        // the spawned task reports it before we even try to connect.
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let result = tuber::server::run_with_listener_limited(
+                listener,
+                65535,
+                Some(max_jobs_size),
+                Some(wal_dir_clone.as_path()),
+                None,
+            )
+            .await;
+            let _ = err_tx.send(result);
+        });
+
+        // Give the server a moment to either come up or fail replay.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // If the task has already finished with an error, surface it.
+        if handle.is_finished() {
+            match err_rx.await {
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(())) => {}
+                Err(_) => {}
+            }
+        }
+
+        Ok(TestServer {
+            port,
+            handle,
+            wal_dir,
+        })
+    }
+
     async fn connect(&self) -> TestConn {
         // Retry connection a few times (server may still be starting)
         let mut last_err = None;
@@ -590,4 +635,50 @@ async fn test_wal_replay_concurrency_limit() {
     let line = c2.readline().await;
     assert!(line.starts_with("RESERVED"), "expected third RESERVED after restart, got {:?}", line);
     let _ = c2.readline().await;
+}
+
+/// Replay aborts with a diagnostic error if the on-disk binlog is larger than
+/// --max-jobs-size. This is the operator-facing safety net for the migration
+/// case (upgrading from an unlimited previous run to a newly-bounded one).
+#[tokio::test]
+async fn test_binlog_replay_aborts_when_over_budget() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // First run: no limit, put several jobs so the binlog is non-trivial.
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+    for i in 0..5 {
+        c.mustsend("put 0 0 60 100\r\n").await;
+        c.mustsend(&format!("{}\r\n", "x".repeat(100))).await;
+        c.ckresp(&format!("INSERTED {}\r\n", i + 1)).await;
+    }
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Second run: tight --max-jobs-size (100 bytes) must fail replay loudly.
+    let result = TestServer::try_start_with_wal_and_max_jobs_size(&wal_dir, 100).await;
+    let err = result.err().expect("expected replay to abort with an error");
+    assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--max-jobs-size"),
+        "error message should mention --max-jobs-size: {msg}"
+    );
+    assert!(
+        msg.contains("WAL on-disk size"),
+        "error message should mention on-disk size: {msg}"
+    );
+
+    // Third run: generous budget — all five jobs replay successfully.
+    let srv3 = TestServer::try_start_with_wal_and_max_jobs_size(&wal_dir, 10 * 1024 * 1024)
+        .await
+        .expect("generous budget should allow replay");
+    let mut c3 = srv3.connect().await;
+    c3.mustsend("stats\r\n").await;
+    let body = c3.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-ready: 5"),
+        "expected 5 ready jobs after replay: {body}"
+    );
 }

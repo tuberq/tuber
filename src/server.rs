@@ -23,6 +23,17 @@ const FAST_THRESHOLD: f64 = 0.1;
 /// tubes with very fast jobs from dominating selection.
 const FAIR_EWMA_FLOOR: f64 = 0.01;
 
+/// Fixed memory overhead per live job, covering the Job struct baseline
+/// (~250 bytes of fields), HashMap bucket overhead (~48 bytes), the ready/delay
+/// heap entry (~16 bytes), plus a safety margin. Users budget
+/// `body_len + JOB_OVERHEAD_BYTES` per job against `--max-jobs-size`.
+///
+/// If `struct Job` in src/job.rs grows significantly, revisit this constant.
+const JOB_OVERHEAD_BYTES: u64 = 512;
+
+/// Fixed memory overhead per idempotency-cooldown tombstone.
+const TOMBSTONE_OVERHEAD_BYTES: u64 = 128;
+
 /// Minimum number of processing time samples before weighted-fair uses EWMA.
 /// Below this threshold, raw weights are used.
 const FAIR_MIN_SAMPLES: u64 = 10;
@@ -87,6 +98,10 @@ struct GlobalStats {
     timeout_ct: u64,
     op_ct: [u64; 28],
     total_connections: u64,
+    /// Number of times the tick-time drift detector observed a non-zero
+    /// `total_job_bytes` while the live set (jobs + tombstones) was empty.
+    /// Every increment is a tuber bug; alert on it.
+    accounting_drift_events: u64,
 }
 
 /// State for a job group (grp:/aft: feature).
@@ -127,6 +142,14 @@ struct ServerState {
     conns: HashMap<u64, ConnState>,
     next_job_id: u64,
     max_job_size: u32,
+    /// Optional cap on total in-memory job bytes (bodies + overhead + tombstones).
+    /// `None` disables the check.
+    max_job_bytes: Option<u64>,
+    /// Running sum of `job_memory_cost` for all jobs plus `tombstone_memory_cost`
+    /// for every live idempotency-cooldown entry. Maintained via the
+    /// `insert_job` / `remove_job` / `insert_tombstone` / `remove_tombstone`
+    /// helpers — the raw HashMap must not be mutated directly.
+    total_job_bytes: u64,
     drain_mode: bool,
     ready_ct: u64,
     started_at: Instant,
@@ -153,7 +176,7 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(max_job_size: u32, name: Option<String>) -> Self {
+    fn new(max_job_size: u32, max_job_bytes: Option<u64>, name: Option<String>) -> Self {
         let mut tubes = HashMap::new();
         tubes.insert("default".to_string(), Tube::new("default"));
 
@@ -231,6 +254,8 @@ impl ServerState {
             next_job_id: 1,
 
             max_job_size,
+            max_job_bytes,
+            total_job_bytes: 0,
             drain_mode: false,
             ready_ct: 0,
             started_at: Instant::now(),
@@ -246,6 +271,90 @@ impl ServerState {
             groups: HashMap::new(),
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
+        }
+    }
+
+    // --- Memory accounting ---
+    //
+    // All mutations of `self.jobs` and `tube.idempotency_cooldowns` MUST go
+    // through these helpers. A missed call site here causes slow drift of
+    // `total_job_bytes` away from reality, which manifests as `OUT_OF_MEMORY`
+    // responses on near-empty queues. Grep for `self.jobs.insert`,
+    // `self.jobs.remove`, and `idempotency_cooldowns` to audit.
+
+    fn job_memory_cost(job: &Job) -> u64 {
+        job.body.len() as u64 + JOB_OVERHEAD_BYTES
+    }
+
+    fn tombstone_memory_cost(key: &str) -> u64 {
+        key.len() as u64 + TOMBSTONE_OVERHEAD_BYTES
+    }
+
+    /// True iff adding `additional` bytes would exceed the configured budget.
+    /// Returns false (allow) when `max_job_bytes` is `None`.
+    fn memory_limit_exceeded(&self, additional: u64) -> bool {
+        match self.max_job_bytes {
+            Some(limit) => self.total_job_bytes.saturating_add(additional) > limit,
+            None => false,
+        }
+    }
+
+    fn insert_job(&mut self, id: u64, job: Job) {
+        self.total_job_bytes = self
+            .total_job_bytes
+            .saturating_add(Self::job_memory_cost(&job));
+        self.jobs.insert(id, job);
+    }
+
+    fn remove_job(&mut self, id: u64) -> Option<Job> {
+        let job = self.jobs.remove(&id)?;
+        self.total_job_bytes = self
+            .total_job_bytes
+            .saturating_sub(Self::job_memory_cost(&job));
+        Some(job)
+    }
+
+    fn insert_tombstone(
+        &mut self,
+        tube_name: &str,
+        key: String,
+        job_id: u64,
+        expires_at: SystemTime,
+    ) {
+        let cost = Self::tombstone_memory_cost(&key);
+        // Replacing an existing tombstone is net-zero. Decrement first so the
+        // subsequent add doesn't double-count.
+        let replacing = self
+            .tubes
+            .get(tube_name)
+            .is_some_and(|t| t.idempotency_cooldowns.contains_key(&key));
+        if replacing {
+            self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+        }
+        self.total_job_bytes = self.total_job_bytes.saturating_add(cost);
+        if let Some(tube) = self.tubes.get_mut(tube_name) {
+            tube.idempotency_cooldowns.insert(key, (job_id, expires_at));
+        }
+    }
+
+    fn remove_tombstone(&mut self, tube_name: &str, key: &str) {
+        if let Some(tube) = self.tubes.get_mut(tube_name)
+            && tube.idempotency_cooldowns.remove(key).is_some()
+        {
+            let cost = Self::tombstone_memory_cost(key);
+            self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+        }
+    }
+
+    /// Drain every tombstone from a tube, updating accounting.
+    fn drain_tombstones_in_tube(&mut self, tube_name: &str) {
+        if let Some(tube) = self.tubes.get_mut(tube_name) {
+            let drained: Vec<String> =
+                tube.idempotency_cooldowns.drain().map(|(k, _)| k).collect();
+            for k in drained {
+                let cost = Self::tombstone_memory_cost(&k);
+                self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            }
         }
     }
 
@@ -559,6 +668,22 @@ impl ServerState {
             None => return Response::InternalError,
         };
 
+        // Memory budget: reject new work before allocating anything. We
+        // account for the job itself plus any idempotency tombstone that
+        // would be created if the job is later deleted with a non-zero idp
+        // TTL — that tombstone is part of the same budget, and admitting a
+        // put we can't later cooldown would be dishonest. Release/bury/kick
+        // never pass through this check because they don't add bytes.
+        let tombstone_cost = idempotency_key
+            .as_ref()
+            .filter(|(_, ttl)| *ttl > 0)
+            .map(|(k, _)| k.len() as u64 + TOMBSTONE_OVERHEAD_BYTES)
+            .unwrap_or(0);
+        let job_cost = body.len() as u64 + JOB_OVERHEAD_BYTES;
+        if self.memory_limit_exceeded(job_cost + tombstone_cost) {
+            return Response::OutOfMemory;
+        }
+
         // Mark connection as producer
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.set_producer();
@@ -616,14 +741,17 @@ impl ServerState {
         }
 
         // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
-        if let Some(ref key_tuple) = idempotency_key
-            && let Some(tube) = self.tubes.get_mut(&tube_name)
-            && let Some(&(original_id, expiry)) = tube.idempotency_cooldowns.get(&key_tuple.0)
-        {
-            if SystemTime::now() < expiry {
-                return Response::InsertedDup(original_id, "DELETED", None);
-            } else {
-                tube.idempotency_cooldowns.remove(&key_tuple.0);
+        if let Some(ref key_tuple) = idempotency_key {
+            let cooldown = self
+                .tubes
+                .get(&tube_name)
+                .and_then(|t| t.idempotency_cooldowns.get(&key_tuple.0).copied());
+            if let Some((original_id, expiry)) = cooldown {
+                if SystemTime::now() < expiry {
+                    return Response::InsertedDup(original_id, "DELETED", None);
+                } else {
+                    self.remove_tombstone(&tube_name, &key_tuple.0);
+                }
             }
         }
 
@@ -704,7 +832,7 @@ impl ServerState {
             let deadline = Instant::now() + Duration::from_secs(delay as u64);
             job.state = JobState::Delayed;
             job.deadline_at = Some(deadline);
-            self.jobs.insert(id, job);
+            self.insert_job(id, job);
             if let Some(tube) = self.tubes.get_mut(&tube_name) {
                 tube.delay.insert((deadline, id), id);
             }
@@ -713,7 +841,7 @@ impl ServerState {
             job.state = JobState::Delayed;
             job.deadline_at = None;
             let after_group_name = job.after_group.clone();
-            self.jobs.insert(id, job);
+            self.insert_job(id, job);
             // Add to group's waiting list (will be promoted when group completes)
             if let Some(ref ag) = after_group_name
                 && let Some(gs) = self.groups.get_mut(ag)
@@ -722,7 +850,7 @@ impl ServerState {
             }
         } else {
             let key = job.ready_key();
-            self.jobs.insert(id, job);
+            self.insert_job(id, job);
             if let Some(tube) = self.tubes.get_mut(&tube_name) {
                 tube.ready.insert(key, id);
             }
@@ -1052,18 +1180,17 @@ impl ServerState {
 
         // Remove idempotency key from tube index (with optional cooldown)
         let mut expiry_epoch_secs: u64 = 0;
-        if let Some(ref key_tuple) = idempotency_key
-            && let Some(tube) = self.tubes.get_mut(&tube_name)
-        {
-            tube.idempotency_keys.remove(&key_tuple.0);
+        if let Some(ref key_tuple) = idempotency_key {
+            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                tube.idempotency_keys.remove(&key_tuple.0);
+            }
             if key_tuple.1 > 0 {
                 let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
                 expiry_epoch_secs = expires_at
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                tube.idempotency_cooldowns
-                    .insert(key_tuple.0.clone(), (id, expires_at));
+                self.insert_tombstone(&tube_name, key_tuple.0.clone(), id, expires_at);
             }
         }
         if let Some(ref grp) = group_name
@@ -1078,7 +1205,7 @@ impl ServerState {
         // WAL: write delete state change (with tombstone expiry if applicable)
         self.wal_write_state_change(id, None, 0, Duration::ZERO, expiry_epoch_secs);
 
-        self.jobs.remove(&id);
+        self.remove_job(id);
 
         // Check if any group completed and promote waiting after-jobs
         if let Some(ref grp) = group_name {
@@ -1124,9 +1251,7 @@ impl ServerState {
         let count = job_ids.len() as u32;
         if count == 0 {
             // Still clear cooldowns even if no jobs
-            if let Some(tube) = self.tubes.get_mut(tube_name) {
-                tube.idempotency_cooldowns.clear();
-            }
+            self.drain_tombstones_in_tube(tube_name);
             return Response::Flushed(0);
         }
 
@@ -1163,13 +1288,13 @@ impl ServerState {
             }
         }
 
-        // Clear tube queues
+        // Clear tombstones with accounting, then clear everything else.
+        self.drain_tombstones_in_tube(tube_name);
         let tube = self.tubes.get_mut(tube_name).unwrap();
         tube.ready.clear();
         tube.delay.clear();
         tube.buried.clear();
         tube.idempotency_keys.clear();
-        tube.idempotency_cooldowns.clear();
 
         // Update tube stats
         tube.stat.total_delete_ct += count as u64;
@@ -1211,7 +1336,7 @@ impl ServerState {
         // WAL: write delete for each job, then remove from jobs map
         for &id in &job_ids {
             self.wal_write_state_change(id, None, 0, Duration::ZERO, 0);
-            self.jobs.remove(&id);
+            self.remove_job(id);
         }
 
         // Check if any affected groups completed
@@ -1933,6 +2058,9 @@ impl ServerState {
              job-timeouts: {}\n\
              total-jobs: {}\n\
              max-job-size: {}\n\
+             current-jobs-size: {}\n\
+             max-jobs-size: {}\n\
+             accounting-drift-events: {}\n\
              current-tubes: {}\n\
              current-connections: {}\n\
              current-producers: {}\n\
@@ -1992,6 +2120,9 @@ impl ServerState {
             self.stats.timeout_ct,
             self.stats.total_jobs_ct,
             self.max_job_size,
+            self.total_job_bytes,
+            self.max_job_bytes.unwrap_or(0),
+            self.stats.accounting_drift_events,
             self.tubes.len(),
             self.conns.len(),
             self.conns.values().filter(|c| c.is_producer()).count(),
@@ -2353,15 +2484,20 @@ impl ServerState {
     // --- WAL helpers ---
 
     fn wal_write_put(&mut self, job_id: u64) {
-        if let Some(wal) = self.wal.as_mut() {
-            // We need to temporarily take the job out to satisfy borrow checker
-            if let Some(mut job) = self.jobs.remove(&job_id) {
-                if let Err(e) = wal.write_put(&mut job) {
-                    tracing::error!("WAL write_put error: {}, disabling WAL", e);
-                    self.wal = None;
-                }
-                self.jobs.insert(job_id, job);
+        if self.wal.is_none() {
+            return;
+        }
+        // Temporarily take the job out to satisfy the borrow checker while
+        // calling into the WAL. Accounting is net-zero across the pair because
+        // `wal.write_put` does not change `job.body`, only bookkeeping fields.
+        if let Some(mut job) = self.remove_job(job_id) {
+            if let Some(wal) = self.wal.as_mut()
+                && let Err(e) = wal.write_put(&mut job)
+            {
+                tracing::error!("WAL write_put error: {}, disabling WAL", e);
+                self.wal = None;
             }
+            self.insert_job(job_id, job);
         }
     }
 
@@ -2373,14 +2509,18 @@ impl ServerState {
         delay: Duration,
         expiry_epoch_secs: u64,
     ) {
-        if let Some(wal) = self.wal.as_mut()
-            && let Some(mut job) = self.jobs.remove(&job_id)
-        {
-            if let Err(e) = wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs) {
+        if self.wal.is_none() {
+            return;
+        }
+        if let Some(mut job) = self.remove_job(job_id) {
+            if let Some(wal) = self.wal.as_mut()
+                && let Err(e) =
+                    wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs)
+            {
                 tracing::error!("WAL write_state_change error: {}, disabling WAL", e);
                 self.wal = None;
             }
-            self.jobs.insert(job_id, job);
+            self.insert_job(job_id, job);
         }
     }
 
@@ -2552,11 +2692,44 @@ impl ServerState {
         // Try to fulfill remaining waiters with newly ready jobs
         self.process_queue();
 
-        // Clean up expired idempotency cooldowns
+        // Clean up expired idempotency cooldowns (with memory accounting).
         let sys_now = SystemTime::now();
-        for tube in self.tubes.values_mut() {
-            tube.idempotency_cooldowns
-                .retain(|_, (_, expiry)| *expiry > sys_now);
+        let expired: Vec<(String, String)> = self
+            .tubes
+            .iter()
+            .flat_map(|(tube_name, tube)| {
+                tube.idempotency_cooldowns
+                    .iter()
+                    .filter(|(_, (_, expiry))| *expiry <= sys_now)
+                    .map(|(k, _)| (tube_name.clone(), k.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (tube_name, key) in expired {
+            self.remove_tombstone(&tube_name, &key);
+        }
+
+        // Memory-accounting drift detector.
+        //
+        // When the live set (jobs + tombstones) is empty, `total_job_bytes`
+        // must also be zero. Non-zero means a missed decrement somewhere,
+        // which would eventually produce bogus OUT_OF_MEMORY responses on
+        // an empty queue. Log loudly (so operators see it), bump a counter
+        // (so they can alert on `rate(tuber_accounting_drift_events_total
+        // [5m]) > 0`), and self-heal by resetting — a permanent leak is
+        // worse than a one-off warning.
+        if self.total_job_bytes != 0
+            && self.jobs.is_empty()
+            && self.tubes.values().all(|t| t.idempotency_cooldowns.is_empty())
+        {
+            tracing::warn!(
+                "memory accounting drift: total_job_bytes={} with no live \
+                 jobs or tombstones — resetting to 0. This is a tuber bug; \
+                 please report it.",
+                self.total_job_bytes,
+            );
+            self.stats.accounting_drift_events += 1;
+            self.total_job_bytes = 0;
         }
 
         // WAL maintenance (GC, sync, compaction)
@@ -2616,7 +2789,7 @@ impl ServerState {
             match state {
                 JobState::Ready => {
                     let key = job.ready_key();
-                    self.jobs.insert(id, job);
+                    self.insert_job(id, job);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.ready.insert(key, id);
                     }
@@ -2636,7 +2809,7 @@ impl ServerState {
                     let deadline = job
                         .deadline_at
                         .unwrap_or_else(|| Instant::now() + job.delay);
-                    self.jobs.insert(id, job);
+                    self.insert_job(id, job);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.delay.insert((deadline, id), id);
                     }
@@ -2646,7 +2819,7 @@ impl ServerState {
                     }
                 }
                 JobState::Buried => {
-                    self.jobs.insert(id, job);
+                    self.insert_job(id, job);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.buried.push_back(id);
                         tube.stat.buried_ct += 1;
@@ -2661,7 +2834,7 @@ impl ServerState {
                     // Reserved jobs replay as Ready (handled by WAL deserialization)
                     // This shouldn't happen, but handle it gracefully
                     let key = (pri, id);
-                    self.jobs.insert(id, job);
+                    self.insert_job(id, job);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.ready.insert(key, id);
                     }
@@ -2744,12 +2917,38 @@ impl ServerState {
         // Restore idempotency tombstones from WAL
         for tombstone in tombstones {
             self.ensure_tube(&tombstone.tube_name);
-            if let Some(tube) = self.tubes.get_mut(&tombstone.tube_name) {
-                tube.idempotency_cooldowns
-                    .insert(tombstone.key, (tombstone.job_id, tombstone.expires_at));
-            }
+            self.insert_tombstone(
+                &tombstone.tube_name,
+                tombstone.key,
+                tombstone.job_id,
+                tombstone.expires_at,
+            );
         }
     }
+}
+
+/// Parse a human-readable byte count (`1g`, `500M`, `100k`, or raw bytes) into u64.
+/// Case-insensitive. Trailing `B` accepted (`2GB`, `500MB`). No decimals.
+pub fn parse_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty byte count".to_string());
+    }
+    // Strip an optional trailing "B" / "b" (e.g. "2GB").
+    let s_no_b = s.strip_suffix(['B', 'b']).unwrap_or(s);
+    let (num_part, multiplier): (&str, u64) = match s_no_b.chars().last() {
+        Some('k' | 'K') => (&s_no_b[..s_no_b.len() - 1], 1024),
+        Some('m' | 'M') => (&s_no_b[..s_no_b.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&s_no_b[..s_no_b.len() - 1], 1024 * 1024 * 1024),
+        Some('t' | 'T') => (&s_no_b[..s_no_b.len() - 1], 1024u64.pow(4)),
+        _ => (s_no_b, 1),
+    };
+    let n: u64 = num_part
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid byte count {s:?}: {e}"))?;
+    n.checked_mul(multiplier)
+        .ok_or_else(|| format!("byte count {s:?} overflows u64"))
 }
 
 /// Build ServerState, replaying the WAL if `wal_dir` is set.
@@ -2761,18 +2960,35 @@ impl ServerState {
 /// commands.
 fn build_state(
     max_job_size: u32,
+    max_job_bytes: Option<u64>,
     wal_dir: Option<&Path>,
     name: Option<String>,
 ) -> io::Result<ServerState> {
-    let mut state = ServerState::new(max_job_size, name);
+    let mut state = ServerState::new(max_job_size, max_job_bytes, name);
 
     if let Some(dir) = wal_dir {
         let mut wal = Wal::open(dir, None)?;
-        tracing::info!(
-            "WAL: replaying {} bytes from {:?}",
-            wal.total_disk_bytes(),
-            dir
-        );
+        let on_disk = wal.total_disk_bytes();
+
+        // If the binlog is larger than the configured memory budget, abort
+        // before replay. On-disk size is a conservative upper bound for the
+        // in-memory working set (state-transition records compact away in RAM).
+        // A server running under the same limit will have written a binlog
+        // that fits trivially; the only way to hit this error is an operator
+        // tightening the limit below what the previous run produced.
+        if let Some(max) = max_job_bytes
+            && on_disk > max
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "WAL on-disk size ({on_disk} bytes) exceeds --max-jobs-size ({max} bytes). \
+                     Raise --max-jobs-size or move the binlog aside and restart."
+                ),
+            ));
+        }
+
+        tracing::info!("WAL: replaying {} bytes from {:?}", on_disk, dir);
         let (jobs, next_id, tombstones) = wal.replay()?;
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
@@ -2800,18 +3016,29 @@ pub async fn run(
     addr: &str,
     port: u16,
     max_job_size: u32,
+    max_job_bytes: Option<u64>,
     wal_dir: Option<&str>,
     metrics_port: Option<u16>,
     name: Option<String>,
 ) -> io::Result<()> {
     let wal_path = wal_dir.map(Path::new);
-    let state = build_state(max_job_size, wal_path, name.clone())?;
+    let state = build_state(max_job_size, max_job_bytes, wal_path, name.clone())?;
 
     let listener = TcpListener::bind((addr, port)).await?;
+    let mut opts = format!(" max-job-size={max_job_size}");
+    if let Some(b) = max_job_bytes {
+        opts.push_str(&format!(" max-jobs-size={b}"));
+    }
+    if let Some(ref dir) = wal_dir {
+        opts.push_str(&format!(" binlog={dir}"));
+    }
+    if let Some(mp) = metrics_port {
+        opts.push_str(&format!(" metrics={}:{mp}", listener.local_addr()?.ip()));
+    }
     if let Some(ref n) = name {
-        tracing::info!("tuber v{} [{}] listening on {}:{}", env!("CARGO_PKG_VERSION"), n, addr, port);
+        tracing::info!("tuber v{} [{}] listening on {}:{}{opts}", env!("CARGO_PKG_VERSION"), n, addr, port);
     } else {
-        tracing::info!("tuber v{} listening on {}:{}", env!("CARGO_PKG_VERSION"), addr, port);
+        tracing::info!("tuber v{} listening on {}:{}{opts}", env!("CARGO_PKG_VERSION"), addr, port);
     }
 
     if let Some(mp) = metrics_port {
@@ -2837,7 +3064,20 @@ pub async fn run_with_listener(
     wal_dir: Option<&Path>,
     name: Option<String>,
 ) -> io::Result<()> {
-    let state = build_state(max_job_size, wal_dir, name)?;
+    run_with_listener_limited(listener, max_job_size, None, wal_dir, name).await
+}
+
+/// Like [`run_with_listener`] but with an explicit `max_job_bytes` budget.
+/// Exists so integration tests can exercise the memory limit without going
+/// through the `run` CLI path.
+pub async fn run_with_listener_limited(
+    listener: TcpListener,
+    max_job_size: u32,
+    max_job_bytes: Option<u64>,
+    wal_dir: Option<&Path>,
+    name: Option<String>,
+) -> io::Result<()> {
+    let state = build_state(max_job_size, max_job_bytes, wal_dir, name)?;
     serve(listener, state, max_job_size).await
 }
 
@@ -3113,7 +3353,7 @@ mod tests {
     use super::*;
 
     fn make_state() -> ServerState {
-        ServerState::new(65535, None)
+        ServerState::new(65535, None, None)
     }
 
     fn register(state: &mut ServerState) -> u64 {
@@ -4585,5 +4825,308 @@ mod tests {
                 not_found: 1
             }
         );
+    }
+
+    // --- Memory accounting (--max-jobs-size) ---
+
+    /// Sum the live memory cost of every job and tombstone from scratch.
+    /// Must match `state.total_job_bytes` at all times.
+    fn recompute_total_job_bytes(state: &ServerState) -> u64 {
+        let jobs: u64 = state
+            .jobs
+            .values()
+            .map(ServerState::job_memory_cost)
+            .sum();
+        let tombs: u64 = state
+            .tubes
+            .values()
+            .flat_map(|t| t.idempotency_cooldowns.keys())
+            .map(|k| ServerState::tombstone_memory_cost(k))
+            .sum();
+        jobs + tombs
+    }
+
+    fn make_state_with_limit(max_bytes: Option<u64>) -> ServerState {
+        ServerState::new(65535, max_bytes, None)
+    }
+
+    #[test]
+    fn test_memory_accounting_put_delete_zero() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        s.handle_command(c, put_cmd(0, 0, 60, 5), Some(b"hello".to_vec()));
+        s.handle_command(c, put_cmd(0, 0, 60, 3), Some(b"foo".to_vec()));
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+        assert_eq!(s.total_job_bytes, (5 + 512) + (3 + 512));
+
+        s.handle_command(c, Command::Delete { id: 1 }, None);
+        s.handle_command(c, Command::Delete { id: 2 }, None);
+        assert_eq!(s.total_job_bytes, 0);
+        assert_eq!(recompute_total_job_bytes(&s), 0);
+    }
+
+    #[test]
+    fn test_memory_accounting_reserve_release_is_neutral() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        s.handle_command(c, put_cmd(0, 0, 60, 5), Some(b"hello".to_vec()));
+        let baseline = s.total_job_bytes;
+
+        let resp = s.handle_command(c, Command::Reserve, None);
+        let id = match resp {
+            Response::Reserved { id, .. } => id,
+            _ => panic!("expected Reserved"),
+        };
+        // Reserve doesn't add bytes.
+        assert_eq!(s.total_job_bytes, baseline);
+
+        s.handle_command(c, Command::Release { id, pri: 0, delay: 0 }, None);
+        assert_eq!(s.total_job_bytes, baseline);
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+    }
+
+    #[test]
+    fn test_memory_accounting_bury_kick_is_neutral() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        s.handle_command(c, put_cmd(0, 0, 60, 5), Some(b"hello".to_vec()));
+        let baseline = s.total_job_bytes;
+
+        let resp = s.handle_command(c, Command::Reserve, None);
+        let id = match resp {
+            Response::Reserved { id, .. } => id,
+            _ => panic!("expected Reserved"),
+        };
+        s.handle_command(c, Command::Bury { id, pri: 0 }, None);
+        assert_eq!(s.total_job_bytes, baseline);
+
+        s.handle_command(c, Command::Kick { bound: 1 }, None);
+        assert_eq!(s.total_job_bytes, baseline);
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+    }
+
+    #[test]
+    fn test_memory_limit_blocks_put() {
+        // Budget for exactly one 10-byte job (10 + 512 = 522). A second put
+        // of the same size must be rejected.
+        let mut s = make_state_with_limit(Some(522));
+        let c = register(&mut s);
+
+        let r1 = s.handle_command(c, put_cmd(0, 0, 60, 10), Some(vec![b'a'; 10]));
+        assert!(matches!(r1, Response::Inserted(1)), "first put: {r1:?}");
+
+        let r2 = s.handle_command(c, put_cmd(0, 0, 60, 10), Some(vec![b'b'; 10]));
+        assert!(matches!(r2, Response::OutOfMemory), "second put: {r2:?}");
+
+        // Delete frees the budget; next put should succeed again.
+        s.handle_command(c, Command::Delete { id: 1 }, None);
+        assert_eq!(s.total_job_bytes, 0);
+
+        let r3 = s.handle_command(c, put_cmd(0, 0, 60, 10), Some(vec![b'c'; 10]));
+        assert!(matches!(r3, Response::Inserted(2)), "post-delete put: {r3:?}");
+    }
+
+    #[test]
+    fn test_memory_limit_allows_reserve_at_capacity() {
+        let mut s = make_state_with_limit(Some(522));
+        let c = register(&mut s);
+
+        s.handle_command(c, put_cmd(0, 0, 60, 10), Some(vec![b'a'; 10]));
+        // At the limit. Reserve must still succeed.
+        let resp = s.handle_command(c, Command::Reserve, None);
+        assert!(matches!(resp, Response::Reserved { .. }));
+
+        // And release, too.
+        let resp = s.handle_command(
+            c,
+            Command::Release {
+                id: 1,
+                pri: 0,
+                delay: 0,
+            },
+            None,
+        );
+        assert!(matches!(resp, Response::Released));
+    }
+
+    #[test]
+    fn test_memory_limit_put_with_idp_accounts_for_tombstone() {
+        // A 5-byte body + 512 job overhead + "k1" tombstone (2 + 128 = 130)
+        // = 647. Allow exactly that, put once. Then put a second fresh idp:
+        // 5 + 512 = 517 of job + "k2" 2 + 128 = 130 of tombstone = 647 more.
+        // Budget of 647 fits exactly one such put, second must fail.
+        let mut s = make_state_with_limit(Some(647));
+        let c = register(&mut s);
+
+        let cmd_idp1 = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("k1".to_string(), 30)), // TTL > 0 → tombstone cost
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let r1 = s.handle_command(c, cmd_idp1, Some(b"hello".to_vec()));
+        assert!(matches!(r1, Response::Inserted(1)), "got {r1:?}");
+
+        let cmd_idp2 = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("k2".to_string(), 30)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        let r2 = s.handle_command(c, cmd_idp2, Some(b"world".to_vec()));
+        assert!(matches!(r2, Response::OutOfMemory), "got {r2:?}");
+    }
+
+    #[test]
+    fn test_memory_accounting_flush_tube_drains_tombstones() {
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put with idp+TTL, then delete → creates cooldown tombstone.
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 5,
+            idempotency_key: Some(("k1".to_string(), 30)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"hello".to_vec()));
+        s.handle_command(c, Command::Delete { id: 1 }, None);
+        assert!(s.total_job_bytes > 0, "tombstone should remain after delete");
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+
+        s.handle_command(
+            c,
+            Command::FlushTube {
+                tube: "default".to_string(),
+            },
+            None,
+        );
+        assert_eq!(s.total_job_bytes, 0);
+        assert_eq!(recompute_total_job_bytes(&s), 0);
+    }
+
+    #[test]
+    fn test_memory_accounting_churn_returns_to_zero() {
+        // Mixed stream of puts, deletes, reserves, releases. After everything
+        // is deleted, the counter must match a from-scratch recomputation
+        // (0 in this case since all jobs are gone).
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        let mut live_ids: Vec<u64> = Vec::new();
+
+        for i in 0..500u32 {
+            let body = format!("job-{i}").into_bytes();
+            let cmd = put_cmd(0, 0, 60, body.len() as u32);
+            if let Response::Inserted(id) = s.handle_command(c, cmd, Some(body)) {
+                live_ids.push(id);
+            }
+        }
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+
+        // Reserve+release a batch — net zero.
+        for _ in 0..100 {
+            if let Response::Reserved { id, .. } = s.handle_command(c, Command::Reserve, None) {
+                s.handle_command(
+                    c,
+                    Command::Release {
+                        id,
+                        pri: 0,
+                        delay: 0,
+                    },
+                    None,
+                );
+            }
+        }
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+
+        // Reserve+bury+kick a batch — net zero.
+        for _ in 0..50 {
+            if let Response::Reserved { id, .. } = s.handle_command(c, Command::Reserve, None) {
+                s.handle_command(c, Command::Bury { id, pri: 0 }, None);
+            }
+        }
+        s.handle_command(c, Command::Kick { bound: 100 }, None);
+        assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+
+        // Delete every remaining job.
+        for id in live_ids {
+            s.handle_command(c, Command::Delete { id }, None);
+        }
+        assert_eq!(s.total_job_bytes, 0);
+        assert_eq!(recompute_total_job_bytes(&s), 0);
+    }
+
+    #[test]
+    fn test_drift_detector_fires_and_self_heals_on_empty_state() {
+        let mut s = make_state();
+        // Simulate a missed accounting decrement: counter non-zero, no jobs.
+        s.total_job_bytes = 9999;
+        assert_eq!(s.stats.accounting_drift_events, 0);
+
+        s.tick();
+
+        assert_eq!(
+            s.total_job_bytes, 0,
+            "drift detector should reset counter to 0"
+        );
+        assert_eq!(
+            s.stats.accounting_drift_events, 1,
+            "drift detector should bump the counter"
+        );
+    }
+
+    #[test]
+    fn test_drift_detector_does_not_fire_with_live_jobs() {
+        let mut s = make_state();
+        let c = register(&mut s);
+        s.handle_command(c, put_cmd(0, 0, 60, 5), Some(b"hello".to_vec()));
+        let baseline = s.total_job_bytes;
+
+        // Corrupt the counter upward. With a live job present, the drift
+        // detector must not touch it — we can't tell if the extra bytes are
+        // drift or real.
+        s.total_job_bytes += 1000;
+        let corrupted = s.total_job_bytes;
+
+        s.tick();
+
+        assert_eq!(s.total_job_bytes, corrupted, "detector must only fire on empty state");
+        assert_eq!(s.stats.accounting_drift_events, 0);
+        // Clean up so the test doesn't leak a weird counter.
+        s.total_job_bytes = baseline;
+    }
+
+    #[test]
+    fn test_parse_bytes_variants() {
+        assert_eq!(parse_bytes("1024"), Ok(1024));
+        assert_eq!(parse_bytes("1k"), Ok(1024));
+        assert_eq!(parse_bytes("1K"), Ok(1024));
+        assert_eq!(parse_bytes("2m"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_bytes("2M"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_bytes("3g"), Ok(3 * 1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("3G"), Ok(3 * 1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("1t"), Ok(1024u64.pow(4)));
+        assert_eq!(parse_bytes("2gb"), Ok(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("2GB"), Ok(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("500M"), Ok(500 * 1024 * 1024));
+        assert!(parse_bytes("").is_err());
+        assert!(parse_bytes("nope").is_err());
+        assert!(parse_bytes("1.5g").is_err()); // decimals not supported
     }
 }

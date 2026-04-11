@@ -3,6 +3,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::{Parser, Subcommand};
 
+/// Parse a human-readable byte count for `--max-job-size`, clamping to u32.
+fn parse_max_job_size(s: &str) -> Result<u32, String> {
+    let n = tuber::server::parse_bytes(s)?;
+    u32::try_from(n).map_err(|_| format!("max-job-size {s:?} does not fit in u32"))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tuber", about = "A simple, fast work queue", version)]
 struct Cli {
@@ -26,9 +32,17 @@ enum Commands {
         #[arg(short = 'b', long)]
         binlog_dir: Option<String>,
 
-        /// Max job size in bytes
-        #[arg(short = 'z', long, default_value_t = 65535)]
+        /// Maximum size of a single job's body.
+        /// Accepts suffixes: k, m, g, t (e.g. 64k, 1m). Default: 65535.
+        #[arg(short = 'z', long, default_value = "65535", value_parser = parse_max_job_size)]
         max_job_size: u32,
+
+        /// Maximum total in-memory size of all jobs (bodies + per-job overhead
+        /// + idempotency tombstones). PUT returns OUT_OF_MEMORY once exceeded;
+        /// reserve/release/bury/kick/delete always succeed. Accepts suffixes:
+        /// k, m, g, t (e.g. 2g, 500M, 100k). Default: unlimited.
+        #[arg(long, value_parser = tuber::server::parse_bytes)]
+        max_jobs_size: Option<u64>,
 
         /// Increase verbosity (-V for info, -VV for debug)
         #[arg(short = 'V', action = clap::ArgAction::Count)]
@@ -129,6 +143,7 @@ async fn main() {
             port,
             binlog_dir,
             max_job_size,
+            max_jobs_size,
             verbose,
             metrics_port,
             name,
@@ -144,6 +159,7 @@ async fn main() {
                 &listen,
                 port,
                 max_job_size,
+                max_jobs_size,
                 binlog_dir.as_deref(),
                 metrics_port,
                 instance_name,

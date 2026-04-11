@@ -196,6 +196,20 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "binlog-total-bytes",
     );
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_size_bytes",
+        "Current in-memory size of all jobs (bodies + per-job overhead + tombstones)",
+        &stats,
+        "current-jobs-size",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_jobs_size_limit_bytes",
+        "Configured --max-jobs-size limit (0 if unlimited)",
+        &stats,
+        "max-jobs-size",
+    );
 
     // Counters
     prom_counter(
@@ -218,6 +232,14 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         "Total connections",
         &stats,
         "total-connections",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_accounting_drift_events_total",
+        "Total times the tick-time drift detector saw a non-zero \
+         current-jobs-size with an empty live set (every increment is a bug)",
+        &stats,
+        "accounting-drift-events",
     );
 
     // Command counters (labeled)
