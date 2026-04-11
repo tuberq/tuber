@@ -2752,47 +2752,46 @@ impl ServerState {
     }
 }
 
-/// Start the beanstalkd server.
-pub async fn run(
-    addr: &str,
-    port: u16,
-    max_job_size: u32,
-    wal_dir: Option<&str>,
-    metrics_port: Option<u16>,
-    name: Option<String>,
-) -> io::Result<()> {
-    let listener = TcpListener::bind((addr, port)).await?;
-    if let Some(ref n) = name {
-        tracing::info!("tuber v{} [{}] listening on {}:{}", env!("CARGO_PKG_VERSION"), n, addr, port);
-    } else {
-        tracing::info!("tuber v{} listening on {}:{}", env!("CARGO_PKG_VERSION"), addr, port);
-    }
-
-    if let Some(mp) = metrics_port {
-        let listen_addr = listener.local_addr()?.ip();
-        let beanstalk_addr = format!("{listen_addr}:{port}");
-        tokio::spawn(async move {
-            if let Err(e) = crate::metrics::serve(listen_addr, mp, beanstalk_addr).await {
-                tracing::error!("metrics server error: {e}");
+/// Sum the on-disk size of all binlog segment files in `dir`, for logging.
+/// Returns 0 if the directory can't be read (e.g. doesn't exist yet).
+fn binlog_total_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with("binlog.") {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
             }
-        });
+        }
     }
-
-    let wal_path = wal_dir.map(Path::new);
-    run_with_listener(listener, max_job_size, wal_path, name).await
+    total
 }
 
-pub async fn run_with_listener(
-    listener: TcpListener,
+/// Build ServerState, replaying the WAL if `wal_dir` is set.
+///
+/// This is the blocking-ish portion of startup — on a large binlog it can take
+/// seconds to minutes and allocate proportional RAM. Callers that care about
+/// TCP readiness (e.g. [`run`]) should complete this step *before* binding the
+/// listener, so the accept port only becomes reachable once the server is
+/// genuinely able to serve commands.
+fn build_state(
     max_job_size: u32,
     wal_dir: Option<&Path>,
     name: Option<String>,
-) -> io::Result<()> {
-    let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
+) -> io::Result<ServerState> {
     let mut state = ServerState::new(max_job_size, name);
 
-    // WAL: open and replay if configured
     if let Some(dir) = wal_dir {
+        let on_disk = binlog_total_bytes(dir);
+        tracing::info!(
+            "WAL: replaying {} bytes from {:?} (not yet accepting connections)",
+            on_disk,
+            dir
+        );
         let mut wal = Wal::open(dir, None)?;
         let (jobs, next_id, tombstones) = wal.replay()?;
         let job_count = jobs.len();
@@ -2806,6 +2805,75 @@ pub async fn run_with_listener(
             dir
         );
     }
+
+    Ok(state)
+}
+
+/// Start the beanstalkd server.
+///
+/// WAL replay runs *before* the TCP listener is bound, so the accept port
+/// only becomes reachable once the server is ready to handle commands. This
+/// makes TCP-level health checks (e.g. `nc -z host 11300`) an honest signal of
+/// readiness — during replay there is nothing to connect to, rather than a
+/// listening socket that silently never calls `accept()`.
+pub async fn run(
+    addr: &str,
+    port: u16,
+    max_job_size: u32,
+    wal_dir: Option<&str>,
+    metrics_port: Option<u16>,
+    name: Option<String>,
+) -> io::Result<()> {
+    // 1. Replay WAL into memory BEFORE binding. A large or corrupted binlog
+    //    must never be able to advertise a listening socket it can't serve.
+    let wal_path = wal_dir.map(Path::new);
+    let state = build_state(max_job_size, wal_path, name.clone())?;
+
+    // 2. Now bind — from this point on, TCP reachability == readiness.
+    let listener = TcpListener::bind((addr, port)).await?;
+    if let Some(ref n) = name {
+        tracing::info!("tuber v{} [{}] listening on {}:{}", env!("CARGO_PKG_VERSION"), n, addr, port);
+    } else {
+        tracing::info!("tuber v{} listening on {}:{}", env!("CARGO_PKG_VERSION"), addr, port);
+    }
+
+    // 3. Spawn the metrics server (also only after replay is complete).
+    if let Some(mp) = metrics_port {
+        let listen_addr = listener.local_addr()?.ip();
+        let beanstalk_addr = format!("{listen_addr}:{port}");
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics::serve(listen_addr, mp, beanstalk_addr).await {
+                tracing::error!("metrics server error: {e}");
+            }
+        });
+    }
+
+    // 4. Run the engine + accept loop with the already-replayed state.
+    serve(listener, state, max_job_size).await
+}
+
+/// Run the server with a pre-bound listener. Used by tests and benches that
+/// need to bind port 0 and learn the ephemeral port before starting the
+/// server. Production startup goes through [`run`] instead, which replays
+/// the WAL before binding.
+pub async fn run_with_listener(
+    listener: TcpListener,
+    max_job_size: u32,
+    wal_dir: Option<&Path>,
+    name: Option<String>,
+) -> io::Result<()> {
+    let state = build_state(max_job_size, wal_dir, name)?;
+    serve(listener, state, max_job_size).await
+}
+
+/// Run the engine task and accept loop with a fully-built [`ServerState`].
+async fn serve(
+    listener: TcpListener,
+    state: ServerState,
+    max_job_size: u32,
+) -> io::Result<()> {
+    let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
+    let mut state = state;
 
     // Engine task
     let _engine_handle = tokio::spawn(async move {
