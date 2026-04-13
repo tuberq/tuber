@@ -21,39 +21,39 @@ enum Commands {
     /// Start the tuber server
     Server {
         /// Listen address
-        #[arg(short = 'l', long, default_value = "0.0.0.0")]
+        #[arg(short = 'l', long, default_value = "0.0.0.0", env = "TUBER_LISTEN")]
         listen: String,
 
         /// Listen port
-        #[arg(short = 'p', long, default_value_t = 11300)]
+        #[arg(short = 'p', long, default_value_t = 11300, env = "TUBER_PORT")]
         port: u16,
 
         /// WAL directory (enables persistence)
-        #[arg(short = 'b', long)]
+        #[arg(short = 'b', long, env = "TUBER_BINLOG_DIR")]
         binlog_dir: Option<String>,
 
         /// Maximum size of a single job's body.
         /// Accepts suffixes: k, m, g, t (e.g. 64k, 1m). Default: 65535.
-        #[arg(short = 'z', long, default_value = "65535", value_parser = parse_max_job_size)]
+        #[arg(short = 'z', long, default_value = "65535", value_parser = parse_max_job_size, env = "TUBER_MAX_JOB_SIZE")]
         max_job_size: u32,
 
         /// Maximum total in-memory size of all jobs (bodies + per-job overhead
         /// + idempotency tombstones). PUT returns OUT_OF_MEMORY once exceeded;
         /// reserve/release/bury/kick/delete always succeed. Accepts suffixes:
         /// k, m, g, t (e.g. 2g, 500M, 100k). Default: unlimited.
-        #[arg(long, value_parser = tuber::server::parse_bytes)]
+        #[arg(long, value_parser = tuber::server::parse_bytes, env = "TUBER_MAX_JOBS_SIZE")]
         max_jobs_size: Option<u64>,
 
         /// Increase verbosity (-V for info, -VV for debug)
-        #[arg(short = 'V', action = clap::ArgAction::Count)]
+        #[arg(short = 'V', action = clap::ArgAction::Count, env = "TUBER_VERBOSE")]
         verbose: u8,
 
         /// Enable Prometheus metrics endpoint on this port
-        #[arg(long)]
+        #[arg(long, env = "TUBER_METRICS_PORT")]
         metrics_port: Option<u16>,
 
-        /// Instance name (falls back to TUBER_NAME env var)
-        #[arg(long)]
+        /// Instance name
+        #[arg(long, env = "TUBER_NAME")]
         name: Option<String>,
     },
 
@@ -154,7 +154,6 @@ async fn main() {
                 _ => tracing::Level::DEBUG,
             };
             tracing_subscriber::fmt().with_max_level(level).init();
-            let instance_name = name.or_else(|| std::env::var("TUBER_NAME").ok());
             if let Err(e) = tuber::server::run(
                 &listen,
                 port,
@@ -162,7 +161,7 @@ async fn main() {
                 max_jobs_size,
                 binlog_dir.as_deref(),
                 metrics_port,
-                instance_name,
+                name,
             )
             .await
             {
