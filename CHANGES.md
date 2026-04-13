@@ -1,5 +1,33 @@
 # Changes
 
+## v0.5.0
+
+**Memory budget, startup readiness, env var config**
+
+- **`--max-jobs-size` memory budget** — new flag (and `TUBER_MAX_JOBS_SIZE` env var) that caps the total in-memory footprint of all jobs. When the budget is full, `put` returns `OUT_OF_MEMORY` — an explicit backpressure signal instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete at capacity. Each job costs `body_len + 512` bytes against the budget; idempotency tombstones cost `key_len + 128`. Accepts human-readable suffixes (`2g`, `500M`, `100k`). Default is unlimited for backward compatibility.
+- **Replay pre-check** — if the WAL on disk is larger than `--max-jobs-size`, tuber aborts at startup with a diagnostic error naming both sizes and what to do, instead of OOMing mid-replay.
+- **Accounting drift detector** — when the queue drains to empty, tuber verifies the internal byte counter is zero. If not, it logs a warning, bumps an `accounting-drift-events` counter (exposed in stats and Prometheus), and self-heals by resetting. Every increment is a bug worth reporting.
+- **Stats and metrics** — new `current-jobs-size`, `max-jobs-size`, and `accounting-drift-events` fields in `stats` output, plus Prometheus gauges `tuber_jobs_size_bytes`, `tuber_jobs_size_limit_bytes`, and counter `tuber_accounting_drift_events_total`.
+- **`--max-job-size` suffix support** — the existing per-job body size limit (`-z`) now accepts the same human-readable suffixes (`-z 64k`, `-z 1m`). Backward compatible — raw integers still work.
+- **Env var support for all server flags** — every `server` subcommand option can now be set via a `TUBER_*` environment variable (`TUBER_LISTEN`, `TUBER_PORT`, `TUBER_BINLOG_DIR`, `TUBER_MAX_JOB_SIZE`, `TUBER_MAX_JOBS_SIZE`, `TUBER_VERBOSE`, `TUBER_METRICS_PORT`, `TUBER_NAME`). Useful for Docker Compose and Kubernetes deployments where env vars are easier than command arrays.
+- **Startup log shows full config** — the startup INFO line now includes `max-job-size`, `max-jobs-size` (if set), `binlog` path (if set), and `metrics` address (if set), so operators can verify the running config from `docker compose logs` without connecting.
+
+## v0.4.2
+
+**Replay WAL before binding listener**
+
+The TCP listener was bound before WAL replay, so the accept port was reachable while the server was still loading the binlog into memory. TCP health checks would pass during replay even though no command could be served — and if replay OOMed, monitors saw a healthy port during the brief window between restart and next OOM. Now `run()` replays the WAL first, then binds. TCP reachability honestly reflects readiness. Also logs the binlog size before replay begins via `Wal::total_disk_bytes()`.
+
+## v0.4.1
+
+**Add floor and min samples to weighted-fair selection**
+
+## v0.4.0
+
+**Weighted-fair reserve mode**
+
+New `reserve-mode weighted-fair` that allocates worker time proportional to tube weights, adjusted for processing time. Prevents slow tubes from starving fast ones.
+
 ## v0.3.15
 
 **IDP priority upgrade on duplicate put**
