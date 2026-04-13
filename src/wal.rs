@@ -14,13 +14,15 @@ use crate::job::{Job, JobState};
 // --- Constants ---
 
 const WAL_MAGIC: &[u8; 4] = b"TWAL";
-const WAL_VERSION: u32 = 3;
+const WAL_VERSION: u32 = 4;
+const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
-const STATE_CHANGE_PAYLOAD_LEN: u32 = 21;
-/// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload(21) + crc(4)
-const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 21 + 4;
+const STATE_CHANGE_PAYLOAD_LEN_V3: u32 = 21;
+const STATE_CHANGE_PAYLOAD_LEN: u32 = 22; // v4: added reason byte
+/// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload(22) + crc(4)
+const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 22 + 4;
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const FILE_PREFIX: &str = "binlog.";
 
@@ -36,6 +38,33 @@ fn state_to_u8(state: JobState) -> u8 {
 }
 
 const STATE_DELETED: u8 = 0xFF;
+
+// --- State change reason encoding ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateChangeReason {
+    None = 0,
+    Reserve = 1,
+    Release = 2,
+    Bury = 3,
+    Kick = 4,
+    Timeout = 5,
+}
+
+fn reason_to_u8(r: StateChangeReason) -> u8 {
+    r as u8
+}
+
+fn u8_to_reason(v: u8) -> StateChangeReason {
+    match v {
+        1 => StateChangeReason::Reserve,
+        2 => StateChangeReason::Release,
+        3 => StateChangeReason::Bury,
+        4 => StateChangeReason::Kick,
+        5 => StateChangeReason::Timeout,
+        _ => StateChangeReason::None,
+    }
+}
 
 fn u8_to_state(v: u8) -> Option<JobState> {
     match v {
@@ -131,6 +160,7 @@ pub enum WalRecord {
         new_priority: u32,
         new_delay_nanos: u64,
         expiry_epoch_secs: u64, // For idempotency tombstones (0 = no tombstone)
+        reason: StateChangeReason,
     },
 }
 
@@ -212,13 +242,14 @@ pub fn serialize_state_change(
     priority: u32,
     delay_nanos: u64,
     expiry_epoch_secs: u64,
+    reason: StateChangeReason,
 ) -> Vec<u8> {
     let mut record = Vec::with_capacity(STATE_CHANGE_RECORD_SIZE);
     record.push(RECORD_TYPE_STATE_CHANGE);
     record.extend_from_slice(&job_id.to_le_bytes());
     record.extend_from_slice(&STATE_CHANGE_PAYLOAD_LEN.to_le_bytes());
 
-    // payload: state + priority + delay_nanos + expiry_epoch_secs
+    // payload: state + priority + delay_nanos + expiry_epoch_secs + reason
     let state_byte = match state {
         Some(s) => state_to_u8(s),
         None => STATE_DELETED,
@@ -227,6 +258,7 @@ pub fn serialize_state_change(
     record.extend_from_slice(&priority.to_le_bytes());
     record.extend_from_slice(&delay_nanos.to_le_bytes());
     record.extend_from_slice(&expiry_epoch_secs.to_le_bytes());
+    record.push(reason_to_u8(reason));
 
     let crc = crc32fast::hash(&record);
     record.extend_from_slice(&crc.to_le_bytes());
@@ -442,20 +474,30 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
 }
 
 fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
-    if data.len() < STATE_CHANGE_RECORD_SIZE {
+    // Determine record size from payload_len to support both v3 (21) and v4 (22)
+    if data.len() < 13 {
         return Err(WalError::Truncated);
+    }
+    let payload_len =
+        u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?);
+    let record_size = (1 + 8 + 4 + payload_len + 4) as usize; // type + id + len + payload + crc
+
+    if data.len() < record_size {
+        return Err(WalError::Truncated);
+    }
+    if payload_len != STATE_CHANGE_PAYLOAD_LEN_V3 && payload_len != STATE_CHANGE_PAYLOAD_LEN {
+        return Err(WalError::InvalidData);
     }
 
     let job_id = u64::from_le_bytes(data[1..9].try_into().map_err(|_| WalError::Truncated)?);
-    let _payload_len = u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?);
 
     // Verify CRC
     let stored_crc = u32::from_le_bytes(
-        data[STATE_CHANGE_RECORD_SIZE - 4..STATE_CHANGE_RECORD_SIZE]
+        data[record_size - 4..record_size]
             .try_into()
             .map_err(|_| WalError::Truncated)?,
     );
-    let computed_crc = crc32fast::hash(&data[..STATE_CHANGE_RECORD_SIZE - 4]);
+    let computed_crc = crc32fast::hash(&data[..record_size - 4]);
     if stored_crc != computed_crc {
         return Err(WalError::BadCrc);
     }
@@ -473,6 +515,12 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
     let expiry_epoch_secs =
         u64::from_le_bytes(data[26..34].try_into().map_err(|_| WalError::Truncated)?);
 
+    let reason = if payload_len >= STATE_CHANGE_PAYLOAD_LEN {
+        u8_to_reason(data[34])
+    } else {
+        StateChangeReason::None
+    };
+
     Ok((
         WalRecord::StateChange {
             job_id,
@@ -480,8 +528,9 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
             new_priority,
             new_delay_nanos,
             expiry_epoch_secs,
+            reason,
         },
-        STATE_CHANGE_RECORD_SIZE,
+        record_size,
     ))
 }
 
@@ -500,7 +549,7 @@ fn read_header(data: &[u8]) -> Result<u32, WalError> {
         return Err(WalError::BadMagic);
     }
     let version = u32::from_le_bytes(data[4..8].try_into().map_err(|_| WalError::Truncated)?);
-    if version != WAL_VERSION {
+    if !(WAL_VERSION_MIN..=WAL_VERSION).contains(&version) {
         return Err(WalError::BadVersion(version));
     }
     let flags = u32::from_le_bytes(data[8..12].try_into().map_err(|_| WalError::Truncated)?);
@@ -785,6 +834,7 @@ impl Wal {
         new_priority: u32,
         new_delay: Duration,
         expiry_epoch_secs: u64,
+        reason: StateChangeReason,
     ) -> io::Result<()> {
         // State changes are allowed to exceed max_file_size
         if self.should_rotate() {
@@ -803,6 +853,7 @@ impl Wal {
             new_priority,
             delay_nanos,
             expiry_epoch_secs,
+            reason,
         );
         let record_len = record.len();
 
@@ -921,6 +972,7 @@ impl Wal {
                                 new_priority,
                                 new_delay_nanos,
                                 expiry_epoch_secs,
+                                reason,
                             } => {
                                 if job_id > max_id {
                                     max_id = job_id;
@@ -967,6 +1019,16 @@ impl Wal {
                                                 job.deadline_at = None;
                                             }
                                             job.reserver_id = None;
+
+                                            // Increment counter based on reason
+                                            match reason {
+                                                StateChangeReason::Reserve => job.reserve_ct += 1,
+                                                StateChangeReason::Release => job.release_ct += 1,
+                                                StateChangeReason::Bury => job.bury_ct += 1,
+                                                StateChangeReason::Kick => job.kick_ct += 1,
+                                                StateChangeReason::Timeout => job.timeout_ct += 1,
+                                                StateChangeReason::None => {}
+                                            }
 
                                             // Do NOT update WAL tracking here.
                                             // The job's wal_file_seq must keep
@@ -1095,7 +1157,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_state_change() {
-        let record = serialize_state_change(99, Some(JobState::Buried), 500, 0, 0);
+        let record = serialize_state_change(99, Some(JobState::Buried), 500, 0, 0, StateChangeReason::Bury);
         assert_eq!(record.len(), STATE_CHANGE_RECORD_SIZE);
 
         let (rec, consumed) = deserialize_record(&record).unwrap();
@@ -1107,6 +1169,7 @@ mod tests {
             new_priority,
             new_delay_nanos,
             expiry_epoch_secs,
+            reason,
         } = rec
         {
             assert_eq!(job_id, 99);
@@ -1114,6 +1177,7 @@ mod tests {
             assert_eq!(new_priority, 500);
             assert_eq!(new_delay_nanos, 0);
             assert_eq!(expiry_epoch_secs, 0);
+            assert_eq!(reason, StateChangeReason::Bury);
         } else {
             panic!("expected StateChange");
         }
@@ -1121,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_state_change_deleted() {
-        let record = serialize_state_change(77, None, 0, 0, 0);
+        let record = serialize_state_change(77, None, 0, 0, 0, StateChangeReason::None);
         let (rec, _) = deserialize_record(&record).unwrap();
 
         if let WalRecord::StateChange { new_state, .. } = rec {
@@ -1133,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_crc32_validation() {
-        let mut record = serialize_state_change(99, Some(JobState::Ready), 0, 0, 0);
+        let mut record = serialize_state_change(99, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
         // Corrupt a byte in the middle
         record[5] ^= 0xFF;
         let result = deserialize_record(&record);
@@ -1257,7 +1321,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_state_change_crc() {
-        let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0, 0);
+        let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0, 0, StateChangeReason::None);
         let len = record.len();
         record[len - 2] ^= 0xFF;
         assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
@@ -1283,7 +1347,7 @@ mod tests {
 
     #[test]
     fn test_invalid_state_byte_in_state_change() {
-        let mut record = serialize_state_change(1, Some(JobState::Ready), 0, 0, 0);
+        let mut record = serialize_state_change(1, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
         // State byte is at offset 13 in state change record
         record[13] = 0xEE; // invalid state (not 0-3 or 0xFF)
         // Recompute CRC
@@ -1580,7 +1644,7 @@ mod tests {
             wal.write_put(&mut job2).unwrap();
 
             // Delete job 1
-            wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0)
+            wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0, StateChangeReason::None)
                 .unwrap();
         }
 
@@ -1662,7 +1726,7 @@ mod tests {
 
         // Delete all but the last job
         for job in jobs.iter_mut().take(19) {
-            wal.write_state_change(job, None, 0, Duration::ZERO, 0).unwrap();
+            wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
         }
 
         // Now most files have dead data — waste ratio should be high
@@ -1701,9 +1765,9 @@ mod tests {
         assert!(count_before_gc > 1, "should have multiple files");
 
         // Delete all jobs so all files become reclaimable except current
-        wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0).unwrap();
-        wal.write_state_change(&mut job2, None, 0, Duration::ZERO, 0).unwrap();
-        wal.write_state_change(&mut job3, None, 0, Duration::ZERO, 0).unwrap();
+        wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
+        wal.write_state_change(&mut job2, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
+        wal.write_state_change(&mut job3, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
 
         wal.gc();
         assert!(
@@ -1734,7 +1798,7 @@ mod tests {
 
         // Delete most jobs (keep only job 20 in the last file)
         for job in jobs.iter_mut().take(19) {
-            wal.write_state_change(job, None, 0, Duration::ZERO, 0).unwrap();
+            wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
         }
 
         // Run gc — should remove leading files with 0 refs
@@ -1792,6 +1856,7 @@ mod tests {
                 pri,
                 Duration::ZERO,
                 0,
+                StateChangeReason::Bury,
             )
             .unwrap();
 
@@ -1858,7 +1923,7 @@ mod tests {
         );
 
         // State change (delete) should consume the single reservation
-        wal.write_state_change(&mut job, None, 10, Duration::ZERO, 0)
+        wal.write_state_change(&mut job, None, 10, Duration::ZERO, 0, StateChangeReason::None)
             .unwrap();
         assert_eq!(wal.reserved_bytes, 0, "delete should consume reservation");
     }
@@ -1873,5 +1938,96 @@ mod tests {
 
         // A record larger than max_file_size
         assert!(!wal.reserve_put(1024));
+    }
+
+    #[test]
+    fn test_replay_restores_counters_from_reason() {
+        // Verifies that state change reason bytes allow replay to reconstruct
+        // per-job counters. Simulates: put → reserve → release → reserve →
+        // timeout → reserve → bury → kick → bury (final state: Buried).
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        {
+            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+
+            let mut job = Job::new(
+                1, 10, Duration::ZERO, Duration::from_secs(60),
+                b"test-body".to_vec(), "default".to_string(),
+            );
+            wal.write_put(&mut job).unwrap();
+
+            // reserve #1
+            job.reserve_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            // release #1
+            job.release_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Ready), 10, Duration::ZERO, 0, StateChangeReason::Release).unwrap();
+            // reserve #2
+            job.reserve_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            // timeout #1
+            job.timeout_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Ready), 10, Duration::ZERO, 0, StateChangeReason::Timeout).unwrap();
+            // reserve #3
+            job.reserve_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            // bury #1
+            job.bury_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Buried), 10, Duration::ZERO, 0, StateChangeReason::Bury).unwrap();
+            // kick #1
+            job.kick_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Ready), 10, Duration::ZERO, 0, StateChangeReason::Kick).unwrap();
+            // reserve #4 (to bury again)
+            job.reserve_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            // bury #2
+            job.bury_ct += 1;
+            wal.write_state_change(&mut job, Some(JobState::Buried), 10, Duration::ZERO, 0, StateChangeReason::Bury).unwrap();
+        }
+
+        // Replay and verify all counters
+        {
+            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let (jobs, _, _) = wal.replay().unwrap();
+
+            let job = jobs.get(&1).expect("job 1 should exist after replay");
+            assert_eq!(job.state, JobState::Buried);
+            assert_eq!(job.reserve_ct, 4, "reserve_ct: 4 reserves");
+            assert_eq!(job.release_ct, 1, "release_ct: 1 release");
+            assert_eq!(job.timeout_ct, 1, "timeout_ct: 1 timeout");
+            assert_eq!(job.bury_ct, 2, "bury_ct: 2 buries");
+            assert_eq!(job.kick_ct, 1, "kick_ct: 1 kick");
+        }
+    }
+
+    #[test]
+    fn test_replay_v3_state_change_no_counter_update() {
+        // Verify that v3 StateChange records (payload_len=21, no reason byte)
+        // are still readable — counters just stay at 0 (backward compatible).
+        let v3_record = {
+            // Manually build a v3 state change record (payload_len=21, no reason byte)
+            let mut record = Vec::new();
+            record.push(RECORD_TYPE_STATE_CHANGE);
+            record.extend_from_slice(&1u64.to_le_bytes()); // job_id
+            record.extend_from_slice(&STATE_CHANGE_PAYLOAD_LEN_V3.to_le_bytes());
+            record.push(state_to_u8(JobState::Buried)); // state
+            record.extend_from_slice(&10u32.to_le_bytes()); // priority
+            record.extend_from_slice(&0u64.to_le_bytes()); // delay_nanos
+            record.extend_from_slice(&0u64.to_le_bytes()); // expiry_epoch_secs
+            let crc = crc32fast::hash(&record);
+            record.extend_from_slice(&crc.to_le_bytes());
+            record
+        };
+        assert_eq!(v3_record.len(), 38); // old size
+
+        let (rec, consumed) = deserialize_record(&v3_record).unwrap();
+        assert_eq!(consumed, 38);
+        if let WalRecord::StateChange { reason, new_state, .. } = rec {
+            assert_eq!(reason, StateChangeReason::None);
+            assert_eq!(new_state, Some(JobState::Buried));
+        } else {
+            panic!("expected StateChange");
+        }
     }
 }

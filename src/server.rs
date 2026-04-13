@@ -11,7 +11,7 @@ use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{Job, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, Response, MAX_DELETE_BATCH};
 use crate::tube::{Tube, TubeStats};
-use crate::wal::{IdpTombstone, Wal};
+use crate::wal::{IdpTombstone, StateChangeReason, Wal};
 
 /// EWMA smoothing factor for all timing stats (processing time, queue time).
 const EWMA_ALPHA: f64 = 0.1;
@@ -726,7 +726,7 @@ impl ServerState {
                     }
                 }
 
-                self.wal_write_state_change(existing_id, Some(state), pri, delay, 0);
+                self.wal_write_state_change(existing_id, Some(state), pri, delay, 0, StateChangeReason::None);
 
                 Some(pri)
             } else {
@@ -1044,6 +1044,8 @@ impl ServerState {
         }
         self.stats.reserved_ct += 1;
 
+        self.wal_write_state_change(job_id, Some(JobState::Reserved), 0, Duration::ZERO, 0, StateChangeReason::Reserve);
+
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.reserved_jobs.push(job_id);
         }
@@ -1203,7 +1205,7 @@ impl ServerState {
         }
 
         // WAL: write delete state change (with tombstone expiry if applicable)
-        self.wal_write_state_change(id, None, 0, Duration::ZERO, expiry_epoch_secs);
+        self.wal_write_state_change(id, None, 0, Duration::ZERO, expiry_epoch_secs, StateChangeReason::None);
 
         self.remove_job(id);
 
@@ -1335,7 +1337,7 @@ impl ServerState {
 
         // WAL: write delete for each job, then remove from jobs map
         for &id in &job_ids {
-            self.wal_write_state_change(id, None, 0, Duration::ZERO, 0);
+            self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
             self.remove_job(id);
         }
 
@@ -1418,6 +1420,7 @@ impl ServerState {
             pri,
             Duration::from_secs(delay as u64),
             0,
+            StateChangeReason::Release,
         );
 
         self.process_queue();
@@ -1471,7 +1474,7 @@ impl ServerState {
         }
 
         // WAL: write bury state change
-        self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO, 0);
+        self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO, 0, StateChangeReason::Bury);
 
         Response::Buried
     }
@@ -1672,7 +1675,7 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0);
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Kick);
                 kicked += 1;
             }
         } else {
@@ -1707,7 +1710,7 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0);
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Kick);
                 kicked += 1;
             }
         }
@@ -1767,7 +1770,7 @@ impl ServerState {
         }
 
         // WAL: write kick state change
-        self.wal_write_state_change(id, Some(JobState::Ready), 0, Duration::ZERO, 0);
+        self.wal_write_state_change(id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Kick);
 
         self.process_queue();
         Response::KickedOne
@@ -2508,6 +2511,7 @@ impl ServerState {
         pri: u32,
         delay: Duration,
         expiry_epoch_secs: u64,
+        reason: StateChangeReason,
     ) {
         if self.wal.is_none() {
             return;
@@ -2515,7 +2519,7 @@ impl ServerState {
         if let Some(mut job) = self.remove_job(job_id) {
             if let Some(wal) = self.wal.as_mut()
                 && let Err(e) =
-                    wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs)
+                    wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs, reason)
             {
                 tracing::error!("WAL write_state_change error: {}, disabling WAL", e);
                 self.wal = None;
@@ -2648,6 +2652,7 @@ impl ServerState {
                         }
                     }
                 }
+                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Timeout);
             }
         }
 
