@@ -62,6 +62,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Per-job priority** | Yes (numeric) | Yes (numeric) | — ⁵ | Yes | Yes | Yes |
 | **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Via plugin |
 | **Batch reserve / delete** | Yes | — | — | — | — | Prefetch |
+| **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory alarms ¹² |
 | **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | In DB ⁸ | — | — |
 | **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | In DB ⁸ | — | — |
 | **Persistence** | WAL (optional) | WAL (optional) | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
@@ -75,7 +76,10 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 ⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.<br>
 ⁷ Sidekiq 7+ tracks execution time per job class in exponential histogram buckets. No percentiles without external APM.<br>
 ⁸ GoodJob stores timestamps in PostgreSQL — you can query for percentiles with SQL, but nothing is computed or displayed by default.<br>
-⁹ Sidekiq's `Queue#latency` returns the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.</sub>
+⁹ Sidekiq's `Queue#latency` returns the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.<br>
+¹⁰ Tuber's `--max-jobs-size` rejects new `put` commands with `OUT_OF_MEMORY` when the budget is full, but workers can always reserve, release, bury, kick, and delete — the queue keeps draining even at capacity.<br>
+¹¹ Redis `maxmemory` with an eviction policy can drop data silently. With `noeviction`, writes fail but Sidekiq has no built-in handling — workers stall on Redis errors.<br>
+¹² RabbitMQ blocks publishers when memory or disk alarms fire, but also blocks consumers on the same connection — a full queue can prevent workers from ACKing messages, causing a deadlock. Tuber's design avoids this by only gating `put`.</sub>
 
 ## What Can You Do With It?
 
