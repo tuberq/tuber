@@ -1,5 +1,24 @@
 # Changes
 
+## v0.5.2
+
+**Fix WAL replay losing per-job counters**
+
+After a restart, `stats-job` showed `reserves: 0`, `buries: 0`, `kicks: 0` for every job — even jobs that had been reserved, buried, and kicked multiple times. The counters (`reserve_ct`, `bury_ct`, `timeout_ct`, `release_ct`, `kick_ct`) were only persisted in the FullJob WAL record written at `put` time (when all counters are 0). Subsequent state transitions wrote StateChange records that carried state/priority/delay but no counter data, so replay restored counters to zero.
+
+Additionally, `reserve` and `timeout` transitions never wrote to the WAL at all, so their counters were lost even within a single WAL file's lifetime.
+
+**Fix:** StateChange records now include a 1-byte "reason" field identifying the transition type (reserve, release, bury, kick, timeout). On replay, the appropriate counter is incremented based on this reason. WAL writes are also added for reserve and timeout transitions that previously had none.
+
+- WAL version bumped from 3 to 4. New tuber reads both v3 and v4 files — v3 StateChange records replay with reason=None (counters stay at 0, no worse than before). Old tuber rejects v4 files cleanly via version check.
+- StateChange record size grows from 38 to 39 bytes (+1 byte for reason).
+
+## v0.5.1
+
+**Env var support for all server flags**
+
+Every `server` subcommand option can now be set via a `TUBER_*` environment variable.
+
 ## v0.5.0
 
 **Memory budget, startup readiness, env var config**
