@@ -152,6 +152,7 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 - **Peek** — inspect jobs without reserving them. Peek by ID, or peek at the next ready/delayed/buried job.
 - **Pause** — temporarily stop a tube from serving jobs.
 - **Persistence** — optional write-ahead log (`-b` flag) for crash recovery.
+- **Memory budget** — `--max-jobs-size` caps the total in-memory footprint of all jobs. PUT returns `OUT_OF_MEMORY` when the budget is exhausted, giving producers an explicit backpressure signal instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete — state transitions never fail due to the budget. Stats (`current-jobs-size`, `max-jobs-size`) and Prometheus gauges (`tuber_jobs_size_bytes`, `tuber_jobs_size_limit_bytes`) let you alert before the budget fills up. The budget also applies at startup: if the WAL is larger than the configured limit (e.g. after tightening the limit on a previously-unbounded server), tuber aborts with a diagnostic error instead of OOMing mid-replay.
 - **Prometheus metrics** — expose a `/metrics` endpoint for monitoring. See [Statistics Reference](docs/statistics.md#prometheus-metrics).
 
 ### Statistics
@@ -405,15 +406,16 @@ The binary will be at `target/release/tuber`.
 tuber server [OPTIONS]
 ```
 
-| Option | Default | Description |
-|---|---|---|
-| `-l`, `--listen` | `0.0.0.0` | Listen address |
-| `-p`, `--port` | `11300` | Listen port |
-| `-b`, `--binlog-dir` | — | WAL directory (enables persistence) |
-| `-z`, `--max-job-size` | `65535` | Max job size in bytes |
-| `-V` | warn | Verbosity (`-V` info, `-VV` debug) |
-| `--metrics-port` | — | Prometheus metrics endpoint port |
-| `--name` | `TUBER_NAME` env | Instance name (shown in stats and metrics) |
+| Option | Env var | Default | Description |
+|---|---|---|---|
+| `-l`, `--listen` | `TUBER_LISTEN` | `0.0.0.0` | Listen address |
+| `-p`, `--port` | `TUBER_PORT` | `11300` | Listen port |
+| `-b`, `--binlog-dir` | `TUBER_BINLOG_DIR` | — | WAL directory (enables persistence) |
+| `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `65535` | Max size of a single job body. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
+| `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | unlimited | Max total in-memory size of all jobs (bodies + per-job overhead + tombstones). PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
+| `-V` | `TUBER_VERBOSE` | warn | Verbosity (`-V` info, `-VV` debug) |
+| `--metrics-port` | `TUBER_METRICS_PORT` | — | Prometheus metrics endpoint port |
+| `--name` | `TUBER_NAME` | — | Instance name (shown in stats and metrics) |
 
 ```bash
 # Listen on a custom port with persistence
@@ -421,6 +423,9 @@ tuber server -p 11301 -b /var/lib/tuber
 
 # Verbose mode with metrics
 tuber server -VV --metrics-port 9100
+
+# Memory-bounded server (Docker-friendly)
+tuber server --max-jobs-size 2g -b /var/lib/tuber --metrics-port 9100
 ```
 
 #### Durability & fsync
