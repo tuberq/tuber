@@ -113,7 +113,7 @@ Structure exists (`op_ct` array in `GlobalStats`) and is wired into `stats` outp
 
 ### WAL Fsync Mode
 
-WAL fsyncs every 100ms (on the server tick), not per-write. There's no configurable mode (`-f 0`, `-f <ms>`, `-F`). Given the tick-based approach, the rate-limited `-f <ms>` mode provides little benefit over the current behaviour. A `--no-fsync` flag for ephemeral workloads could still be useful.
+Done: `--wal-sync-interval` (env `TUBER_WAL_SYNC_INTERVAL`) exposes the fsync cadence. `0` means per-write (strongest durability); a positive duration bounds how much committed state can be lost on crash. Writes are buffered through a 64 KiB `BufWriter` so the syscall count stays low in all modes.
 
 ## Future
 
@@ -138,6 +138,39 @@ Compress job bodies in memory and in the WAL using zstd. Decompress transparentl
 - Reduces both memory footprint and WAL disk usage
 - Skip compression for small bodies (e.g. <64 bytes) where overhead exceeds savings
 - Could be a server flag: `--compress` or `--compress-min-size <bytes>`
+
+### OIDC / Bearer Token Authentication
+
+Add optional authentication to the text protocol via an `AUTH` command:
+
+```
+AUTH bearer <token>\r\n
+```
+
+Response: `OK\r\n` or `UNAUTHORIZED\r\n`
+
+**Design:**
+
+- Per-connection auth — validate once at connect, all commands return `UNAUTHORIZED` until `AUTH` succeeds
+- Server validates JWTs locally using the OIDC provider's JWKS (fetched at startup, refreshed periodically)
+- No per-command round-trip to the IdP — just signature + claims checks (`exp`, `iss`, `aud`)
+- Rust crates: `jsonwebtoken` for validation, `reqwest` for JWKS fetching
+- Server flags: `--oidc-issuer <url>` and `--oidc-audience <aud>`
+
+**Optional authorization via JWT scopes/claims:**
+
+| Scope | Capabilities |
+|---|---|
+| `tuber:producer` | `use`, `put` |
+| `tuber:worker` | `watch`, `reserve`, `delete`, `release`, `bury`, `touch` |
+| `tuber:admin` | `stats`, `flush-tube`, `kick`, `pause-tube` |
+
+Maps naturally onto the existing connection type bitmask (`CONN_TYPE_PRODUCER`, `CONN_TYPE_WORKER`).
+
+**Open questions:**
+
+- Token revocation mid-session: re-validate on a timer, or just let tokens expire naturally?
+- Should unauthenticated mode remain the default (auth only when `--oidc-issuer` is set)?
 
 ## Known Pain Points (C version) That Rust Helps With
 

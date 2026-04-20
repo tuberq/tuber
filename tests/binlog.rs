@@ -27,9 +27,14 @@ impl TestServer {
         let wal_dir_clone = wal_dir.clone();
 
         let handle = tokio::spawn(async move {
-            tuber::server::run_with_listener(listener, max_job_size, Some(wal_dir_clone.as_path()), None)
-                .await
-                .ok();
+            tuber::server::run_with_listener(
+                listener,
+                max_job_size,
+                Some(wal_dir_clone.as_path()),
+                None,
+            )
+            .await
+            .ok();
         });
 
         // Give the server a moment to start
@@ -619,7 +624,11 @@ async fn test_wal_replay_concurrency_limit() {
     // acquire_concurrency_key sets count=1, limit=3
     c2.mustsend("reserve-with-timeout 0\r\n").await;
     let line = c2.readline().await;
-    assert!(line.starts_with("RESERVED"), "expected RESERVED, got {:?}", line);
+    assert!(
+        line.starts_with("RESERVED"),
+        "expected RESERVED, got {:?}",
+        line
+    );
     let _ = c2.readline().await;
 
     // Reserve second job — BUG: without the fix, is_concurrency_blocked sees
@@ -627,13 +636,21 @@ async fn test_wal_replay_concurrency_limit() {
     // With the fix, limit is correctly restored to 3 so count=1 < 3 passes.
     c2.mustsend("reserve-with-timeout 0\r\n").await;
     let line = c2.readline().await;
-    assert!(line.starts_with("RESERVED"), "expected second RESERVED after restart, got {:?} (concurrency limit not restored)", line);
+    assert!(
+        line.starts_with("RESERVED"),
+        "expected second RESERVED after restart, got {:?} (concurrency limit not restored)",
+        line
+    );
     let _ = c2.readline().await;
 
     // Reserve third — should also succeed (count=2 < limit=3)
     c2.mustsend("reserve-with-timeout 0\r\n").await;
     let line = c2.readline().await;
-    assert!(line.starts_with("RESERVED"), "expected third RESERVED after restart, got {:?}", line);
+    assert!(
+        line.starts_with("RESERVED"),
+        "expected third RESERVED after restart, got {:?}",
+        line
+    );
     let _ = c2.readline().await;
 }
 
@@ -658,7 +675,9 @@ async fn test_binlog_replay_aborts_when_over_budget() {
 
     // Second run: tight --max-jobs-size (100 bytes) must fail replay loudly.
     let result = TestServer::try_start_with_wal_and_max_jobs_size(&wal_dir, 100).await;
-    let err = result.err().expect("expected replay to abort with an error");
+    let err = result
+        .err()
+        .expect("expected replay to abort with an error");
     assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
     let msg = err.to_string();
     assert!(

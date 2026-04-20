@@ -1428,10 +1428,18 @@ async fn test_stats_format_complete() {
     // rusage-maxrss should be a non-negative integer
     for line in body.lines() {
         if line.starts_with("rusage-maxrss:") {
-            let val: i64 = line.split(':').nth(1).unwrap().trim().parse().expect(
-                "rusage-maxrss should be an integer",
+            let val: i64 = line
+                .split(':')
+                .nth(1)
+                .unwrap()
+                .trim()
+                .parse()
+                .expect("rusage-maxrss should be an integer");
+            assert!(
+                val >= 0,
+                "rusage-maxrss should be non-negative, got: {}",
+                val
             );
-            assert!(val >= 0, "rusage-maxrss should be non-negative, got: {}", val);
         }
     }
 }
@@ -4568,7 +4576,12 @@ async fn test_stats_tube_new_fields_present() {
         "processing-time-p99:",
         "bury-rate:",
     ] {
-        assert!(body.contains(field), "{} missing from stats-tube: {}", field, body);
+        assert!(
+            body.contains(field),
+            "{} missing from stats-tube: {}",
+            field,
+            body
+        );
     }
 }
 
@@ -4765,14 +4778,16 @@ async fn test_stats_tube_ewma_values_plausible() {
     assert!(
         ewma_fast < 0.1,
         "fast ewma {:.6} should be < 0.1s: {}",
-        ewma_fast, body
+        ewma_fast,
+        body
     );
 
     // Slow EWMA should be roughly 200ms (between 150ms and 400ms to allow for scheduling jitter)
     assert!(
         ewma_slow > 0.15 && ewma_slow < 0.4,
         "slow ewma {:.6} should be ~0.2s: {}",
-        ewma_slow, body
+        ewma_slow,
+        body
     );
 }
 
@@ -4801,19 +4816,24 @@ async fn test_stats_tube_percentiles_with_varied_times() {
     assert!(
         p50 <= p95 && p95 <= p99,
         "percentiles should be ordered: p50={:.6} p95={:.6} p99={:.6}: {}",
-        p50, p95, p99, body
+        p50,
+        p95,
+        p99,
+        body
     );
 
     // All should be in the 100ms-500ms range (with scheduling jitter margin)
     assert!(
         p50 > 0.1 && p50 < 0.5,
         "p50 {:.6} should be ~0.2s: {}",
-        p50, body
+        p50,
+        body
     );
     assert!(
         p99 > 0.1 && p99 < 0.6,
         "p99 {:.6} should be ~0.3s: {}",
-        p99, body
+        p99,
+        body
     );
 }
 
@@ -4851,14 +4871,19 @@ async fn test_stats_tube_bimodal_split() {
     assert!(
         ewma_overall > ewma_fast && ewma_overall < ewma_slow,
         "overall ewma {:.6} should be between fast {:.6} and slow {:.6}: {}",
-        ewma_overall, ewma_fast, ewma_slow, body
+        ewma_overall,
+        ewma_fast,
+        ewma_slow,
+        body
     );
 
     // The split EWMAs should be far apart (orders of magnitude)
     assert!(
         ewma_slow / ewma_fast > 100.0,
         "slow/fast ratio should be large: slow={:.6} fast={:.6}: {}",
-        ewma_slow, ewma_fast, body
+        ewma_slow,
+        ewma_fast,
+        body
     );
 }
 
@@ -4880,7 +4905,12 @@ async fn test_stats_tube_queue_time_fields_present() {
         "queue-time-max:",
         "queue-time-samples:",
     ] {
-        assert!(body.contains(field), "{} missing from stats-tube: {}", field, body);
+        assert!(
+            body.contains(field),
+            "{} missing from stats-tube: {}",
+            field,
+            body
+        );
     }
 }
 
@@ -4904,7 +4934,8 @@ async fn test_stats_tube_queue_time_immediate_reserve() {
     assert!(
         ewma < 0.1,
         "queue-time-ewma {:.6} should be near zero for immediate reserve: {}",
-        ewma, body
+        ewma,
+        body
     );
 }
 
@@ -4933,7 +4964,8 @@ async fn test_stats_tube_queue_time_delayed_reserve() {
     assert!(
         ewma > 0.15 && ewma < 0.4,
         "queue-time-ewma {:.6} should be ~0.2s: {}",
-        ewma, body
+        ewma,
+        body
     );
 }
 

@@ -191,6 +191,28 @@ Corrupt or truncated records terminate processing of that file (with a warning).
 Valid records before the corruption point are preserved. The file is truncated
 at the corrupt offset to prevent repeated warnings on future restarts.
 
+## Durability
+
+Writes pass through a 64 KiB userland `BufWriter` to amortise syscall overhead.
+`fsync` cadence is controlled by `--wal-sync-interval` (env
+`TUBER_WAL_SYNC_INTERVAL`, default `100ms`):
+
+- **`--wal-sync-interval 0`** — the buffer is flushed and `fsync` runs on every
+  put/state-change *before* the server acknowledges the client. Zero ack-vs-durable
+  window; the engine task blocks on fsync, so throughput drops sharply.
+- **`--wal-sync-interval <duration>`** (e.g. `100ms`, `1s`) — writes are buffered
+  and `fsync` runs at most once per interval, plus once on segment rotation and
+  once on clean shutdown (`flush_and_sync`). Up to `interval` of acknowledged
+  records can be lost on a crash. On clean shutdown the tail is always synced
+  regardless of interval.
+
+There is no "never fsync" mode: if you don't care about durability at all, don't
+pass `-b`/`--binlog-dir`. Setting a very large interval (e.g. `24h`) approximates
+that behaviour while still syncing on clean shutdown.
+
+When `sync_interval` is shorter than the engine's 100 ms tick, the tick shortens
+to match so fsyncs don't back up behind tick cadence.
+
 ## File Management
 
 ### Segmentation and Rotation

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,11 @@ const STATE_CHANGE_PAYLOAD_LEN: u32 = 22; // v4: added reason byte
 const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 22 + 4;
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const FILE_PREFIX: &str = "binlog.";
+/// Userland write buffer capacity per WAL file. Amortises syscall overhead.
+/// Durability is not affected: every path that calls `sync_all` first calls `flush`.
+const BUF_CAPACITY: usize = 64 * 1024;
+/// Default interval between fsyncs. `Duration::ZERO` means fsync on every write.
+pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 // --- State encoding ---
 
@@ -478,8 +483,7 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
     if data.len() < 13 {
         return Err(WalError::Truncated);
     }
-    let payload_len =
-        u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?);
+    let payload_len = u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?);
     let record_size = (1 + 8 + 4 + payload_len + 4) as usize; // type + id + len + payload + crc
 
     if data.len() < record_size {
@@ -561,14 +565,46 @@ fn read_header(data: &[u8]) -> Result<u32, WalError> {
 struct WalFile {
     seq: u64,
     path: PathBuf,
-    fd: Option<File>,
+    fd: Option<BufWriter<File>>,
     refs: u64,
     bytes_written: usize,
+}
+
+/// Configuration for [`Wal::open`].
+#[derive(Debug, Clone)]
+pub struct WalConfig {
+    /// Maximum size of a single segment file before rotation. `None` uses [`DEFAULT_MAX_FILE_SIZE`].
+    pub max_file_size: Option<usize>,
+    /// Minimum interval between fsyncs. `Duration::ZERO` fsyncs on every write
+    /// (blocking the caller until durable). Positive values bound how much committed
+    /// state can be lost on crash.
+    pub sync_interval: Duration,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        WalConfig {
+            max_file_size: None,
+            sync_interval: DEFAULT_SYNC_INTERVAL,
+        }
+    }
+}
+
+impl WalConfig {
+    /// Convenience for callers that only need to override the file size.
+    pub fn with_max_file_size(max: usize) -> Self {
+        WalConfig {
+            max_file_size: Some(max),
+            sync_interval: DEFAULT_SYNC_INTERVAL,
+        }
+    }
 }
 
 pub struct Wal {
     dir: PathBuf,
     max_file_size: usize,
+    sync_interval: Duration,
+    last_sync_at: Instant,
     files: VecDeque<WalFile>,
     next_seq: u64,
     reserved_bytes: u64,
@@ -576,6 +612,8 @@ pub struct Wal {
     records_migrated: u64,
     #[allow(dead_code)] // held for flock side effect
     lock_fd: Option<File>,
+    #[cfg(test)]
+    sync_count: u64,
 }
 
 impl Wal {
@@ -641,25 +679,34 @@ impl Wal {
         Some((oldest_seq, ratio as usize))
     }
 
-    pub fn open(dir: &Path, max_file_size: Option<usize>) -> io::Result<Self> {
+    pub fn open(dir: &Path, config: WalConfig) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
         let lock_fd = Self::acquire_lock(dir)?;
 
         let mut wal = Wal {
             dir: dir.to_path_buf(),
-            max_file_size: max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
+            max_file_size: config.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
+            sync_interval: config.sync_interval,
+            last_sync_at: Instant::now(),
             files: VecDeque::new(),
             next_seq: 1,
             reserved_bytes: 0,
             alive_bytes: 0,
             records_migrated: 0,
             lock_fd: Some(lock_fd),
+            #[cfg(test)]
+            sync_count: 0,
         };
 
         wal.scan_dir()?;
 
         Ok(wal)
+    }
+
+    /// Returns the configured fsync interval. `Duration::ZERO` means per-write.
+    pub fn sync_interval(&self) -> Duration {
+        self.sync_interval
     }
 
     fn acquire_lock(dir: &Path) -> io::Result<File> {
@@ -729,12 +776,13 @@ impl Wal {
         self.next_seq += 1;
         let path = self.file_path(seq);
 
-        let mut fd = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
 
+        let mut fd = BufWriter::with_capacity(BUF_CAPACITY, file);
         write_header(&mut fd)?;
 
         self.files.push_back(WalFile {
@@ -766,9 +814,15 @@ impl Wal {
         if self.should_rotate() {
             // Close current file
             if let Some(f) = self.files.back_mut()
-                && let Some(fd) = f.fd.take()
+                && let Some(mut fd) = f.fd.take()
             {
-                fd.sync_all()?;
+                fd.flush()?;
+                fd.get_ref().sync_all()?;
+                #[cfg(test)]
+                {
+                    self.sync_count += 1;
+                }
+                self.last_sync_at = Instant::now();
             }
             self.create_next_file()?;
         }
@@ -792,6 +846,7 @@ impl Wal {
         let record = serialize_full_job(job);
         let record_len = record.len();
 
+        let sync_per_write = self.sync_interval.is_zero();
         let file = self.current_file_mut()?;
         let fd = file
             .fd
@@ -799,6 +854,10 @@ impl Wal {
             .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
         fd.write_all(&record)?;
         file.bytes_written += record_len;
+        if sync_per_write {
+            fd.flush()?;
+            fd.get_ref().sync_all()?;
+        }
 
         // Update job's WAL tracking
         let old_seq = job.wal_file_seq;
@@ -824,6 +883,14 @@ impl Wal {
             self.reserved_bytes += STATE_CHANGE_RECORD_SIZE as u64;
         }
 
+        if sync_per_write {
+            #[cfg(test)]
+            {
+                self.sync_count += 1;
+            }
+            self.last_sync_at = Instant::now();
+        }
+
         Ok(())
     }
 
@@ -839,9 +906,15 @@ impl Wal {
         // State changes are allowed to exceed max_file_size
         if self.should_rotate() {
             if let Some(f) = self.files.back_mut()
-                && let Some(fd) = f.fd.take()
+                && let Some(mut fd) = f.fd.take()
             {
-                fd.sync_all()?;
+                fd.flush()?;
+                fd.get_ref().sync_all()?;
+                #[cfg(test)]
+                {
+                    self.sync_count += 1;
+                }
+                self.last_sync_at = Instant::now();
             }
             self.create_next_file()?;
         }
@@ -857,6 +930,7 @@ impl Wal {
         );
         let record_len = record.len();
 
+        let sync_per_write = self.sync_interval.is_zero();
         let file = self.current_file_mut()?;
         let fd = file
             .fd
@@ -864,6 +938,10 @@ impl Wal {
             .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
         fd.write_all(&record)?;
         file.bytes_written += record_len;
+        if sync_per_write {
+            fd.flush()?;
+            fd.get_ref().sync_all()?;
+        }
 
         // Release reservation
         self.reserved_bytes = self
@@ -883,6 +961,14 @@ impl Wal {
             // containing the FullJob record, since StateChange records don't
             // carry the full job body. Moving the ref would allow GC to delete
             // the FullJob's file, causing silent data loss on replay.
+        }
+
+        if sync_per_write {
+            #[cfg(test)]
+            {
+                self.sync_count += 1;
+            }
+            self.last_sync_at = Instant::now();
         }
 
         Ok(())
@@ -1085,16 +1171,53 @@ impl Wal {
         }
     }
 
-    /// Run GC and sync the current file.
+    /// Run GC and, if the configured interval has elapsed, fsync the current file.
+    ///
+    /// The userland buffer is always flushed so that GC, stats, and replay see a
+    /// consistent view. The fsync itself is skipped when `sync_interval` is zero
+    /// (writes already synced inline) or when the interval has not yet elapsed.
     pub fn maintain(&mut self) {
         self.gc();
 
-        // Sync current file
         if let Some(f) = self.files.back_mut()
-            && let Some(fd) = f.fd.as_ref()
+            && let Some(fd) = f.fd.as_mut()
         {
-            let _ = fd.sync_all();
+            // Always flush userland buffer.
+            let _ = fd.flush();
+
+            // Skip interval sync when interval=0 — writes already synced inline.
+            if !self.sync_interval.is_zero() && self.last_sync_at.elapsed() >= self.sync_interval {
+                let _ = fd.get_ref().sync_all();
+                #[cfg(test)]
+                {
+                    self.sync_count += 1;
+                }
+                self.last_sync_at = Instant::now();
+            }
         }
+    }
+
+    /// Flush the userland buffer and fsync the current file unconditionally.
+    /// Used on shutdown to guarantee the buffered tail reaches disk regardless
+    /// of the configured sync interval.
+    pub fn flush_and_sync(&mut self) {
+        if let Some(f) = self.files.back_mut()
+            && let Some(fd) = f.fd.as_mut()
+        {
+            let _ = fd.flush();
+            let _ = fd.get_ref().sync_all();
+            #[cfg(test)]
+            {
+                self.sync_count += 1;
+            }
+            self.last_sync_at = Instant::now();
+        }
+    }
+
+    /// Test-only: number of `sync_all` calls observed since the WAL was opened.
+    #[cfg(test)]
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count
     }
 }
 
@@ -1157,7 +1280,14 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_state_change() {
-        let record = serialize_state_change(99, Some(JobState::Buried), 500, 0, 0, StateChangeReason::Bury);
+        let record = serialize_state_change(
+            99,
+            Some(JobState::Buried),
+            500,
+            0,
+            0,
+            StateChangeReason::Bury,
+        );
         assert_eq!(record.len(), STATE_CHANGE_RECORD_SIZE);
 
         let (rec, consumed) = deserialize_record(&record).unwrap();
@@ -1197,7 +1327,8 @@ mod tests {
 
     #[test]
     fn test_crc32_validation() {
-        let mut record = serialize_state_change(99, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
+        let mut record =
+            serialize_state_change(99, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
         // Corrupt a byte in the middle
         record[5] ^= 0xFF;
         let result = deserialize_record(&record);
@@ -1321,7 +1452,8 @@ mod tests {
 
     #[test]
     fn test_corrupted_state_change_crc() {
-        let mut record = serialize_state_change(1, Some(JobState::Ready), 100, 0, 0, StateChangeReason::None);
+        let mut record =
+            serialize_state_change(1, Some(JobState::Ready), 100, 0, 0, StateChangeReason::None);
         let len = record.len();
         record[len - 2] ^= 0xFF;
         assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
@@ -1347,7 +1479,8 @@ mod tests {
 
     #[test]
     fn test_invalid_state_byte_in_state_change() {
-        let mut record = serialize_state_change(1, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
+        let mut record =
+            serialize_state_change(1, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
         // State byte is at offset 13 in state change record
         record[13] = 0xEE; // invalid state (not 0-3 or 0xFF)
         // Recompute CRC
@@ -1398,7 +1531,7 @@ mod tests {
 
         // Write two valid jobs, then corrupt the file by appending garbage
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
 
             let mut job1 = Job::new(
                 1,
@@ -1436,7 +1569,7 @@ mod tests {
         }
 
         // Replay should recover both valid jobs, skip the garbage
-        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
         let (jobs, next_id, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 2);
         assert!(jobs.contains_key(&1));
@@ -1451,7 +1584,7 @@ mod tests {
 
         // Write one valid job
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
             let mut job1 = Job::new(
                 1,
                 10,
@@ -1476,7 +1609,7 @@ mod tests {
         }
 
         // Replay should skip the bad file, recover nothing
-        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
         let (jobs, _, _) = wal.replay().unwrap();
         assert!(jobs.is_empty());
     }
@@ -1488,7 +1621,7 @@ mod tests {
 
         // Write two jobs
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
             let mut job1 = Job::new(
                 1,
                 10,
@@ -1523,7 +1656,7 @@ mod tests {
         }
 
         // Should recover job 1 only
-        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
         let (jobs, next_id, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs.contains_key(&1));
@@ -1535,7 +1668,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
 
-        let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
 
         // Before any writes, no files
         assert_eq!(wal.file_count(), 0);
@@ -1553,7 +1686,10 @@ mod tests {
         wal.write_put(&mut job1).unwrap();
 
         assert_eq!(wal.file_count(), 1);
-        assert!(wal.total_disk_bytes() > 0, "should have bytes after a write");
+        assert!(
+            wal.total_disk_bytes() > 0,
+            "should have bytes after a write"
+        );
 
         let bytes_after_one = wal.total_disk_bytes();
 
@@ -1581,7 +1717,7 @@ mod tests {
         let dir_path = dir.path();
 
         // Very small max file size to force rotation
-        let mut wal = Wal::open(dir_path, Some(64)).unwrap();
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(64)).unwrap();
 
         let mut job1 = Job::new(
             1,
@@ -1621,7 +1757,7 @@ mod tests {
 
         // Write some records
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
 
             let mut job1 = Job::new(
                 1,
@@ -1644,13 +1780,20 @@ mod tests {
             wal.write_put(&mut job2).unwrap();
 
             // Delete job 1
-            wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0, StateChangeReason::None)
-                .unwrap();
+            wal.write_state_change(
+                &mut job1,
+                None,
+                0,
+                Duration::ZERO,
+                0,
+                StateChangeReason::None,
+            )
+            .unwrap();
         }
 
         // Replay
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
             let (jobs, next_id, _) = wal.replay().unwrap();
 
             // Job 1 was deleted
@@ -1669,11 +1812,15 @@ mod tests {
     #[test]
     fn test_compaction_target_none_when_single_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(dir.path(), Some(1024 * 1024)).unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1024 * 1024)).unwrap();
 
         let mut job = Job::new(
-            1, 10, Duration::ZERO, Duration::from_secs(60),
-            b"body".to_vec(), "default".to_string(),
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body".to_vec(),
+            "default".to_string(),
         );
         wal.write_put(&mut job).unwrap();
 
@@ -1685,13 +1832,17 @@ mod tests {
     fn test_compaction_target_none_when_low_waste() {
         let dir = tempfile::tempdir().unwrap();
         // Use a large file size so all jobs fit in two files with low waste
-        let mut wal = Wal::open(dir.path(), Some(4096)).unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(4096)).unwrap();
 
         // Write jobs that span exactly 2 files
         for i in 1..=50 {
             let mut job = Job::new(
-                i, 10, Duration::ZERO, Duration::from_secs(60),
-                b"body".to_vec(), "default".to_string(),
+                i,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job).unwrap();
         }
@@ -1709,14 +1860,18 @@ mod tests {
     fn test_compaction_target_some_when_high_waste() {
         let dir = tempfile::tempdir().unwrap();
         // Small file size to force many files
-        let mut wal = Wal::open(dir.path(), Some(128)).unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(128)).unwrap();
 
         // Write many jobs then delete them all except one
         let mut jobs: Vec<Job> = Vec::new();
         for i in 1..=20 {
             let mut job = Job::new(
-                i, 10, Duration::ZERO, Duration::from_secs(60),
-                b"body".to_vec(), "default".to_string(),
+                i,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job).unwrap();
             jobs.push(job);
@@ -1726,12 +1881,16 @@ mod tests {
 
         // Delete all but the last job
         for job in jobs.iter_mut().take(19) {
-            wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
+            wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None)
+                .unwrap();
         }
 
         // Now most files have dead data — waste ratio should be high
         let target = wal.compaction_target();
-        assert!(target.is_some(), "should have a compaction target with high waste");
+        assert!(
+            target.is_some(),
+            "should have a compaction target with high waste"
+        );
         let (seq, count) = target.unwrap();
         assert_eq!(seq, wal.oldest_seq());
         assert!(count >= 2, "ratio should be >= 2, got {}", count);
@@ -1741,23 +1900,35 @@ mod tests {
     fn test_gc_after_all_refs_removed() {
         let dir = tempfile::tempdir().unwrap();
         // Very small file size to force each job into its own file
-        let mut wal = Wal::open(dir.path(), Some(64)).unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(64)).unwrap();
 
         let mut job1 = Job::new(
-            1, 10, Duration::ZERO, Duration::from_secs(60),
-            b"body1".to_vec(), "default".to_string(),
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body1".to_vec(),
+            "default".to_string(),
         );
         wal.write_put(&mut job1).unwrap();
 
         let mut job2 = Job::new(
-            2, 10, Duration::ZERO, Duration::from_secs(60),
-            b"body2".to_vec(), "default".to_string(),
+            2,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body2".to_vec(),
+            "default".to_string(),
         );
         wal.write_put(&mut job2).unwrap();
 
         let mut job3 = Job::new(
-            3, 10, Duration::ZERO, Duration::from_secs(60),
-            b"body3".to_vec(), "default".to_string(),
+            3,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body3".to_vec(),
+            "default".to_string(),
         );
         wal.write_put(&mut job3).unwrap();
 
@@ -1765,9 +1936,33 @@ mod tests {
         assert!(count_before_gc > 1, "should have multiple files");
 
         // Delete all jobs so all files become reclaimable except current
-        wal.write_state_change(&mut job1, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
-        wal.write_state_change(&mut job2, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
-        wal.write_state_change(&mut job3, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
+        wal.write_state_change(
+            &mut job1,
+            None,
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
+        wal.write_state_change(
+            &mut job2,
+            None,
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
+        wal.write_state_change(
+            &mut job3,
+            None,
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
 
         wal.gc();
         assert!(
@@ -1781,14 +1976,18 @@ mod tests {
     #[test]
     fn test_compaction_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(dir.path(), Some(128)).unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(128)).unwrap();
 
         // Create jobs spanning multiple files
         let mut jobs: Vec<Job> = Vec::new();
         for i in 1..=20 {
             let mut job = Job::new(
-                i, 10, Duration::ZERO, Duration::from_secs(60),
-                b"data".to_vec(), "default".to_string(),
+                i,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"data".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job).unwrap();
             jobs.push(job);
@@ -1798,7 +1997,8 @@ mod tests {
 
         // Delete most jobs (keep only job 20 in the last file)
         for job in jobs.iter_mut().take(19) {
-            wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None).unwrap();
+            wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None)
+                .unwrap();
         }
 
         // Run gc — should remove leading files with 0 refs
@@ -1836,7 +2036,7 @@ mod tests {
 
         // Use a tiny max file size so the put and state change land in different files
         {
-            let mut wal = Wal::open(dir.path(), Some(64)).unwrap();
+            let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(64)).unwrap();
 
             let mut job = Job::new(
                 1,
@@ -1876,13 +2076,10 @@ mod tests {
 
         // Reopen and replay — job must survive
         {
-            let mut wal = Wal::open(dir.path(), Some(64)).unwrap();
+            let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(64)).unwrap();
             let (jobs, _next_id, _tombstones) = wal.replay().unwrap();
 
-            assert!(
-                jobs.contains_key(&1),
-                "job 1 must survive replay after GC"
-            );
+            assert!(jobs.contains_key(&1), "job 1 must survive replay after GC");
             let job = jobs.get(&1).unwrap();
             assert_eq!(job.state, JobState::Buried);
             assert_eq!(job.body, b"important-data");
@@ -1892,7 +2089,7 @@ mod tests {
     #[test]
     fn test_compaction_migration_does_not_leak_reserved_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(dir.path(), Some(512)).unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(512)).unwrap();
 
         let mut job = Job::new(
             1,
@@ -1923,15 +2120,22 @@ mod tests {
         );
 
         // State change (delete) should consume the single reservation
-        wal.write_state_change(&mut job, None, 10, Duration::ZERO, 0, StateChangeReason::None)
-            .unwrap();
+        wal.write_state_change(
+            &mut job,
+            None,
+            10,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
         assert_eq!(wal.reserved_bytes, 0, "delete should consume reservation");
     }
 
     #[test]
     fn test_reserve_put_rejects_oversized_record() {
         let dir = tempfile::tempdir().unwrap();
-        let wal = Wal::open(dir.path(), Some(512)).unwrap();
+        let wal = Wal::open(dir.path(), WalConfig::with_max_file_size(512)).unwrap();
 
         // A record that fits
         assert!(wal.reserve_put(100));
@@ -1949,46 +2153,122 @@ mod tests {
         let dir_path = dir.path();
 
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
 
             let mut job = Job::new(
-                1, 10, Duration::ZERO, Duration::from_secs(60),
-                b"test-body".to_vec(), "default".to_string(),
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"test-body".to_vec(),
+                "default".to_string(),
             );
             wal.write_put(&mut job).unwrap();
 
             // reserve #1
             job.reserve_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Reserved),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Reserve,
+            )
+            .unwrap();
             // release #1
             job.release_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Ready), 10, Duration::ZERO, 0, StateChangeReason::Release).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Ready),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Release,
+            )
+            .unwrap();
             // reserve #2
             job.reserve_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Reserved),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Reserve,
+            )
+            .unwrap();
             // timeout #1
             job.timeout_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Ready), 10, Duration::ZERO, 0, StateChangeReason::Timeout).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Ready),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Timeout,
+            )
+            .unwrap();
             // reserve #3
             job.reserve_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Reserved),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Reserve,
+            )
+            .unwrap();
             // bury #1
             job.bury_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Buried), 10, Duration::ZERO, 0, StateChangeReason::Bury).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Buried),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Bury,
+            )
+            .unwrap();
             // kick #1
             job.kick_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Ready), 10, Duration::ZERO, 0, StateChangeReason::Kick).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Ready),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Kick,
+            )
+            .unwrap();
             // reserve #4 (to bury again)
             job.reserve_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Reserved), 10, Duration::ZERO, 0, StateChangeReason::Reserve).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Reserved),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Reserve,
+            )
+            .unwrap();
             // bury #2
             job.bury_ct += 1;
-            wal.write_state_change(&mut job, Some(JobState::Buried), 10, Duration::ZERO, 0, StateChangeReason::Bury).unwrap();
+            wal.write_state_change(
+                &mut job,
+                Some(JobState::Buried),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Bury,
+            )
+            .unwrap();
         }
 
         // Replay and verify all counters
         {
-            let mut wal = Wal::open(dir_path, Some(1024 * 1024)).unwrap();
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
             let (jobs, _, _) = wal.replay().unwrap();
 
             let job = jobs.get(&1).expect("job 1 should exist after replay");
@@ -2023,11 +2303,183 @@ mod tests {
 
         let (rec, consumed) = deserialize_record(&v3_record).unwrap();
         assert_eq!(consumed, 38);
-        if let WalRecord::StateChange { reason, new_state, .. } = rec {
+        if let WalRecord::StateChange {
+            reason, new_state, ..
+        } = rec
+        {
             assert_eq!(reason, StateChangeReason::None);
             assert_eq!(new_state, Some(JobState::Buried));
         } else {
             panic!("expected StateChange");
         }
+    }
+
+    // --- Sync-mode / buffering tests ---
+
+    fn config_with_interval(max: usize, interval: Duration) -> WalConfig {
+        WalConfig {
+            max_file_size: Some(max),
+            sync_interval: interval,
+        }
+    }
+
+    #[test]
+    fn test_sync_interval_zero_syncs_per_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(
+            dir.path(),
+            config_with_interval(1024 * 1024, Duration::ZERO),
+        )
+        .unwrap();
+
+        let baseline = wal.sync_count();
+
+        let mut job1 = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"a".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job1).unwrap();
+        let mut job2 = Job::new(
+            2,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"b".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job2).unwrap();
+        wal.write_state_change(
+            &mut job1,
+            None,
+            10,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
+
+        // 3 writes × 1 sync each = 3 additional syncs.
+        assert_eq!(wal.sync_count() - baseline, 3);
+    }
+
+    #[test]
+    fn test_sync_interval_positive_respects_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(
+            dir.path(),
+            config_with_interval(1024 * 1024, Duration::from_millis(500)),
+        )
+        .unwrap();
+
+        // First write creates a file (which rotates from "no current file" and syncs
+        // the previous one — but there is none, so no sync on rotation). Write is buffered.
+        let mut job = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body".to_vec(),
+            "default".to_string(),
+        );
+        wal.write_put(&mut job).unwrap();
+
+        let baseline = wal.sync_count();
+
+        // Repeated maintain() calls well within the interval should not fsync.
+        for _ in 0..5 {
+            wal.maintain();
+        }
+        assert_eq!(
+            wal.sync_count(),
+            baseline,
+            "maintain must not sync before interval elapses"
+        );
+
+        // Sleep past the interval and call maintain once — should sync exactly once.
+        std::thread::sleep(Duration::from_millis(550));
+        wal.maintain();
+        assert_eq!(
+            wal.sync_count(),
+            baseline + 1,
+            "maintain must sync once after interval"
+        );
+
+        // Immediately calling maintain again should not re-sync (interval reset).
+        wal.maintain();
+        assert_eq!(wal.sync_count(), baseline + 1);
+    }
+
+    #[test]
+    fn test_buffered_write_replays_after_maintain() {
+        // Guards the invariant that maintain()'s flush makes buffered data
+        // visible to a subsequent replay on a fresh Wal instance.
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut wal = Wal::open(
+                dir.path(),
+                config_with_interval(1024 * 1024, Duration::from_secs(3600)),
+            )
+            .unwrap();
+            let mut job = Job::new(
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"buffered".to_vec(),
+                "default".to_string(),
+            );
+            wal.write_put(&mut job).unwrap();
+            // Force a flush through maintain (the interval is far in the future,
+            // so no fsync, but the BufWriter flush must still run).
+            wal.maintain();
+            // Drop without calling flush_and_sync — relying on maintain's flush.
+        }
+
+        let mut wal = Wal::open(
+            dir.path(),
+            config_with_interval(1024 * 1024, Duration::from_secs(3600)),
+        )
+        .unwrap();
+        let (jobs, _, _) = wal.replay().unwrap();
+        assert!(jobs.contains_key(&1), "job should survive buffered replay");
+        assert_eq!(jobs[&1].body, b"buffered");
+    }
+
+    #[test]
+    fn test_flush_and_sync_makes_data_durable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut wal = Wal::open(
+                dir.path(),
+                config_with_interval(1024 * 1024, Duration::from_secs(3600)),
+            )
+            .unwrap();
+            let before = wal.sync_count();
+            let mut job = Job::new(
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"shutdown".to_vec(),
+                "default".to_string(),
+            );
+            wal.write_put(&mut job).unwrap();
+            wal.flush_and_sync();
+            assert!(wal.sync_count() > before, "flush_and_sync must always sync");
+        }
+
+        let mut wal = Wal::open(
+            dir.path(),
+            config_with_interval(1024 * 1024, Duration::from_secs(3600)),
+        )
+        .unwrap();
+        let (jobs, _, _) = wal.replay().unwrap();
+        assert!(jobs.contains_key(&1));
     }
 }

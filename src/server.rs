@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{Job, JobState, URGENT_THRESHOLD};
-use crate::protocol::{self, Command, Response, MAX_DELETE_BATCH};
+use crate::protocol::{self, Command, MAX_DELETE_BATCH, Response};
 use crate::tube::{Tube, TubeStats};
 use crate::wal::{IdpTombstone, StateChangeReason, Wal};
 
@@ -349,8 +349,7 @@ impl ServerState {
     /// Drain every tombstone from a tube, updating accounting.
     fn drain_tombstones_in_tube(&mut self, tube_name: &str) {
         if let Some(tube) = self.tubes.get_mut(tube_name) {
-            let drained: Vec<String> =
-                tube.idempotency_cooldowns.drain().map(|(k, _)| k).collect();
+            let drained: Vec<String> = tube.idempotency_cooldowns.drain().map(|(k, _)| k).collect();
             for k in drained {
                 let cost = Self::tombstone_memory_cost(&k);
                 self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
@@ -703,7 +702,10 @@ impl ServerState {
         // Idempotency dedup: if key already exists for a live job, return original ID + state.
         // If the new put has a higher priority (lower number), upgrade the existing job's priority.
         if let Some(ref key_tuple) = idempotency_key
-            && let Some(&existing_id) = self.tubes.get(&tube_name).and_then(|t| t.idempotency_keys.get(&key_tuple.0))
+            && let Some(&existing_id) = self
+                .tubes
+                .get(&tube_name)
+                .and_then(|t| t.idempotency_keys.get(&key_tuple.0))
         {
             let upgraded_pri = if let Some(existing_job) = self.jobs.get_mut(&existing_id)
                 && pri < existing_job.priority
@@ -726,14 +728,23 @@ impl ServerState {
                     }
                 }
 
-                self.wal_write_state_change(existing_id, Some(state), pri, delay, 0, StateChangeReason::None);
+                self.wal_write_state_change(
+                    existing_id,
+                    Some(state),
+                    pri,
+                    delay,
+                    0,
+                    StateChangeReason::None,
+                );
 
                 Some(pri)
             } else {
                 None
             };
 
-            let state_str = self.jobs.get(&existing_id)
+            let state_str = self
+                .jobs
+                .get(&existing_id)
                 .expect("job must exist — just looked up by idempotency key")
                 .state
                 .as_protocol_str();
@@ -1037,14 +1048,24 @@ impl ServerState {
 
             let queue_secs = now.duration_since(created_at).as_secs_f64();
             TubeStats::record_timing(
-                &mut tube.stat.queue_time_ewma, &mut tube.stat.queue_time_samples,
-                &mut tube.stat.queue_time_min, &mut tube.stat.queue_time_max,
-                queue_secs, EWMA_ALPHA,
+                &mut tube.stat.queue_time_ewma,
+                &mut tube.stat.queue_time_samples,
+                &mut tube.stat.queue_time_min,
+                &mut tube.stat.queue_time_max,
+                queue_secs,
+                EWMA_ALPHA,
             );
         }
         self.stats.reserved_ct += 1;
 
-        self.wal_write_state_change(job_id, Some(JobState::Reserved), 0, Duration::ZERO, 0, StateChangeReason::Reserve);
+        self.wal_write_state_change(
+            job_id,
+            Some(JobState::Reserved),
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::Reserve,
+        );
 
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.reserved_jobs.push(job_id);
@@ -1156,23 +1177,28 @@ impl ServerState {
                 let secs = Instant::now().duration_since(ra).as_secs_f64();
 
                 TubeStats::record_timing(
-                    &mut tube.stat.processing_time_ewma, &mut tube.stat.processing_time_samples,
-                    &mut tube.stat.processing_time_min, &mut tube.stat.processing_time_max,
-                    secs, EWMA_ALPHA,
+                    &mut tube.stat.processing_time_ewma,
+                    &mut tube.stat.processing_time_samples,
+                    &mut tube.stat.processing_time_min,
+                    &mut tube.stat.processing_time_max,
+                    secs,
+                    EWMA_ALPHA,
                 );
 
                 if secs < FAST_THRESHOLD {
                     TubeStats::update_ewma(
                         &mut tube.stat.processing_time_ewma_fast,
                         &mut tube.stat.processing_time_samples_fast,
-                        secs, EWMA_ALPHA,
+                        secs,
+                        EWMA_ALPHA,
                     );
                     tube.stat.record_fast_sample(secs);
                 } else {
                     TubeStats::update_ewma(
                         &mut tube.stat.processing_time_ewma_slow,
                         &mut tube.stat.processing_time_samples_slow,
-                        secs, EWMA_ALPHA,
+                        secs,
+                        EWMA_ALPHA,
                     );
                     tube.stat.record_slow_sample(secs);
                 }
@@ -1205,7 +1231,14 @@ impl ServerState {
         }
 
         // WAL: write delete state change (with tombstone expiry if applicable)
-        self.wal_write_state_change(id, None, 0, Duration::ZERO, expiry_epoch_secs, StateChangeReason::None);
+        self.wal_write_state_change(
+            id,
+            None,
+            0,
+            Duration::ZERO,
+            expiry_epoch_secs,
+            StateChangeReason::None,
+        );
 
         self.remove_job(id);
 
@@ -1474,7 +1507,14 @@ impl ServerState {
         }
 
         // WAL: write bury state change
-        self.wal_write_state_change(id, Some(JobState::Buried), pri, Duration::ZERO, 0, StateChangeReason::Bury);
+        self.wal_write_state_change(
+            id,
+            Some(JobState::Buried),
+            pri,
+            Duration::ZERO,
+            0,
+            StateChangeReason::Bury,
+        );
 
         Response::Buried
     }
@@ -1675,7 +1715,14 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Kick);
+                self.wal_write_state_change(
+                    job_id,
+                    Some(JobState::Ready),
+                    0,
+                    Duration::ZERO,
+                    0,
+                    StateChangeReason::Kick,
+                );
                 kicked += 1;
             }
         } else {
@@ -1710,7 +1757,14 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Kick);
+                self.wal_write_state_change(
+                    job_id,
+                    Some(JobState::Ready),
+                    0,
+                    Duration::ZERO,
+                    0,
+                    StateChangeReason::Kick,
+                );
                 kicked += 1;
             }
         }
@@ -1770,7 +1824,14 @@ impl ServerState {
         }
 
         // WAL: write kick state change
-        self.wal_write_state_change(id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Kick);
+        self.wal_write_state_change(
+            id,
+            Some(JobState::Ready),
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::Kick,
+        );
 
         self.process_queue();
         Response::KickedOne
@@ -2652,7 +2713,14 @@ impl ServerState {
                         }
                     }
                 }
-                self.wal_write_state_change(job_id, Some(JobState::Ready), 0, Duration::ZERO, 0, StateChangeReason::Timeout);
+                self.wal_write_state_change(
+                    job_id,
+                    Some(JobState::Ready),
+                    0,
+                    Duration::ZERO,
+                    0,
+                    StateChangeReason::Timeout,
+                );
             }
         }
 
@@ -2725,7 +2793,10 @@ impl ServerState {
         // worse than a one-off warning.
         if self.total_job_bytes != 0
             && self.jobs.is_empty()
-            && self.tubes.values().all(|t| t.idempotency_cooldowns.is_empty())
+            && self
+                .tubes
+                .values()
+                .all(|t| t.idempotency_cooldowns.is_empty())
         {
             tracing::warn!(
                 "memory accounting drift: total_job_bytes={} with no live \
@@ -2752,9 +2823,7 @@ impl ServerState {
                 .collect();
 
             for job_id in migrate_ids {
-                if let (Some(wal), Some(job)) =
-                    (self.wal.as_mut(), self.jobs.get_mut(&job_id))
-                {
+                if let (Some(wal), Some(job)) = (self.wal.as_mut(), self.jobs.get_mut(&job_id)) {
                     if let Err(e) = wal.write_put(job) {
                         tracing::error!("WAL compaction write error: {}, disabling WAL", e);
                         self.wal = None;
@@ -2766,7 +2835,8 @@ impl ServerState {
         }
 
         // New connections default to "use default" + "watch default", so always keep it
-        self.tubes.retain(|name, tube| name == "default" || !tube.is_idle());
+        self.tubes
+            .retain(|name, tube| name == "default" || !tube.is_idle());
     }
 
     /// Restore jobs from WAL replay into server state.
@@ -2967,12 +3037,19 @@ fn build_state(
     max_job_size: u32,
     max_job_bytes: Option<u64>,
     wal_dir: Option<&Path>,
+    wal_sync_interval: Duration,
     name: Option<String>,
 ) -> io::Result<ServerState> {
     let mut state = ServerState::new(max_job_size, max_job_bytes, name);
 
     if let Some(dir) = wal_dir {
-        let mut wal = Wal::open(dir, None)?;
+        let mut wal = Wal::open(
+            dir,
+            crate::wal::WalConfig {
+                max_file_size: None,
+                sync_interval: wal_sync_interval,
+            },
+        )?;
         let on_disk = wal.total_disk_bytes();
 
         // If the binlog is larger than the configured memory budget, abort
@@ -3023,11 +3100,18 @@ pub async fn run(
     max_job_size: u32,
     max_job_bytes: Option<u64>,
     wal_dir: Option<&str>,
+    wal_sync_interval: Duration,
     metrics_port: Option<u16>,
     name: Option<String>,
 ) -> io::Result<()> {
     let wal_path = wal_dir.map(Path::new);
-    let state = build_state(max_job_size, max_job_bytes, wal_path, name.clone())?;
+    let state = build_state(
+        max_job_size,
+        max_job_bytes,
+        wal_path,
+        wal_sync_interval,
+        name.clone(),
+    )?;
 
     let listener = TcpListener::bind((addr, port)).await?;
     let mut opts = format!(" max-job-size={max_job_size}");
@@ -3041,9 +3125,20 @@ pub async fn run(
         opts.push_str(&format!(" metrics={}:{mp}", listener.local_addr()?.ip()));
     }
     if let Some(ref n) = name {
-        tracing::info!("tuber v{} [{}] listening on {}:{}{opts}", env!("CARGO_PKG_VERSION"), n, addr, port);
+        tracing::info!(
+            "tuber v{} [{}] listening on {}:{}{opts}",
+            env!("CARGO_PKG_VERSION"),
+            n,
+            addr,
+            port
+        );
     } else {
-        tracing::info!("tuber v{} listening on {}:{}{opts}", env!("CARGO_PKG_VERSION"), addr, port);
+        tracing::info!(
+            "tuber v{} listening on {}:{}{opts}",
+            env!("CARGO_PKG_VERSION"),
+            addr,
+            port
+        );
     }
 
     if let Some(mp) = metrics_port {
@@ -3082,21 +3177,35 @@ pub async fn run_with_listener_limited(
     wal_dir: Option<&Path>,
     name: Option<String>,
 ) -> io::Result<()> {
-    let state = build_state(max_job_size, max_job_bytes, wal_dir, name)?;
+    let state = build_state(
+        max_job_size,
+        max_job_bytes,
+        wal_dir,
+        crate::wal::DEFAULT_SYNC_INTERVAL,
+        name,
+    )?;
     serve(listener, state, max_job_size).await
 }
 
 /// Run the engine task and accept loop with a fully-built [`ServerState`].
-async fn serve(
-    listener: TcpListener,
-    mut state: ServerState,
-    max_job_size: u32,
-) -> io::Result<()> {
+async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32) -> io::Result<()> {
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
+
+    // Shrink the engine tick when the WAL fsync interval is tighter than the
+    // default 100 ms tick, so fsync cadence isn't rate-limited by the tick.
+    // `sync_interval == 0` (per-write fsync) stays on the 100 ms tick — the
+    // tick only drives GC/maintenance, not the per-write sync.
+    let default_tick = Duration::from_millis(100);
+    let tick_period = state
+        .wal
+        .as_ref()
+        .map(|w| w.sync_interval())
+        .filter(|d| !d.is_zero() && *d < default_tick)
+        .unwrap_or(default_tick);
 
     // Engine task
     let _engine_handle = tokio::spawn(async move {
-        let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+        let mut tick_interval = tokio::time::interval(tick_period);
         let mut sigusr1 =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
                 .expect("failed to register SIGUSR1 handler");
@@ -3144,7 +3253,7 @@ async fn serve(
                         EnginePayload::Shutdown => {
                             tracing::info!("engine shutting down, flushing WAL");
                             if let Some(wal) = &mut state.wal {
-                                wal.maintain();
+                                wal.flush_and_sync();
                             }
                             break;
                         }
@@ -3209,7 +3318,6 @@ async fn serve(
 /// Atomic counter for connection IDs (simpler than engine round-trip).
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-
 /// Maximum digits in a u64 value (18446744073709551615).
 const MAX_U64_DIGITS: usize = 20;
 
@@ -3221,9 +3329,7 @@ const MAX_U64_DIGITS: usize = 20;
 ///   Total                                            = 21015
 ///
 /// For reference, put with all extensions is 891 bytes (well under this limit).
-const MAX_LINE_LEN: u64 = (13
-    + MAX_DELETE_BATCH * (MAX_U64_DIGITS + 1)
-    + 2) as u64;
+const MAX_LINE_LEN: u64 = (13 + MAX_DELETE_BATCH * (MAX_U64_DIGITS + 1) + 2) as u64;
 
 async fn handle_connection(
     socket: tokio::net::TcpStream,
@@ -3724,9 +3830,17 @@ mod tests {
 
         // Set processing time EWMAs: fast=0.1s, slow=10.0s (100x slower)
         s.tubes.get_mut("fast").unwrap().stat.processing_time_ewma = 0.1;
-        s.tubes.get_mut("fast").unwrap().stat.processing_time_samples = 100;
+        s.tubes
+            .get_mut("fast")
+            .unwrap()
+            .stat
+            .processing_time_samples = 100;
         s.tubes.get_mut("slow").unwrap().stat.processing_time_ewma = 10.0;
-        s.tubes.get_mut("slow").unwrap().stat.processing_time_samples = 100;
+        s.tubes
+            .get_mut("slow")
+            .unwrap()
+            .stat
+            .processing_time_samples = 100;
 
         // Reserve many jobs and count which tube they came from
         let mut fast_count = 0u32;
@@ -4404,7 +4518,10 @@ mod tests {
             concurrency_key: None,
         };
         let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "RESERVED", Some(30))));
+        assert!(matches!(
+            resp,
+            Response::InsertedDup(1, "RESERVED", Some(30))
+        ));
 
         // Verify the job's priority was updated
         assert_eq!(s.jobs.get(&1).unwrap().priority, 30);
@@ -4479,7 +4596,10 @@ mod tests {
             concurrency_key: None,
         };
         let resp = s.handle_command(c, cmd2, Some(b"world".to_vec()));
-        assert!(matches!(resp, Response::InsertedDup(1, "DELAYED", Some(40))));
+        assert!(matches!(
+            resp,
+            Response::InsertedDup(1, "DELAYED", Some(40))
+        ));
         assert_eq!(s.jobs.get(&1).unwrap().priority, 40);
     }
 
@@ -4837,11 +4957,7 @@ mod tests {
     /// Sum the live memory cost of every job and tombstone from scratch.
     /// Must match `state.total_job_bytes` at all times.
     fn recompute_total_job_bytes(state: &ServerState) -> u64 {
-        let jobs: u64 = state
-            .jobs
-            .values()
-            .map(ServerState::job_memory_cost)
-            .sum();
+        let jobs: u64 = state.jobs.values().map(ServerState::job_memory_cost).sum();
         let tombs: u64 = state
             .tubes
             .values()
@@ -4887,7 +5003,15 @@ mod tests {
         // Reserve doesn't add bytes.
         assert_eq!(s.total_job_bytes, baseline);
 
-        s.handle_command(c, Command::Release { id, pri: 0, delay: 0 }, None);
+        s.handle_command(
+            c,
+            Command::Release {
+                id,
+                pri: 0,
+                delay: 0,
+            },
+            None,
+        );
         assert_eq!(s.total_job_bytes, baseline);
         assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
     }
@@ -4931,7 +5055,10 @@ mod tests {
         assert_eq!(s.total_job_bytes, 0);
 
         let r3 = s.handle_command(c, put_cmd(0, 0, 60, 10), Some(vec![b'c'; 10]));
-        assert!(matches!(r3, Response::Inserted(2)), "post-delete put: {r3:?}");
+        assert!(
+            matches!(r3, Response::Inserted(2)),
+            "post-delete put: {r3:?}"
+        );
     }
 
     #[test]
@@ -5011,7 +5138,10 @@ mod tests {
         };
         s.handle_command(c, cmd, Some(b"hello".to_vec()));
         s.handle_command(c, Command::Delete { id: 1 }, None);
-        assert!(s.total_job_bytes > 0, "tombstone should remain after delete");
+        assert!(
+            s.total_job_bytes > 0,
+            "tombstone should remain after delete"
+        );
         assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
 
         s.handle_command(
@@ -5111,7 +5241,10 @@ mod tests {
 
         s.tick();
 
-        assert_eq!(s.total_job_bytes, corrupted, "detector must only fire on empty state");
+        assert_eq!(
+            s.total_job_bytes, corrupted,
+            "detector must only fire on empty state"
+        );
         assert_eq!(s.stats.accounting_drift_events, 0);
         // Clean up so the test doesn't leak a weird counter.
         s.total_job_bytes = baseline;

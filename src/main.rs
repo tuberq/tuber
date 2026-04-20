@@ -1,12 +1,49 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
 
 /// Parse a human-readable byte count for `--max-job-size`, clamping to u32.
 fn parse_max_job_size(s: &str) -> Result<u32, String> {
     let n = tuber::server::parse_bytes(s)?;
     u32::try_from(n).map_err(|_| format!("max-job-size {s:?} does not fit in u32"))
+}
+
+/// Parse a human-readable duration (e.g. `0`, `50ms`, `1s`, `2m`) into a `Duration`.
+/// `0` (with or without a unit) means "fsync on every write".
+fn parse_sync_interval(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    // Allow a bare "0" as shorthand for per-write sync.
+    if s == "0" {
+        return Ok(Duration::ZERO);
+    }
+    parse_duration_suffix(s)
+}
+
+fn parse_duration_suffix(s: &str) -> Result<Duration, String> {
+    // Minimal ms/s/m/h parser so we don't pull in a new dep.
+    let (num_str, unit) = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .map(|i| (&s[..i], &s[i..]))
+        .unwrap_or((s, "ms"));
+    let n: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid duration number in {s:?}"))?;
+    let nanos = match unit.trim() {
+        "ns" => n,
+        "us" | "µs" => n * 1_000.0,
+        "ms" | "" => n * 1_000_000.0,
+        "s" => n * 1_000_000_000.0,
+        "m" => n * 60.0 * 1_000_000_000.0,
+        "h" => n * 3_600.0 * 1_000_000_000.0,
+        other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
+    };
+    if nanos < 0.0 {
+        return Err(format!("negative duration {s:?}"));
+    }
+    Ok(Duration::from_nanos(nanos as u64))
 }
 
 #[derive(Parser, Debug)]
@@ -31,6 +68,18 @@ enum Commands {
         /// WAL directory (enables persistence)
         #[arg(short = 'b', long, env = "TUBER_BINLOG_DIR")]
         binlog_dir: Option<String>,
+
+        /// Minimum interval between WAL fsyncs (e.g. 0, 50ms, 1s).
+        /// "0" means fsync on every write (strongest durability; ack follows durability).
+        /// Positive values bound how much committed state can be lost on crash.
+        /// Only meaningful when --binlog-dir is set.
+        #[arg(
+            long,
+            default_value = "100ms",
+            value_parser = parse_sync_interval,
+            env = "TUBER_WAL_SYNC_INTERVAL"
+        )]
+        wal_sync_interval: Duration,
 
         /// Maximum size of a single job's body.
         /// Accepts suffixes: k, m, g, t (e.g. 64k, 1m). Default: 65535.
@@ -142,6 +191,7 @@ async fn main() {
             listen,
             port,
             binlog_dir,
+            wal_sync_interval,
             max_job_size,
             max_jobs_size,
             verbose,
@@ -160,6 +210,7 @@ async fn main() {
                 max_job_size,
                 max_jobs_size,
                 binlog_dir.as_deref(),
+                wal_sync_interval,
                 metrics_port,
                 name,
             )

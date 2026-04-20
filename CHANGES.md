@@ -1,5 +1,20 @@
 # Changes
 
+## Unreleased
+
+**Configurable WAL durability + buffered writes**
+
+- New `--wal-sync-interval` flag (env `TUBER_WAL_SYNC_INTERVAL`, default `100ms`)
+  controls how often the WAL is `fsync`ed. `0` syncs on every write before
+  acknowledging the client (strongest durability, slowest). Positive values
+  bound how much committed state can be lost on crash. On clean shutdown the
+  tail is always flushed and synced regardless of the interval.
+- WAL writes now pass through a 64 KiB userland `BufWriter`, cutting syscall
+  count under load without changing durability guarantees (every fsync path
+  flushes the buffer first).
+- When `--wal-sync-interval` is shorter than the engine's 100 ms tick, the
+  tick shortens to match so fsync cadence isn't capped by maintenance cadence.
+
 ## v0.5.2
 
 **Fix WAL replay losing per-job counters**
