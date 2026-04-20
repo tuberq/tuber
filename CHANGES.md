@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## v0.5.3
 
 **Configurable WAL durability + buffered writes**
 
