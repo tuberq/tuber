@@ -810,19 +810,29 @@ impl Wal {
             .unwrap_or(true)
     }
 
+    /// Flush the userland buffer of `fd` and fsync the inner file.
+    fn flush_and_fsync(fd: &mut BufWriter<File>) -> io::Result<()> {
+        fd.flush()?;
+        fd.get_ref().sync_all()
+    }
+
+    /// Record that a sync happened, updating tracking state.
+    fn record_sync(&mut self) {
+        #[cfg(test)]
+        {
+            self.sync_count += 1;
+        }
+        self.last_sync_at = Instant::now();
+    }
+
     fn rotate_if_needed(&mut self) -> io::Result<()> {
         if self.should_rotate() {
             // Close current file
             if let Some(f) = self.files.back_mut()
                 && let Some(mut fd) = f.fd.take()
             {
-                fd.flush()?;
-                fd.get_ref().sync_all()?;
-                #[cfg(test)]
-                {
-                    self.sync_count += 1;
-                }
-                self.last_sync_at = Instant::now();
+                Self::flush_and_fsync(&mut fd)?;
+                self.record_sync();
             }
             self.create_next_file()?;
         }
@@ -855,8 +865,7 @@ impl Wal {
         fd.write_all(&record)?;
         file.bytes_written += record_len;
         if sync_per_write {
-            fd.flush()?;
-            fd.get_ref().sync_all()?;
+            Self::flush_and_fsync(fd)?;
         }
 
         // Update job's WAL tracking
@@ -884,11 +893,7 @@ impl Wal {
         }
 
         if sync_per_write {
-            #[cfg(test)]
-            {
-                self.sync_count += 1;
-            }
-            self.last_sync_at = Instant::now();
+            self.record_sync();
         }
 
         Ok(())
@@ -903,21 +908,7 @@ impl Wal {
         expiry_epoch_secs: u64,
         reason: StateChangeReason,
     ) -> io::Result<()> {
-        // State changes are allowed to exceed max_file_size
-        if self.should_rotate() {
-            if let Some(f) = self.files.back_mut()
-                && let Some(mut fd) = f.fd.take()
-            {
-                fd.flush()?;
-                fd.get_ref().sync_all()?;
-                #[cfg(test)]
-                {
-                    self.sync_count += 1;
-                }
-                self.last_sync_at = Instant::now();
-            }
-            self.create_next_file()?;
-        }
+        self.rotate_if_needed()?;
 
         let delay_nanos = new_delay.as_nanos().min(u64::MAX as u128) as u64;
         let record = serialize_state_change(
@@ -939,8 +930,7 @@ impl Wal {
         fd.write_all(&record)?;
         file.bytes_written += record_len;
         if sync_per_write {
-            fd.flush()?;
-            fd.get_ref().sync_all()?;
+            Self::flush_and_fsync(fd)?;
         }
 
         // Release reservation
@@ -964,11 +954,7 @@ impl Wal {
         }
 
         if sync_per_write {
-            #[cfg(test)]
-            {
-                self.sync_count += 1;
-            }
-            self.last_sync_at = Instant::now();
+            self.record_sync();
         }
 
         Ok(())
@@ -1182,17 +1168,12 @@ impl Wal {
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
-            // Always flush userland buffer.
             let _ = fd.flush();
 
             // Skip interval sync when interval=0 — writes already synced inline.
             if !self.sync_interval.is_zero() && self.last_sync_at.elapsed() >= self.sync_interval {
                 let _ = fd.get_ref().sync_all();
-                #[cfg(test)]
-                {
-                    self.sync_count += 1;
-                }
-                self.last_sync_at = Instant::now();
+                self.record_sync();
             }
         }
     }
@@ -1204,13 +1185,8 @@ impl Wal {
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
-            let _ = fd.flush();
-            let _ = fd.get_ref().sync_all();
-            #[cfg(test)]
-            {
-                self.sync_count += 1;
-            }
-            self.last_sync_at = Instant::now();
+            let _ = Self::flush_and_fsync(fd);
+            self.record_sync();
         }
     }
 
