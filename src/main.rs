@@ -69,6 +69,7 @@ enum Commands {
             long,
             default_value = "100ms",
             value_parser = parse_sync_interval,
+            requires = "binlog_dir",
             env = "TUBER_WAL_SYNC_INTERVAL"
         )]
         wal_sync_interval: Duration,

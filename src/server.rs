@@ -3120,6 +3120,11 @@ pub async fn run(
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
+        if wal_sync_interval.is_zero() {
+            opts.push_str(" wal-sync=every-write");
+        } else {
+            opts.push_str(&format!(" wal-sync={}ms", wal_sync_interval.as_millis()));
+        }
     }
     if let Some(mp) = metrics_port {
         opts.push_str(&format!(" metrics={}:{mp}", listener.local_addr()?.ip()));
