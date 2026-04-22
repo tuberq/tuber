@@ -3256,7 +3256,7 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
         .unwrap_or(default_tick);
 
     // Engine task
-    let _engine_handle = tokio::spawn(async move {
+    let engine_handle = tokio::spawn(async move {
         let mut tick_interval = tokio::time::interval(tick_period);
         let mut sigusr1 =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
@@ -3359,6 +3359,9 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
 
     // Drop the sender so the engine loop exits after processing Shutdown
     drop(engine_tx);
+
+    // Wait for the engine to finish flushing the WAL before exiting
+    let _ = engine_handle.await;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -700,4 +701,101 @@ async fn test_binlog_replay_aborts_when_over_budget() {
         body.contains("current-jobs-ready: 5"),
         "expected 5 ready jobs after replay: {body}"
     );
+}
+
+/// Test: graceful SIGTERM flushes WAL before exit.
+///
+/// Starts the server as a child process (so we can send a real signal),
+/// inserts a job, sends SIGTERM, waits for the process to exit, then
+/// restarts on the same WAL directory and verifies the job survived.
+#[tokio::test]
+async fn test_binlog_sigterm_flushes_wal() {
+    // Build the binary first so we have a fresh executable.
+    let status = tokio::process::Command::new("cargo")
+        .args(["build", "--quiet"])
+        .status()
+        .await
+        .expect("cargo build failed");
+    assert!(status.success(), "cargo build failed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().to_path_buf();
+
+    // Pick an ephemeral port by binding briefly.
+    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp_listener.local_addr().unwrap().port();
+    drop(tmp_listener);
+
+    // Start server as a child process with WAL enabled and sync-every-write
+    // so the only flush that matters is the shutdown flush.
+    let mut child = tokio::process::Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "--",
+            "server",
+            "-l",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-b",
+            wal_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start tuber subprocess");
+
+    // Wait for the server to start accepting connections.
+    let mut connected = false;
+    for _ in 0..40 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(connected, "server did not start accepting connections");
+
+    // Connect and insert a job.
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut c = TestConn {
+        reader: BufReader::new(read_half),
+        writer: write_half,
+    };
+    c.mustsend("put 10 0 60 12\r\n").await;
+    c.mustsend("sigterm-test\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    drop(c);
+
+    // Send SIGTERM to the child process.
+    let pid = child.id().expect("no child pid");
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    // Wait for clean exit (with timeout).
+    let exit = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("server did not exit within 5s after SIGTERM")
+        .expect("failed to wait on child");
+
+    // On Unix, SIGTERM usually results in a signal exit, not exit code 0,
+    // but the important thing is that it exited (not timed out).
+    let _ = exit;
+
+    // Restart on the same WAL directory using in-process server.
+    let srv2 = TestServer::start_with_wal(&wal_path).await;
+    let mut c2 = srv2.connect().await;
+
+    // The job should have survived the SIGTERM shutdown.
+    c2.mustsend("peek 1\r\n").await;
+    c2.ckresp("FOUND 1 12\r\n").await;
+    let mut body = vec![0u8; 14]; // "sigterm-test\r\n"
+    tokio::time::timeout(Duration::from_secs(5), c2.reader.read_exact(&mut body))
+        .await
+        .expect("read body timed out")
+        .unwrap();
+    assert_eq!(&body[..12], b"sigterm-test");
 }
