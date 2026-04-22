@@ -973,6 +973,17 @@ impl ServerState {
             return Response::NotFound;
         }
 
+        // Check after_group dependency
+        let hold_for_group = job
+            .after_group
+            .as_ref()
+            .and_then(|ag| self.groups.get(ag))
+            .map(|gs| !gs.is_complete())
+            .unwrap_or(false);
+        if hold_for_group {
+            return Response::NotFound;
+        }
+
         let state = job.state;
         let tube_name = job.tube_name.clone();
 
@@ -5315,5 +5326,126 @@ mod tests {
         assert!(parse_bytes("").is_err());
         assert!(parse_bytes("nope").is_err());
         assert!(parse_bytes("1.5g").is_err()); // decimals not supported
+    }
+
+    #[test]
+    fn test_reserve_job_respects_after_group() {
+        // reserve-job by ID must not bypass after_group dependencies.
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        // Put a predecessor job in group "g1"
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 4,
+                idempotency_key: None,
+                group: Some("g1".into()),
+                after_group: None,
+                concurrency_key: None,
+            },
+            Some(b"pre1".to_vec()),
+        );
+        assert!(matches!(resp, Response::Inserted(1)));
+
+        // Put a dependent job with aft:g1
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 4,
+                idempotency_key: None,
+                group: None,
+                after_group: Some("g1".into()),
+                concurrency_key: None,
+            },
+            Some(b"dep1".to_vec()),
+        );
+        assert!(matches!(resp, Response::Inserted(2)));
+
+        // reserve-job 2 should fail — g1 is not complete
+        let r = s.handle_command(c, Command::ReserveJob { id: 2 }, None);
+        assert!(
+            matches!(r, Response::NotFound),
+            "reserve-job should block on incomplete after_group, got {:?}",
+            r
+        );
+
+        // Complete g1: reserve and delete job 1
+        let r = s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None);
+        assert!(matches!(r, Response::Reserved { id: 1, .. }));
+        let r = s.handle_command(c, Command::Delete { id: 1 }, None);
+        assert!(matches!(r, Response::Deleted));
+
+        // Now reserve-job 2 should succeed
+        let r = s.handle_command(c, Command::ReserveJob { id: 2 }, None);
+        assert!(
+            matches!(r, Response::Reserved { id: 2, .. }),
+            "reserve-job should succeed after group completes, got {:?}",
+            r
+        );
+    }
+
+    // --- waiting_ct accounting ---
+
+    #[test]
+    fn test_waiting_ct_reserve_blocks() {
+        let mut s = make_state();
+        let c = register(&mut s);
+        let (tx, _rx) = oneshot::channel();
+        s.add_waiter(c, tx, None);
+        assert_eq!(s.stats.waiting_ct, 1);
+        assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 1);
+    }
+
+    #[test]
+    fn test_waiting_ct_fulfilled_waiter_resets() {
+        let mut s = make_state();
+        let c = register(&mut s);
+        let (tx, _rx) = oneshot::channel();
+        s.add_waiter(c, tx, None);
+        assert_eq!(s.stats.waiting_ct, 1);
+
+        // Put a job — process_queue should wake the waiter
+        s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
+        assert_eq!(s.stats.waiting_ct, 0);
+        assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 0);
+    }
+
+    #[test]
+    fn test_waiting_ct_disconnect_clears() {
+        let mut s = make_state();
+        let c1 = register(&mut s);
+        let c2 = register(&mut s);
+
+        // c2 watches an extra tube
+        s.handle_command(
+            c2,
+            Command::Watch {
+                tube: "foo".into(),
+                weight: 1,
+            },
+            None,
+        );
+
+        let (tx1, _rx1) = oneshot::channel();
+        s.add_waiter(c1, tx1, None);
+        let (tx2, _rx2) = oneshot::channel();
+        s.add_waiter(c2, tx2, None);
+
+        assert_eq!(s.stats.waiting_ct, 2);
+        assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 2);
+        assert_eq!(s.tubes.get("foo").unwrap().stat.waiting_ct, 1);
+
+        // Disconnect c1 — its waiter should be removed
+        s.unregister_conn(c1);
+        assert_eq!(s.stats.waiting_ct, 1);
+        assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 1);
+        assert_eq!(s.tubes.get("foo").unwrap().stat.waiting_ct, 1);
     }
 }

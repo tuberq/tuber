@@ -703,6 +703,89 @@ async fn test_binlog_replay_aborts_when_over_budget() {
     );
 }
 
+/// Test: Kicked job preserves its priority through WAL replay.
+#[tokio::test]
+async fn test_binlog_kick_preserves_priority() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 100 0 60 5\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+
+    // Bury with a *different* priority (50)
+    c.mustsend("bury 1 50\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // Kick it back to ready
+    c.mustsend("kick-job 1\r\n").await;
+    c.ckresp("KICKED\r\n").await;
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    c2.mustsend("stats-job 1\r\n").await;
+    let body = c2.read_ok_body().await;
+    assert!(body.contains("state: ready"), "body: {}", body);
+    assert!(
+        body.contains("pri: 50"),
+        "kicked job should preserve its priority (50): {}",
+        body
+    );
+}
+
+/// Test: Auto-released (timed-out) job preserves its priority through WAL replay.
+#[tokio::test]
+async fn test_binlog_timeout_preserves_priority() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // ttr = 1 second
+    c.mustsend("put 100 0 1 5\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+
+    // Wait for TTR to expire
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Send another command to trigger process_queue (and thus the timeout)
+    c.mustsend("put 0 0 60 1\r\n").await;
+    c.mustsend("x\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    c2.mustsend("stats-job 1\r\n").await;
+    let body = c2.read_ok_body().await;
+    assert!(body.contains("state: ready"), "body: {}", body);
+    assert!(
+        body.contains("pri: 100"),
+        "timed-out job should preserve its original priority (100): {}",
+        body
+    );
+}
+
 /// Test: graceful SIGTERM flushes WAL before exit.
 ///
 /// Runs the server as a child process so we can deliver a real SIGTERM
