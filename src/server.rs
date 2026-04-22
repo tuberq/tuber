@@ -358,10 +358,12 @@ impl ServerState {
     }
 
     fn unregister_conn(&mut self, conn_id: u64) {
+        // Remove from waiting lists first: remove_waiter_at reads conn.watched
+        // to decrement per-tube waiting_ct, so the conn must still be in
+        // self.conns when it runs.
+        self.remove_waiter(conn_id);
         // Release all reserved jobs back to ready
         if let Some(conn) = self.conns.remove(&conn_id) {
-            // Remove from waiting lists
-            self.remove_waiter(conn_id);
 
             // Decrement tube counters
             if let Some(t) = self.tubes.get_mut(&conn.use_tube) {
@@ -1057,7 +1059,7 @@ impl ServerState {
         }
         self.stats.reserved_ct += 1;
 
-        let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
+        let pri = self.job_pri(job_id);
         self.wal_write_state_change(
             job_id,
             Some(JobState::Reserved),
@@ -1715,7 +1717,7 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
+                let pri = self.job_pri(job_id);
                 self.wal_write_state_change(
                     job_id,
                     Some(JobState::Ready),
@@ -1758,7 +1760,7 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
-                let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
+                let pri = self.job_pri(job_id);
                 self.wal_write_state_change(
                     job_id,
                     Some(JobState::Ready),
@@ -1826,7 +1828,7 @@ impl ServerState {
         }
 
         // WAL: write kick state change
-        let pri = self.jobs.get(&id).map_or(0, |j| j.priority);
+        let pri = self.job_pri(id);
         self.wal_write_state_change(
             id,
             Some(JobState::Ready),
@@ -2578,6 +2580,12 @@ impl ServerState {
 
     // --- WAL helpers ---
 
+    /// Current priority of a job, or 0 if the job is gone.
+    /// Used by WAL state-change writes where the priority is not being changed.
+    fn job_pri(&self, id: u64) -> u32 {
+        self.jobs.get(&id).map_or(0, |j| j.priority)
+    }
+
     fn wal_write_put(&mut self, job_id: u64) {
         if self.wal.is_none() {
             return;
@@ -2744,7 +2752,7 @@ impl ServerState {
                         }
                     }
                 }
-                let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
+                let pri = self.job_pri(job_id);
                 self.wal_write_state_change(
                     job_id,
                     Some(JobState::Ready),
