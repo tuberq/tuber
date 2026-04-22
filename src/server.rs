@@ -133,6 +133,10 @@ impl GroupState {
     fn is_idle(&self) -> bool {
         self.is_complete() && self.waiting_jobs.is_empty()
     }
+
+    fn remove_waiting_job(&mut self, id: u64) {
+        self.waiting_jobs.retain(|&jid| jid != id);
+    }
 }
 
 /// All server state, owned by the engine task.
@@ -1232,11 +1236,10 @@ impl ServerState {
                 gs.buried = gs.buried.saturating_sub(1);
             }
         }
-        // Remove from after_group's waiting_jobs if this was a held after-job
         if let Some(ref ag) = after_group_name
             && let Some(gs) = self.groups.get_mut(ag)
         {
-            gs.waiting_jobs.retain(|&jid| jid != id);
+            gs.remove_waiting_job(id);
         }
 
         // WAL: write delete state change (with tombstone expiry if applicable)
@@ -1368,11 +1371,10 @@ impl ServerState {
                         affected_groups.push(grp.clone());
                     }
                 }
-                // Also remove held after-jobs from group waiting lists
                 if let Some(ref ag) = job.after_group
                     && let Some(gs) = self.groups.get_mut(ag)
                 {
-                    gs.waiting_jobs.retain(|&jid| jid != id);
+                    gs.remove_waiting_job(id);
                 }
             }
         }
