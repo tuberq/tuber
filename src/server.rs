@@ -3349,7 +3349,6 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
         }
     }
 
-    // Send shutdown to engine and wait for it to flush WAL
     let _ = engine_tx
         .send(EngineMsg {
             conn_id: 0,
@@ -3357,10 +3356,9 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
         })
         .await;
 
-    // Drop the sender so the engine loop exits after processing Shutdown
+    // Drop the sender so the engine loop exits after processing Shutdown,
+    // then await the task so the WAL is fully flushed before we return.
     drop(engine_tx);
-
-    // Wait for the engine to finish flushing the WAL before exiting
     let _ = engine_handle.await;
 
     Ok(())
