@@ -1123,6 +1123,7 @@ impl ServerState {
         let reserved_at = job.reserved_at;
         let idempotency_key = job.idempotency_key.clone();
         let group_name = job.group.clone();
+        let after_group_name = job.after_group.clone();
         let has_concurrency_key = job.concurrency_key.is_some();
 
         match state {
@@ -1230,6 +1231,12 @@ impl ServerState {
             if state == JobState::Buried {
                 gs.buried = gs.buried.saturating_sub(1);
             }
+        }
+        // Remove from after_group's waiting_jobs if this was a held after-job
+        if let Some(ref ag) = after_group_name
+            && let Some(gs) = self.groups.get_mut(ag)
+        {
+            gs.waiting_jobs.retain(|&jid| jid != id);
         }
 
         // WAL: write delete state change (with tombstone expiry if applicable)

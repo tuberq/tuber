@@ -2163,6 +2163,50 @@ async fn test_group_stats_job_fields() {
     );
 }
 
+/// Deleting a held after-job must remove its ID from GroupState::waiting_jobs
+/// so the group can be cleaned up. Without the fix, the group leaks forever.
+#[tokio::test]
+async fn test_delete_held_after_job_cleans_waiting_jobs() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Create a group job so the group exists with pending=1
+    c.mustsend("put 0 0 60 1 grp:g1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Create an after-job for g1 — it should be held (delayed, no deadline)
+    c.mustsend("put 0 0 60 1 aft:g1\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // The after-job should NOT be reservable yet
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Delete the held after-job (job 2) — this is the bug scenario
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Delete the group job (job 1) to complete the group
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Now create a NEW after-job for the same group.
+    // If the bug is present, g1's waiting_jobs still contains the deleted job 2,
+    // so is_idle() returns false and the group is never cleaned up — meaning
+    // the new after-job would be held forever instead of firing immediately.
+    c.mustsend("put 0 0 60 1 aft:g1\r\n").await;
+    c.mustsend("y\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // The new after-job should fire immediately (group g1 is complete and idle)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("y\r\n").await;
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency key (con:) tests
 // ---------------------------------------------------------------------------
