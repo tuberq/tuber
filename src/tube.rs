@@ -117,7 +117,6 @@ pub struct Tube {
     pub ready: IndexHeap<ReadyKey>,
     pub delay: IndexHeap<DelayKey>,
     pub buried: VecDeque<u64>,
-    pub waiting_conns: Vec<u64>,
     pub stat: TubeStats,
     pub idempotency_keys: HashMap<String, u64>,
     pub idempotency_cooldowns: HashMap<String, (u64, SystemTime)>,
@@ -134,7 +133,6 @@ impl Tube {
             ready: IndexHeap::new(),
             delay: IndexHeap::new(),
             buried: VecDeque::new(),
-            waiting_conns: Vec::new(),
             idempotency_keys: HashMap::new(),
             idempotency_cooldowns: HashMap::new(),
             stat: TubeStats::default(),
@@ -170,7 +168,7 @@ impl Tube {
         self.ready.is_empty()
             && self.delay.is_empty()
             && self.buried.is_empty()
-            && self.waiting_conns.is_empty()
+            && self.stat.waiting_ct == 0
             && self.idempotency_keys.is_empty()
             && self.idempotency_cooldowns.is_empty()
             && self.using_ct == 0
@@ -189,7 +187,7 @@ mod tests {
         assert!(t.ready.is_empty());
         assert!(t.delay.is_empty());
         assert!(t.buried.is_empty());
-        assert!(t.waiting_conns.is_empty());
+        assert_eq!(t.stat.waiting_ct, 0);
         assert!(!t.is_paused());
         assert!(t.is_idle());
     }

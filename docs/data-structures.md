@@ -63,7 +63,6 @@ pub struct Tube {
     pub ready: IndexHeap<(u32, u64)>,
     pub delay: IndexHeap<(i64, u64)>,
     pub buried: VecDeque<u64>,
-    pub waiting_conns: Vec<u64>,
     pub stat: TubeStats,
     pub using_ct: u32,
     pub watching_ct: u32,
