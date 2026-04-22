@@ -1,5 +1,19 @@
 # Changes
 
+## v0.5.4
+
+**Bug fixes for stats, WAL replay, group state, and shutdown**
+
+- Fix `reserve-job` bypassing `after_group` dependencies; add tests for `waiting_ct` and WAL priority preservation.
+- Await engine task on shutdown to prevent WAL data loss.
+- Simplify SIGTERM WAL test; tidy shutdown comments.
+- Extract `GroupState::remove_waiting_job` helper.
+- Fix deleting held after-job leaking its ID in `GroupState::waiting_jobs`.
+- Fix per-tube `waiting_ct` leak on disconnect; extract `job_pri` helper.
+- Fix WAL replay resetting job priority to 0 for kicks, timeouts, and reserves.
+- Remove `tube.waiting_conns` dead state; unify waiter removal.
+- Fix `waiting_ct` stats never being updated.
+
 ## v0.5.3
 
 **Configurable WAL durability + buffered writes**
