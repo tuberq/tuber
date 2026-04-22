@@ -2452,7 +2452,9 @@ impl ServerState {
         // Remove timed-out waiters from back to front
         let mut timed_out = Vec::new();
         for &i in timed_out_indices.iter().rev() {
-            timed_out.push(self.waiters.remove(i));
+            let waiter = self.waiters.remove(i);
+            self.dec_waiter_stats(waiter.conn_id);
+            timed_out.push(waiter);
         }
 
         for waiter in timed_out {
@@ -2483,6 +2485,7 @@ impl ServerState {
                     let waiter = self.waiters.remove(i);
                     // Select the job respecting the connection's reserve mode.
                     if let Some(job_id) = self.find_job_for_waiting_conn(waiter.conn_id) {
+                        self.dec_waiter_stats(waiter.conn_id);
                         let resp = self.do_reserve(waiter.conn_id, job_id);
                         let _ = waiter.reply_tx.send(resp);
                     } else {
@@ -2533,10 +2536,36 @@ impl ServerState {
         }
     }
 
+    fn add_waiter(&mut self, conn_id: u64, reply_tx: oneshot::Sender<Response>, deadline: Option<Instant>) {
+        self.stats.waiting_ct += 1;
+        if let Some(conn) = self.conns.get(&conn_id) {
+            for w in &conn.watched {
+                if let Some(tube) = self.tubes.get_mut(&w.name) {
+                    tube.stat.waiting_ct += 1;
+                    tube.waiting_conns.push(conn_id);
+                }
+            }
+        }
+        self.waiters.push(WaitingReserve { conn_id, reply_tx, deadline });
+    }
+
+    fn dec_waiter_stats(&mut self, conn_id: u64) {
+        self.stats.waiting_ct = self.stats.waiting_ct.saturating_sub(1);
+        if let Some(conn) = self.conns.get(&conn_id) {
+            for w in &conn.watched {
+                if let Some(tube) = self.tubes.get_mut(&w.name) {
+                    tube.stat.waiting_ct = tube.stat.waiting_ct.saturating_sub(1);
+                    tube.waiting_conns.retain(|&c| c != conn_id);
+                }
+            }
+        }
+    }
+
     fn remove_waiter(&mut self, conn_id: u64) {
         let mut i = 0;
         while i < self.waiters.len() {
             if self.waiters[i].conn_id == conn_id {
+                self.dec_waiter_stats(conn_id);
                 let waiter = self.waiters.remove(i);
                 let _ = waiter.reply_tx.send(Response::TimedOut);
             } else {
@@ -2734,6 +2763,7 @@ impl ServerState {
         }
         for &i in deadline_soon_indices.iter().rev() {
             let waiter = self.waiters.remove(i);
+            self.dec_waiter_stats(waiter.conn_id);
             let _ = waiter.reply_tx.send(Response::DeadlineSoon);
         }
 
@@ -2750,7 +2780,9 @@ impl ServerState {
         // Remove from back to front
         let mut expired = Vec::new();
         for &i in timed_out.iter().rev() {
-            expired.push(self.waiters.remove(i));
+            let waiter = self.waiters.remove(i);
+            self.dec_waiter_stats(waiter.conn_id);
+            expired.push(waiter);
         }
 
         // Now send responses (no longer borrowing self.waiters)
@@ -3242,11 +3274,7 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                                     let deadline = timeout.map(|t| {
                                         Instant::now() + Duration::from_secs(t as u64)
                                     });
-                                    state.waiters.push(WaitingReserve {
-                                        conn_id: msg.conn_id,
-                                        reply_tx,
-                                        deadline,
-                                    });
+                                    state.add_waiter(msg.conn_id, reply_tx, deadline);
                                     continue;
                                 }
 
