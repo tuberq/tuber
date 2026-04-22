@@ -1057,10 +1057,11 @@ impl ServerState {
         }
         self.stats.reserved_ct += 1;
 
+        let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
         self.wal_write_state_change(
             job_id,
             Some(JobState::Reserved),
-            0,
+            pri,
             Duration::ZERO,
             0,
             StateChangeReason::Reserve,
@@ -1714,10 +1715,11 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
+                let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
                 self.wal_write_state_change(
                     job_id,
                     Some(JobState::Ready),
-                    0,
+                    pri,
                     Duration::ZERO,
                     0,
                     StateChangeReason::Kick,
@@ -1756,10 +1758,11 @@ impl ServerState {
                     }
                 }
                 // WAL: write kick state change
+                let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
                 self.wal_write_state_change(
                     job_id,
                     Some(JobState::Ready),
-                    0,
+                    pri,
                     Duration::ZERO,
                     0,
                     StateChangeReason::Kick,
@@ -1823,10 +1826,11 @@ impl ServerState {
         }
 
         // WAL: write kick state change
+        let pri = self.jobs.get(&id).map_or(0, |j| j.priority);
         self.wal_write_state_change(
             id,
             Some(JobState::Ready),
-            0,
+            pri,
             Duration::ZERO,
             0,
             StateChangeReason::Kick,
@@ -2740,10 +2744,11 @@ impl ServerState {
                         }
                     }
                 }
+                let pri = self.jobs.get(&job_id).map_or(0, |j| j.priority);
                 self.wal_write_state_change(
                     job_id,
                     Some(JobState::Ready),
-                    0,
+                    pri,
                     Duration::ZERO,
                     0,
                     StateChangeReason::Timeout,
