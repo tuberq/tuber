@@ -2681,6 +2681,9 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
 /// must complete this step *before* binding the listener, so the accept
 /// port only becomes reachable once the server is genuinely able to serve
 /// commands.
+///
+/// May return `io::ErrorKind::OutOfMemory` if, after replaying the WAL,
+/// the actual in-memory job set exceeds `max_job_bytes`.
 fn build_state(
     max_job_size: u32,
     max_job_bytes: Option<u64>,
@@ -2700,29 +2703,29 @@ fn build_state(
         )?;
         let on_disk = wal.total_disk_bytes();
 
-        // If the binlog is larger than the configured memory budget, abort
-        // before replay. On-disk size is a conservative upper bound for the
-        // in-memory working set (state-transition records compact away in RAM).
-        // A server running under the same limit will have written a binlog
-        // that fits trivially; the only way to hit this error is an operator
-        // tightening the limit below what the previous run produced.
-        if let Some(max) = max_job_bytes
-            && on_disk > max
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!(
-                    "WAL on-disk size ({on_disk} bytes) exceeds --max-jobs-size ({max} bytes). \
-                     Raise --max-jobs-size or move the binlog aside and restart."
-                ),
-            ));
-        }
-
         tracing::info!("WAL: replaying {} bytes from {:?}", on_disk, dir);
         let (jobs, next_id, tombstones) = wal.replay()?;
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
         state.restore_jobs(jobs, next_id, tombstones);
+
+        // Enforce the in-memory budget after replay. The WAL on-disk size
+        // is not a reliable proxy (tombstones, superseded records, and format
+        // overhead can make it 1.4x+ larger than the live set), so we measure
+        // the actual in-memory cost.
+        if let Some(max) = max_job_bytes
+            && state.total_job_bytes > max
+        {
+            let actual = state.total_job_bytes;
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "WAL replay produced {actual} in-memory bytes, exceeds --max-jobs-size \
+                     ({max} bytes). Raise --max-jobs-size or move the binlog aside and restart."
+                ),
+            ));
+        }
+
         state.wal = Some(wal);
         tracing::info!(
             "WAL: replayed {} jobs and {} idempotency tombstones from {:?}",

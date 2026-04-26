@@ -81,8 +81,10 @@ enum Commands {
 
         /// Maximum total in-memory size of all jobs (bodies + per-job overhead
         /// + idempotency tombstones). PUT returns OUT_OF_MEMORY once exceeded;
-        /// reserve/release/bury/kick/delete always succeed. Accepts suffixes:
-        /// k, m, g, t (e.g. 2g, 500M, 100k). Default: unlimited.
+        /// reserve/release/bury/kick/delete always succeed. Also enforced at
+        /// startup: replay aborts if the binlog would exceed the budget in
+        /// memory. Accepts suffixes: k, m, g, t (e.g. 2g, 500M, 100k).
+        /// Default: unlimited.
         #[arg(long, value_parser = tuber::server::parse_bytes, env = "TUBER_MAX_JOBS_SIZE")]
         max_jobs_size: Option<u64>,
 

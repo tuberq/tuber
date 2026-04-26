@@ -1,9 +1,16 @@
 # Changes
 
+## v0.5.5
+
+**Fix WAL pre-flight check blocking restarts**
+
+- Remove the WAL on-disk size pre-flight check that compared raw binlog bytes against `--max-jobs-size`. In production, WAL bloat from tombstones, deleted records, and multi-file overhead made the on-disk size ~1.4× larger than the live in-memory set, blocking restarts even at 41% memory capacity. The post-replay check (added in 0.5.4) is the sole enforcement and uses the actual in-memory `total_job_bytes`.
+
 ## v0.5.4
 
 **Bug fixes for stats, WAL replay, group state, and shutdown**
 
+- `--max-jobs-size` is now exactly enforced after WAL replay. A post-replay check compares `total_job_bytes` against `--max-jobs-size` and aborts with a distinct diagnostic message naming the in-memory size.
 - Fix `reserve-job` bypassing `after_group` dependencies; add tests for `waiting_ct` and WAL priority preservation.
 - Await engine task on shutdown to prevent WAL data loss.
 - Simplify SIGTERM WAL test; tidy shutdown comments.

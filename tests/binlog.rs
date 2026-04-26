@@ -686,8 +686,8 @@ async fn test_binlog_replay_aborts_when_over_budget() {
         "error message should mention --max-jobs-size: {msg}"
     );
     assert!(
-        msg.contains("WAL on-disk size"),
-        "error message should mention on-disk size: {msg}"
+        msg.contains("in-memory"),
+        "error message should mention in-memory size: {msg}"
     );
 
     // Third run: generous budget — all five jobs replay successfully.
@@ -700,6 +700,58 @@ async fn test_binlog_replay_aborts_when_over_budget() {
     assert!(
         body.contains("current-jobs-ready: 5"),
         "expected 5 ready jobs after replay: {body}"
+    );
+}
+
+/// Replay aborts when a small-body workload blows the in-memory budget.
+/// The WAL on-disk size can be 3–5× under the actual in-memory cost when
+/// bodies are tiny, because per-job overhead (HashMap bucket, String headers,
+/// allocator slack) is not represented on disk.
+#[tokio::test]
+async fn test_binlog_replay_aborts_when_in_memory_exceeds_budget() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // First run: no limit. Many tiny jobs — the regime where on-disk size
+    // (~105 B/job) drastically understates RAM cost (~522 B/job for a 10-byte
+    // body in the "default" tube).
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+    for i in 0..50 {
+        c.mustsend("put 0 0 60 10\r\n").await;
+        c.mustsend(&format!("{}\r\n", "x".repeat(10))).await;
+        c.ckresp(&format!("INSERTED {}\r\n", i + 1)).await;
+    }
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Second run: budget chosen between disk size (~5.3 KB) and in-memory
+    // size (~26 KB). Pre-flight passes; post-replay check must fire.
+    let result = TestServer::try_start_with_wal_and_max_jobs_size(&wal_dir, 10_000).await;
+    let err = result
+        .err()
+        .expect("expected post-replay check to abort with an error");
+    assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--max-jobs-size"),
+        "error message should mention --max-jobs-size: {msg}"
+    );
+    assert!(
+        msg.contains("in-memory"),
+        "error message should mention in-memory size: {msg}"
+    );
+
+    // Third run: generous budget — all 50 jobs replay successfully.
+    let srv3 = TestServer::try_start_with_wal_and_max_jobs_size(&wal_dir, 1024 * 1024)
+        .await
+        .expect("generous budget should allow replay");
+    let mut c3 = srv3.connect().await;
+    c3.mustsend("stats\r\n").await;
+    let body = c3.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-ready: 50"),
+        "expected 50 ready jobs after replay: {body}"
     );
 }
 
