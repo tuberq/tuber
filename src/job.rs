@@ -24,6 +24,13 @@ pub const TINY_INLINE_BYTES: usize = 23;
 /// Below this they ride along inside the WAL FullJob record.
 pub const HEAP_INLINE_MAX: usize = 256;
 
+/// Single source of truth for the put-time / size-estimate placement
+/// decision: a body goes to the external body store iff the store is
+/// configured and the body is larger than the inline threshold.
+pub fn should_externalize(body_len: usize, body_store_enabled: bool) -> bool {
+    body_store_enabled && body_len > HEAP_INLINE_MAX
+}
+
 /// Where a job's body lives.
 ///
 /// `Tiny` keeps very small bodies inside the enum slot itself (no heap
@@ -83,9 +90,8 @@ impl BodyRef {
     pub fn take_inline(&mut self) -> Option<Vec<u8>> {
         match self {
             BodyRef::Tiny { len, bytes } => {
-                let n = *len as usize;
-                let v = bytes[..n].to_vec();
-                *self = BodyRef::Tiny { len: 0, bytes: [0u8; TINY_INLINE_BYTES] };
+                let v = bytes[..*len as usize].to_vec();
+                *len = 0;
                 Some(v)
             }
             BodyRef::Heap(_) => {

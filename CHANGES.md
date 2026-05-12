@@ -1,5 +1,17 @@
 # Changes
 
+## v0.7.1
+
+**Three-tier body storage cleanup**
+
+Follow-up to v0.7.0. Behaviour unchanged; the three-tier path is now expressed more directly. Net 18 fewer lines across `src/`.
+
+- New `job::should_externalize(body_len, body_store_enabled)` is the single source of truth for the placement decision; the put-path WAL-size estimate and the body-ref construction both call it instead of repeating the threshold check.
+- `serialize_full_job` and `fetch_body` route `Tiny` and `Heap` through `BodyRef::as_inline_bytes()` so only one inline branch exists in each. The post-shortcut `External` case uses a `let … else` instead of an exhaustive match with `unreachable!()` arms.
+- `estimate_full_job_size_raw` takes `Option<&str>` for the four optional-key fields instead of `&Option<String>` / `&Option<(String, u32)>` — drops a `String::clone()` per put on the WAL size-estimate hot path.
+- Legacy-WAL migration loop uses `if len > HEAP_INLINE_MAX && let Some(bytes) = body.take_inline()` so the size guard is the only filter — `take_inline` returns `None` for `External` naturally, no separate `matches!()`-then-`expect()`.
+- `take_inline` on `Tiny` clears `len` in place instead of re-emitting a zeroed 23-byte placeholder.
+
 ## v0.7.0
 
 **Three-tier body storage: small bodies skip TOAST**

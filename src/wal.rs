@@ -244,23 +244,18 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
     );
 
     // body — v6: `body_kind` discriminant + variant payload.
-    //   Tiny/Heap → kind=0x00, then `body_len (u32 LE)` then `len` bytes.
-    //   External  → kind=0x01, then `body_id (u64 LE)`.
-    match &job.body {
-        BodyRef::Tiny { len, bytes } => {
-            payload.push(BODY_KIND_INLINE);
-            payload.extend_from_slice(&(*len as u32).to_le_bytes());
-            payload.extend_from_slice(&bytes[..*len as usize]);
-        }
-        BodyRef::Heap(v) => {
-            payload.push(BODY_KIND_INLINE);
-            payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            payload.extend_from_slice(v);
-        }
-        BodyRef::External(id) => {
-            payload.push(BODY_KIND_EXTERNAL);
-            payload.extend_from_slice(&id.0.to_le_bytes());
-        }
+    //   inline   → kind=0x00, then `body_len (u32 LE)` then `len` bytes.
+    //   external → kind=0x01, then `body_id (u64 LE)`.
+    if let Some(bytes) = job.body.as_inline_bytes() {
+        payload.push(BODY_KIND_INLINE);
+        payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(bytes);
+    } else {
+        let BodyRef::External(id) = &job.body else {
+            unreachable!("as_inline_bytes returned None ⇒ External");
+        };
+        payload.push(BODY_KIND_EXTERNAL);
+        payload.extend_from_slice(&id.0.to_le_bytes());
     }
 
     // Build full record: type + job_id + payload_len + payload + crc
@@ -319,14 +314,13 @@ fn body_section_bytes(body_len: usize, body_external: bool) -> usize {
 
 pub fn estimate_full_job_size(job: &Job) -> usize {
     let body_external = matches!(job.body, BodyRef::External(_));
-    let body_len = job.body.len();
     estimate_full_job_size_raw(
         &job.tube_name,
-        &job.idempotency_key.as_ref().map(|(k, _)| k.clone()),
-        &job.group,
-        &job.after_group,
-        &job.concurrency_key,
-        body_len,
+        job.idempotency_key.as_ref().map(|(k, _)| k.as_str()),
+        job.group.as_deref(),
+        job.after_group.as_deref(),
+        job.concurrency_key.as_ref().map(|(k, _)| k.as_str()),
+        job.body.len(),
         body_external,
     )
 }
@@ -337,10 +331,10 @@ pub fn estimate_full_job_size(job: &Job) -> usize {
 /// body lives in the body store (BodyId reference) rather than inline.
 pub fn estimate_full_job_size_raw(
     tube_name: &str,
-    idempotency_key: &Option<String>,
-    group: &Option<String>,
-    after_group: &Option<String>,
-    concurrency_key: &Option<(String, u32)>,
+    idempotency_key: Option<&str>,
+    group: Option<&str>,
+    after_group: Option<&str>,
+    concurrency_key: Option<&str>,
     body_len: usize,
     body_external: bool,
 ) -> usize {
@@ -352,10 +346,10 @@ pub fn estimate_full_job_size_raw(
     //          + concurrency_limit(4)
     let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 8 + 4 + 4;
     let variable = tube_name.len()
-        + idempotency_key.as_ref().map_or(0, |s| s.len())
-        + group.as_ref().map_or(0, |s| s.len())
-        + after_group.as_ref().map_or(0, |s| s.len())
-        + concurrency_key.as_ref().map_or(0, |(s, _)| s.len());
+        + idempotency_key.map_or(0, str::len)
+        + group.map_or(0, str::len)
+        + after_group.map_or(0, str::len)
+        + concurrency_key.map_or(0, str::len);
     fixed + variable + body_section_bytes(body_len, body_external)
 }
 

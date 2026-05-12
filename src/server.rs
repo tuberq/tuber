@@ -327,31 +327,31 @@ impl ServerState {
         }
     }
 
-    /// Materialise a job's body bytes for the wire. Inline bodies (`Tiny`
-    /// and `Heap`) are copied directly; external bodies are read from the
-    /// body store. Returns `None` if the body is external but the store
-    /// is missing or the read fails — call sites surface this as
+    /// Materialise a job's body bytes for the wire. Inline bodies are
+    /// copied directly; external bodies are read from the body store.
+    /// Returns `None` if the body is external but the store is missing
+    /// or the read fails — call sites surface this as
     /// `Response::InternalError`.
     fn fetch_body(&self, job: &Job) -> Option<Vec<u8>> {
-        match &job.body {
-            BodyRef::Tiny { len, bytes } => Some(bytes[..*len as usize].to_vec()),
-            BodyRef::Heap(v) => Some(v.clone()),
-            BodyRef::External(id) => {
-                let bs = self.body_store.as_ref()?;
-                match bs.read_body(*id) {
-                    Ok(bytes) => Some(bytes),
-                    Err(e) => {
-                        tracing::error!(
-                            job_id = job.id,
-                            body_id = id.0,
-                            tube = %job.tube_name,
-                            state = job.state.as_str(),
-                            error = %e,
-                            "TOAST read failed",
-                        );
-                        None
-                    }
-                }
+        if let Some(bytes) = job.body.as_inline_bytes() {
+            return Some(bytes.to_vec());
+        }
+        let BodyRef::External(id) = &job.body else {
+            unreachable!("as_inline_bytes returned None ⇒ External");
+        };
+        let bs = self.body_store.as_ref()?;
+        match bs.read_body(*id) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::error!(
+                    job_id = job.id,
+                    body_id = id.0,
+                    tube = %job.tube_name,
+                    state = job.state.as_str(),
+                    error = %e,
+                    "TOAST read failed",
+                );
+                None
             }
         }
     }
@@ -940,19 +940,17 @@ impl ServerState {
 
         // WAL: check space reservation
         if let Some(wal) = &self.wal {
-            // Estimate record size for reservation check. The body lives
-            // inline in the WAL record unless it'll be pushed to the body
-            // store; the call site is the only place that knows which
-            // path the body will take.
-            let idp_key_str = idempotency_key.as_ref().map(|(k, _)| k.clone());
+            // The body lives inline in the WAL record unless it'll be
+            // pushed to the body store. Same decision used by the put
+            // path below.
             let will_externalize =
-                self.body_store.is_some() && body.len() > crate::job::HEAP_INLINE_MAX;
+                crate::job::should_externalize(body.len(), self.body_store.is_some());
             let est_size = crate::wal::estimate_full_job_size_raw(
                 &tube_name,
-                &idp_key_str,
-                &group,
-                &after_group,
-                &concurrency_key,
+                idempotency_key.as_ref().map(|(k, _)| k.as_str()),
+                group.as_deref(),
+                after_group.as_deref(),
+                concurrency_key.as_ref().map(|(k, _)| k.as_str()),
                 body.len(),
                 will_externalize,
             );
@@ -974,29 +972,20 @@ impl ServerState {
         let id = self.next_job_id;
         self.next_job_id += 1;
 
-        // Three-tier body placement (v6 WAL):
-        //   - `Tiny`  (≤ TINY_INLINE_BYTES): inline in the enum slot,
-        //     no heap allocation, body rides along in the WAL record.
-        //   - `Heap`  (≤ HEAP_INLINE_MAX): heap `Vec`, body inline in
-        //     the WAL record. Avoids the body-store mutex hop and the
-        //     per-body TOAST overhead for medium bodies.
-        //   - `External`: body bytes written to the body store; the
-        //     WAL record carries only the `BodyId`. The sync
-        //     coordinator inside `Wal` will fsync TOAST before the
-        //     WAL record landing this id.
-        let body_ref = if body.len() <= crate::job::HEAP_INLINE_MAX
-            || self.body_store.is_none()
-        {
-            BodyRef::new_inline(body)
-        } else {
-            let bs = self.body_store.as_ref().unwrap();
-            match bs.write_body(&body) {
-                Ok(body_id) => BodyRef::External(body_id),
-                Err(e) => {
-                    tracing::error!("body store write failed: {}", e);
-                    return Response::InternalError;
+        // External path is taken only for bodies too large to amortise
+        // the body-store's per-body overhead — avoids the body-store
+        // mutex hop and TOAST compaction churn for small bodies.
+        let body_ref = match self.body_store.as_ref() {
+            Some(bs) if crate::job::should_externalize(body.len(), true) => {
+                match bs.write_body(&body) {
+                    Ok(body_id) => BodyRef::External(body_id),
+                    Err(e) => {
+                        tracing::error!("body store write failed: {}", e);
+                        return Response::InternalError;
+                    }
                 }
             }
+            _ => BodyRef::new_inline(body),
         };
 
         let mut job = Job::new(
@@ -3129,22 +3118,15 @@ fn build_state(
             );
         }
 
-        // Migrate inline bodies recovered from pre-v5 WAL records into the
-        // body store, but only for bodies large enough to belong there.
-        // Small bodies stay inline — v6 supports inline bodies natively,
-        // and the whole point of three-tier storage is to keep them out
-        // of TOAST. v5 records already arrive as External — left alone.
+        // Migrate inline bodies recovered from pre-v5 WAL records into
+        // the body store, but only for bodies large enough to belong
+        // there. v5 records replay as External (len=0) and skip the
+        // guard; v3/v4 small bodies stay inline.
         let mut migrated = 0u64;
         for job in jobs.values_mut() {
-            let is_inline = matches!(
-                job.body,
-                BodyRef::Tiny { .. } | BodyRef::Heap(_)
-            );
-            if is_inline && job.body.len() > crate::job::HEAP_INLINE_MAX {
-                let bytes = job
-                    .body
-                    .take_inline()
-                    .expect("matches checked inline above");
+            if job.body.len() > crate::job::HEAP_INLINE_MAX
+                && let Some(bytes) = job.body.take_inline()
+            {
                 let body_id = body_store.write_body(&bytes)?;
                 job.body = BodyRef::External(body_id);
                 migrated += 1;
