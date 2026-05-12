@@ -1,5 +1,25 @@
 # Changes
 
+## v0.7.0
+
+**Three-tier body storage: small bodies skip TOAST**
+
+Empirical: a 1 M-put flood of 64-byte jobs against `tuber server` produced multi-second pauses lining up exactly with `TOAST segment compacted` log lines. TOAST compaction takes the body-store mutex per migrated body, and `write_body` on the put path needs the same mutex — so puts queue behind the migration. Small bodies also pay a structural tax even when no compaction is running: 20-byte segment-header + ~32-byte in-RAM index entry + a positioned disk read on every reserve, for a 64-byte payload that already fits in the unused half of the `BodyRef` enum slot.
+
+The fix is a three-tier `BodyRef`:
+
+- `Tiny { len: u8, bytes: [u8; 23] }` — bodies ≤ 23 bytes inline directly in the enum slot. Zero heap allocation. Sized so a binary UUID (16 B) or a `u64` decimal (≤ 20 B) fits.
+- `Heap(Vec<u8>)` — bodies 24 – 256 bytes still inline in the WAL FullJob record, but on the heap. No body-store traffic.
+- `External(BodyId)` — bodies > 256 bytes go through TOAST as before. This is where TOAST's per-body overhead amortises against the body itself.
+
+Result on the reproducer above: zero `TOAST segment compacted` events during the run; put throughput stays flat with no multi-second gaps.
+
+**WAL format v5 → v6.** The FullJob record's trailing `body_id (u64)` becomes a 1-byte `body_kind` discriminant followed by either inline `len + bytes` (kind=0) or a `BodyId` (kind=1). The discriminant is per-record, so the runtime threshold is a constant, not a format commitment — changing `HEAP_INLINE_MAX` later doesn't require another version bump. v5 reads still work (every v5 body is External); v3/v4 reads still work with `--migrate-wal`, but only bodies > 256 B get pushed into TOAST during migration — smaller ones are rewritten as inline v6 records and stay out of the body store.
+
+No configuration change required. The two thresholds (23 B and 256 B) are compile-time constants chosen from structural reality (enum-slot size; TOAST per-body fixed overhead amortisation point) rather than tuning surface — no new flag.
+
+The earlier "always external when persistence is on" rationale (see `docs/wal-body-split.md`) wasn't wrong about reserve-side cost, but missed the put-side cost of TOAST itself for very small bodies under contention.
+
 ## v0.6.4
 
 **`stats-group` per-state member counters**

@@ -21,11 +21,19 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 /// - v3: original format.
 /// - v4: state-change records gained a `reason` byte.
 /// - v5: `FullJob` records carry a `BodyId` instead of inline body bytes.
-///       Bodies live in the external body store ("TOAST"). Older versions
-///       are still readable; their inline bodies are migrated into the body
-///       store on replay.
-pub const WAL_VERSION: u32 = 5;
+///       Bodies live in the external body store ("TOAST").
+/// - v6: `FullJob` body field is a per-record `body_kind` discriminant
+///       followed by either inline bytes (kind=0) or a `BodyId` (kind=1).
+///       Small bodies stay inline in the WAL record; only larger ones
+///       are pushed to the body store. The discriminant decouples the
+///       on-disk format from the runtime threshold choice — changing
+///       `HEAP_INLINE_MAX` doesn't require a format bump.
+pub const WAL_VERSION: u32 = 6;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
+
+// v6 body_kind discriminant values
+const BODY_KIND_INLINE: u8 = 0x00;
+const BODY_KIND_EXTERNAL: u8 = 0x01;
 const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
@@ -235,17 +243,25 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
             .to_le_bytes(),
     );
 
-    // body — v5 carries a BodyId reference into the external body store.
-    // Inline bodies must not reach this path; the put / replay-migration
-    // hooks switch every Job to BodyRef::External before serialization.
-    let body_id = match &job.body {
-        BodyRef::External(id) => id.0,
-        BodyRef::Inline(_) => unreachable!(
-            "WAL v5 serialization received an Inline body — \
-             the body store integration must run before write_put"
-        ),
-    };
-    payload.extend_from_slice(&body_id.to_le_bytes());
+    // body — v6: `body_kind` discriminant + variant payload.
+    //   Tiny/Heap → kind=0x00, then `body_len (u32 LE)` then `len` bytes.
+    //   External  → kind=0x01, then `body_id (u64 LE)`.
+    match &job.body {
+        BodyRef::Tiny { len, bytes } => {
+            payload.push(BODY_KIND_INLINE);
+            payload.extend_from_slice(&(*len as u32).to_le_bytes());
+            payload.extend_from_slice(&bytes[..*len as usize]);
+        }
+        BodyRef::Heap(v) => {
+            payload.push(BODY_KIND_INLINE);
+            payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            payload.extend_from_slice(v);
+        }
+        BodyRef::External(id) => {
+            payload.push(BODY_KIND_EXTERNAL);
+            payload.extend_from_slice(&id.0.to_le_bytes());
+        }
+    }
 
     // Build full record: type + job_id + payload_len + payload + crc
     let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
@@ -290,38 +306,57 @@ pub fn serialize_state_change(
     record
 }
 
+/// On-wire size of the v6 body section for a FullJob record.
+/// `body_external == true` selects the BodyId encoding; otherwise the
+/// body rides inline as `len + bytes`.
+fn body_section_bytes(body_len: usize, body_external: bool) -> usize {
+    if body_external {
+        1 + 8 // body_kind + BodyId
+    } else {
+        1 + 4 + body_len // body_kind + body_len + bytes
+    }
+}
+
 pub fn estimate_full_job_size(job: &Job) -> usize {
-    // v5 layout:
-    //   type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
-    //   payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1)
-    //          + 5 counters * 4 = 20 + tube_name_len(2) + tube_name
-    //          + 4 option_strings (2 bytes each min) + concurrency_limit(4)
-    //          + idp_ttl(4) + body_id(8)
-    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 8 + 8 + 4 + 4;
-    let variable = job.tube_name.len()
-        + job.idempotency_key.as_ref().map_or(0, |(s, _)| s.len())
-        + job.group.as_ref().map_or(0, |s| s.len())
-        + job.after_group.as_ref().map_or(0, |s| s.len())
-        + job.concurrency_key.as_ref().map_or(0, |(s, _)| s.len());
-    fixed + variable
+    let body_external = matches!(job.body, BodyRef::External(_));
+    let body_len = job.body.len();
+    estimate_full_job_size_raw(
+        &job.tube_name,
+        &job.idempotency_key.as_ref().map(|(k, _)| k.clone()),
+        &job.group,
+        &job.after_group,
+        &job.concurrency_key,
+        body_len,
+        body_external,
+    )
 }
 
 /// Estimate full job record size without needing a Job struct.
+///
+/// `body_len` is the body byte count; `body_external` indicates the
+/// body lives in the body store (BodyId reference) rather than inline.
 pub fn estimate_full_job_size_raw(
     tube_name: &str,
     idempotency_key: &Option<String>,
     group: &Option<String>,
     after_group: &Option<String>,
     concurrency_key: &Option<(String, u32)>,
+    body_len: usize,
+    body_external: bool,
 ) -> usize {
-    // v5 layout — see [`estimate_full_job_size`] for field-by-field accounting.
-    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 8 + 8 + 4 + 4;
+    // v6 layout (excluding the body section, which body_section_bytes covers):
+    //   type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
+    //   payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1)
+    //          + 5 counters * 4 = 20 + tube_name_len(2) + tube_name
+    //          + 4 option_strings (2 bytes each min) + idp_ttl(4)
+    //          + concurrency_limit(4)
+    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 8 + 4 + 4;
     let variable = tube_name.len()
         + idempotency_key.as_ref().map_or(0, |s| s.len())
         + group.as_ref().map_or(0, |s| s.len())
         + after_group.as_ref().map_or(0, |s| s.len())
         + concurrency_key.as_ref().map_or(0, |(s, _)| s.len());
-    fixed + variable
+    fixed + variable + body_section_bytes(body_len, body_external)
 }
 
 // --- Deserialization ---
@@ -454,10 +489,33 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
     let concurrency_limit = read_u32!();
     let concurrency_key = concurrency_key_str.map(|k| (k, concurrency_limit.max(1)));
 
-    // body — v5 records reference a BodyId in the external body store;
-    // older records carry inline bytes that the replay-migration step will
-    // promote into the body store after the fact.
-    let body_ref = if version >= 5 {
+    // body — v6 records carry a body_kind discriminant + variant payload.
+    // v5 records always reference a BodyId (external). v3/v4 records carry
+    // raw inline bytes that the legacy migration step promotes into the
+    // appropriate tier.
+    let body_ref = if version >= 6 {
+        if off >= payload.len() {
+            return Err(WalError::Truncated);
+        }
+        let kind = payload[off];
+        off += 1;
+        match kind {
+            BODY_KIND_INLINE => {
+                let body_len = read_u32!() as usize;
+                if off + body_len > payload.len() {
+                    return Err(WalError::Truncated);
+                }
+                let body = payload[off..off + body_len].to_vec();
+                off += body_len;
+                BodyRef::new_inline(body)
+            }
+            BODY_KIND_EXTERNAL => {
+                let body_id = read_u64!();
+                BodyRef::External(crate::job::BodyId(body_id))
+            }
+            _ => return Err(WalError::InvalidData),
+        }
+    } else if version == 5 {
         let body_id = read_u64!();
         BodyRef::External(crate::job::BodyId(body_id))
     } else {
@@ -467,7 +525,7 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
         }
         let body = payload[off..off + body_len].to_vec();
         off += body_len;
-        BodyRef::Inline(body)
+        BodyRef::new_inline(body)
     };
     let _ = off;
 
@@ -1439,6 +1497,57 @@ mod tests {
         } else {
             panic!("expected FullJob");
         }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_full_job_tiny_body() {
+        let mut job = make_test_job(7, b"");
+        job.body = BodyRef::new_inline(b"uuid-like".to_vec());
+        assert!(matches!(job.body, BodyRef::Tiny { len: 9, .. }));
+
+        let record = serialize_full_job(&job);
+        let (rec, consumed) = deserialize_record(&record, WAL_VERSION).unwrap();
+        assert_eq!(consumed, record.len());
+
+        let WalRecord::FullJob(j) = rec else {
+            panic!("expected FullJob");
+        };
+        assert!(matches!(j.body, BodyRef::Tiny { len: 9, .. }));
+        assert_eq!(j.body.as_inline_bytes(), Some(&b"uuid-like"[..]));
+    }
+
+    #[test]
+    fn test_serialize_deserialize_full_job_heap_body() {
+        let mut job = make_test_job(8, b"");
+        let payload = vec![0xABu8; 64];
+        job.body = BodyRef::new_inline(payload.clone());
+        assert!(matches!(job.body, BodyRef::Heap(_)));
+
+        let record = serialize_full_job(&job);
+        let (rec, consumed) = deserialize_record(&record, WAL_VERSION).unwrap();
+        assert_eq!(consumed, record.len());
+
+        let WalRecord::FullJob(j) = rec else {
+            panic!("expected FullJob");
+        };
+        assert!(matches!(j.body, BodyRef::Heap(_)));
+        assert_eq!(j.body.as_inline_bytes(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn test_serialize_deserialize_full_job_empty_body() {
+        let mut job = make_test_job(9, b"");
+        job.body = BodyRef::new_inline(Vec::new());
+        assert!(matches!(job.body, BodyRef::Tiny { len: 0, .. }));
+
+        let record = serialize_full_job(&job);
+        let (rec, _) = deserialize_record(&record, WAL_VERSION).unwrap();
+
+        let WalRecord::FullJob(j) = rec else {
+            panic!("expected FullJob");
+        };
+        assert!(matches!(j.body, BodyRef::Tiny { len: 0, .. }));
+        assert_eq!(j.body.as_inline_bytes(), Some(&[][..]));
     }
 
     #[test]

@@ -12,21 +12,53 @@ pub const JOB_DATA_SIZE_LIMIT_MAX: u32 = 1_073_741_824;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BodyId(pub u64);
 
-/// Where a job's body lives. `Inline` carries the bytes in-process;
-/// `External` references a body owned by the `BodyStore` (TOAST).
+/// Inline-body upper bound for the zero-heap-alloc `Tiny` variant.
+/// Sized to fit a binary UUID (16B) and a `u64` decimal (≤20B) with
+/// room to spare, while keeping the enum slot the same width as the
+/// 24-byte `Vec<u8>`/`BodyId` payload it sits next to (23 bytes data +
+/// 1 byte length).
+pub const TINY_INLINE_BYTES: usize = 23;
+
+/// Upper bound for inline-in-WAL bodies. Above this, bodies go through
+/// the external body store so the per-body TOAST overhead amortises.
+/// Below this they ride along inside the WAL FullJob record.
+pub const HEAP_INLINE_MAX: usize = 256;
+
+/// Where a job's body lives.
+///
+/// `Tiny` keeps very small bodies inside the enum slot itself (no heap
+/// allocation). `Heap` keeps medium bodies on the heap but still inline
+/// in the WAL record (no body-store traffic). `External` references a
+/// body owned by the `BodyStore` (TOAST).
 #[derive(Debug, Clone)]
 pub enum BodyRef {
-    Inline(Vec<u8>),
+    Tiny { len: u8, bytes: [u8; TINY_INLINE_BYTES] },
+    Heap(Vec<u8>),
     External(BodyId),
 }
 
 impl BodyRef {
-    /// Number of body bytes resident in RAM. `External` returns 0 because
-    /// those bytes live in the body store, not this `Job`. Drives the
-    /// in-memory budget accounting.
+    /// Wrap owned bytes in the cheapest inline tier. Bytes that fit in
+    /// `TINY_INLINE_BYTES` go into the enum slot; larger ones stay on
+    /// the heap. Never produces `External` — that decision lives at the
+    /// put path where the body-store is available.
+    pub fn new_inline(bytes: Vec<u8>) -> Self {
+        if bytes.len() <= TINY_INLINE_BYTES {
+            let mut buf = [0u8; TINY_INLINE_BYTES];
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            BodyRef::Tiny { len: bytes.len() as u8, bytes: buf }
+        } else {
+            BodyRef::Heap(bytes)
+        }
+    }
+
+    /// Number of body bytes resident in RAM. `External` returns 0
+    /// because those bytes live in the body store, not this `Job`.
+    /// Drives the in-memory budget accounting.
     pub fn len(&self) -> usize {
         match self {
-            BodyRef::Inline(v) => v.len(),
+            BodyRef::Tiny { len, .. } => *len as usize,
+            BodyRef::Heap(v) => v.len(),
             BodyRef::External(_) => 0,
         }
     }
@@ -35,15 +67,30 @@ impl BodyRef {
         self.len() == 0
     }
 
-    /// If this is `Inline`, take its bytes and replace the slot with an
-    /// empty `Inline`. Returns `None` for `External`. Used by the v4→v5
-    /// replay migration to lift inline bytes into the body store without
-    /// fighting the borrow checker.
+    /// Borrow inline bytes if the body is `Tiny` or `Heap`. Returns
+    /// `None` for `External` (where bytes live in the body store).
+    pub fn as_inline_bytes(&self) -> Option<&[u8]> {
+        match self {
+            BodyRef::Tiny { len, bytes } => Some(&bytes[..*len as usize]),
+            BodyRef::Heap(v) => Some(v.as_slice()),
+            BodyRef::External(_) => None,
+        }
+    }
+
+    /// If this body is inline (`Tiny` or `Heap`), take its bytes and
+    /// leave an empty placeholder. Returns `None` for `External`. Used
+    /// by the legacy WAL replay migration path.
     pub fn take_inline(&mut self) -> Option<Vec<u8>> {
         match self {
-            BodyRef::Inline(_) => {
-                let placeholder = BodyRef::Inline(Vec::new());
-                let BodyRef::Inline(bytes) = std::mem::replace(self, placeholder) else {
+            BodyRef::Tiny { len, bytes } => {
+                let n = *len as usize;
+                let v = bytes[..n].to_vec();
+                *self = BodyRef::Tiny { len: 0, bytes: [0u8; TINY_INLINE_BYTES] };
+                Some(v)
+            }
+            BodyRef::Heap(_) => {
+                let placeholder = BodyRef::Heap(Vec::new());
+                let BodyRef::Heap(bytes) = std::mem::replace(self, placeholder) else {
                     unreachable!()
                 };
                 Some(bytes)
@@ -142,7 +189,7 @@ impl Job {
             priority,
             delay,
             ttr,
-            body: BodyRef::Inline(body),
+            body: BodyRef::new_inline(body),
             state,
             tube_name,
             idempotency_key: None,
@@ -195,7 +242,7 @@ where
     jobs.into_iter()
         .filter_map(|j| match &j.borrow().body {
             BodyRef::External(id) => Some(*id),
-            BodyRef::Inline(_) => None,
+            BodyRef::Tiny { .. } | BodyRef::Heap(_) => None,
         })
         .collect()
 }
@@ -327,7 +374,27 @@ mod tests {
     }
 
     #[test]
-    fn test_body_ref_inline_round_trip() {
+    fn test_body_ref_new_inline_picks_tier() {
+        // ≤ TINY_INLINE_BYTES → Tiny, no heap allocation.
+        let tiny = BodyRef::new_inline(b"abc".to_vec());
+        assert!(matches!(tiny, BodyRef::Tiny { len: 3, .. }));
+        assert_eq!(tiny.len(), 3);
+        assert_eq!(tiny.as_inline_bytes(), Some(&b"abc"[..]));
+
+        // exactly TINY_INLINE_BYTES → still Tiny.
+        let edge = BodyRef::new_inline(vec![7u8; TINY_INLINE_BYTES]);
+        assert!(matches!(edge, BodyRef::Tiny { .. }));
+        assert_eq!(edge.len(), TINY_INLINE_BYTES);
+
+        // TINY_INLINE_BYTES + 1 → Heap.
+        let heap = BodyRef::new_inline(vec![8u8; TINY_INLINE_BYTES + 1]);
+        assert!(matches!(heap, BodyRef::Heap(_)));
+        assert_eq!(heap.len(), TINY_INLINE_BYTES + 1);
+    }
+
+    #[test]
+    fn test_body_ref_job_new_uses_tier() {
+        // 11-byte body fits in Tiny.
         let job = Job::new(
             1,
             10,
@@ -336,19 +403,43 @@ mod tests {
             b"hello-toast".to_vec(),
             "default".into(),
         );
-        let BodyRef::Inline(ref bytes) = job.body else {
-            panic!("Job::new must produce Inline body");
-        };
-        assert_eq!(bytes, b"hello-toast");
+        assert!(matches!(job.body, BodyRef::Tiny { len: 11, .. }));
         assert_eq!(job.body_size(), 11);
+        assert_eq!(job.body.as_inline_bytes(), Some(&b"hello-toast"[..]));
+
+        // 64-byte body spills to Heap.
+        let big = Job::new(
+            2,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            vec![1u8; 64],
+            "default".into(),
+        );
+        assert!(matches!(big.body, BodyRef::Heap(_)));
+        assert_eq!(big.body_size(), 64);
     }
 
     #[test]
-    fn test_body_ref_take_inline() {
-        let mut inline = BodyRef::Inline(b"abc".to_vec());
-        assert_eq!(inline.take_inline().as_deref(), Some(&b"abc"[..]));
-        assert!(matches!(inline, BodyRef::Inline(ref v) if v.is_empty()));
+    fn test_body_ref_take_inline_tiny() {
+        let mut b = BodyRef::new_inline(b"abc".to_vec());
+        assert!(matches!(b, BodyRef::Tiny { len: 3, .. }));
+        assert_eq!(b.take_inline().as_deref(), Some(&b"abc"[..]));
+        assert!(b.is_empty());
+    }
 
+    #[test]
+    fn test_body_ref_take_inline_heap() {
+        let mut b = BodyRef::Heap(b"a much longer body that won't fit in Tiny".to_vec());
+        assert_eq!(
+            b.take_inline().as_deref(),
+            Some(&b"a much longer body that won't fit in Tiny"[..]),
+        );
+        assert!(matches!(b, BodyRef::Heap(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn test_body_ref_take_inline_external_returns_none() {
         let mut external = BodyRef::External(BodyId(7));
         assert!(external.take_inline().is_none());
         assert!(matches!(external, BodyRef::External(BodyId(7))));

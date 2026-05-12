@@ -1,6 +1,6 @@
 # tuber
 
-A simple, fast job queue server. One binary, zero dependencies. Running in production at [Booko.au](https://booko.au) where it's already procesed jobs in the tens of millions, and newly available in [Splat](https://github.com/dkam/splat).
+A simple, fast job queue server. One binary, zero dependencies. Running in production at [Booko.au](https://booko.au) where it's already processed jobs in the tens of millions, and newly available in [Splat](https://github.com/dkam/splat).
 
 Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, delayed jobs, job reservations, and named tubes — and adds unique jobs, concurrency control, job group pipelines, batch operations, weighted queues, and offloaded job bodies.
 
@@ -11,11 +11,11 @@ Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, dela
 
 Job queues today fall into two camps, and both make compromises.
 
-**RAM-based queues** — Redis-backed Sidekiq (Ruby), BullMQ (Node), Celery and RQ (Python), Faktory, and Beanstalkd itself — are fast, but every job lives in memory. Your queue depth is capped by host RAM, and a backlog of jobs with large payloads can push you into swap or OOM. Redis adds a second problem: it's a general-purpose data store, not a queue, so priorities, delays, reservations, and timeouts are bolted on with complexity growing at every edge case.
+**RAM-based queues** — Redis-backed Sidekiq (Ruby), BullMQ (Node), RQ (Python), Faktory, and Beanstalkd (which Tuber rewrites) — are fast, but every job lives in memory. Your queue depth is capped by host RAM, and a backlog of jobs with large payloads can push you into swap or OOM. (Celery is broker-agnostic but is most commonly deployed against Redis or RabbitMQ.) Redis adds a second problem: it's a general-purpose data store, not a queue, so priorities, delays, reservations, and timeouts are bolted on with complexity growing at every edge case.
 
 **Disk-based queues** — Solid Queue and GoodJob (Ruby), pg-boss (Node), Procrastinate (Python), River (Go) — solve the capacity problem by piggybacking on your relational database, but the queue workload is a bad fit for MVCC storage engines. High-churn job tables generate dead tuples faster than autovacuum can reclaim them, indexes bloat, and dequeue queries (`FOR UPDATE SKIP LOCKED`) get slower as the backlog grows. You also inherit the operational weight of the database — connection pooling, tuning, vacuuming, backups — and either share capacity with your application or run a second instance.
 
-**Tuber takes both.** Metadata stays in RAM for fast reserve/release/delete, backed by an optional write-ahead log for durability. Job bodies are offloaded to disk using a TOAST-style scheme (inspired by PostgreSQL), so memory usage stays bounded regardless of payload size or queue depth. You get RAM-speed coordination with disk-scale capacity, in a single binary with no database to tune.
+**Tuber takes both.** Metadata stays in RAM for fast reserve/release/delete, backed by an optional write-ahead log for durability. **Larger job bodies live on disk, not in RAM** — they're offloaded using a TOAST-style scheme (inspired by PostgreSQL), so memory usage stays bounded regardless of payload size or queue depth. Small bodies (≤ 256 B, typical for UUIDs, IDs, short envelopes) ride along inside their WAL record — they're never copied to the body store, so they avoid TOAST overhead entirely. You get RAM-speed coordination with disk-scale capacity, in a single binary with no database to tune. Unlike beanstalkd — which keeps every job body resident in memory — tuber's RAM footprint is a function of job *count*, not job *size*.
 
 Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) work out of the box across every major language. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/tuberq/beaneater/tree/tuber) for Ruby.
 
@@ -28,7 +28,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Fan-in batches** | Yes | — | Pro ¹ | Yes (flows) | Yes ⁴ | — | — |
 | **Multi-stage DAG pipelines** | Yes | — | — | Yes (flows) | — ⁴ | — | — |
 | **Weighted queues** | Yes | — | Yes | — | — | — | — |
-| **Per-job priority** | Yes (numeric) | Yes (numeric) | — ⁵ | Yes | Yes | Yes | Yes |
+| **Per-job priority** | Yes (numeric) | Yes (numeric) | Queue-level ⁵ | Yes | Yes | Yes | Yes |
 | **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Yes | Via plugin |
 | **Batch reserve / delete** | Yes | — | — | — | — | — | Prefetch |
 | **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory alarms ¹² |
@@ -54,10 +54,10 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 
 ### Storage architecture
 
-Tuber's defining design choice is splitting job storage between RAM and disk. Job *metadata* (state, priority, timing, tags) lives in RAM for fast reserve/release/delete. Job *bodies* — usually the largest part — live on disk in an append-only body store, addressed by an opaque `BodyId` in the WAL.
+Tuber's defining design choice is splitting job storage between RAM and disk. Job *metadata* (state, priority, timing, tags) lives in RAM for fast reserve/release/delete. Large job *bodies* live on disk in an append-only body store, addressed by an opaque `BodyId` in the WAL. Small bodies (≤ 256 B) stay inline inside their WAL record — they're never written to the body store, so they skip the TOAST overhead and per-body fsync coordination entirely.
 
-- **Per-job RAM cost is ~512 bytes regardless of body size.** A 1 MB job uses the same RAM as a 1 KB job. In practice, 1058 active jobs with 1 MB bodies cost ~1 GiB on disk and ~540 KB in RAM — roughly 2000× more capacity at the same RAM budget vs. an in-memory queue. The queue scales by job *count*, not job *size*.
-- **Cheap fsyncs.** Because WAL records only carry metadata plus a body reference, the latency-critical WAL fsync flushes a constant ~100 bytes per record. fsync overhead stays flat as body size grows.
+- **Per-job RAM cost is ~512 bytes for externalised bodies regardless of body size.** A 1 MB job uses the same RAM as a 10 KB job. In practice, 1058 active jobs with 1 MB bodies cost ~1 GiB on disk and ~540 KB in RAM — roughly 2000× more capacity at the same RAM budget vs. an in-memory queue. The queue scales by job *count*, not job *size*.
+- **Cheap fsyncs for large-body workloads.** WAL records for externalised bodies carry metadata plus an 8-byte body reference, so the latency-critical WAL fsync flushes a constant ~100 bytes per record. fsync overhead stays flat as body size grows.
 - **Optional persistence.** Pass `-b <dir>` to enable the WAL + body store. Without it, tuber runs fully in-memory and loses state on restart — fine for ephemeral workloads.
 - **Replay-aware readiness.** When persistence is on, tuber binds the listener *only after* WAL replay completes. Connect-refused during replay, accepting once ready. Docker's `HEALTHCHECK` and external TCP probes get an accurate signal even on a multi-minute replay. See [Readiness & Health Checks](#readiness--health-checks).
 
@@ -77,9 +77,11 @@ Plus tuber's extensions — see [Unique Jobs](#unique-jobs-idempotency), [Job De
 
 ### Operations
 
+Tuber has two independent budgets — RAM and disk — and both gate **only `put`**. Workers can always reserve, release, bury, kick, touch, and delete, even at capacity. The queue keeps draining when it's full; producers get an explicit `OUT_OF_*` rather than a silent crash, and there's no consumer-blocking deadlock of the kind RabbitMQ's memory alarm can produce.
+
 - **Memory budget** — `--max-jobs-size` caps in-memory job footprint (metadata + idempotency tombstones with persistence on; full job bytes without). PUT returns `OUT_OF_MEMORY` when exhausted — explicit backpressure instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete; state transitions never fail due to the budget. The cap also applies at startup, so tuber aborts with a diagnostic instead of OOMing mid-replay.
 - **Storage budget** — `--max-storage-bytes` (mandatory with `-b`) caps WAL + body-store disk usage. PUT returns `OUT_OF_STORAGE` once exceeded; state changes always succeed because tuber reserves one WAL segment's headroom for delete/release/bury/kick records. No silent disk-fill outages.
-- **Per-tube statistics** — EWMA processing time split at a 100ms threshold (fast vs. slow buckets), p50/p95/p99 percentiles from the last 1000 samples, queue-time EWMA, bury rate. Available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-tui). See the [Statistics Reference](docs/statistics.md).
+- **Per-tube statistics** — processing-time and queue-time EWMAs, p50/p95/p99 percentiles, bury rate. See [Statistics](#statistics) below.
 - **Prometheus metrics** — `/metrics` endpoint with gauges for queue depth, memory/storage budgets, and per-tube counters.
 - **Drain mode** — `drain` (or `SIGUSR1`) rejects new puts with `DRAINING` while letting workers finish in-flight jobs. `undrain` resumes.
 
@@ -99,7 +101,7 @@ When persistence is on (`-b`), tuber binds the beanstalk TCP listener **only aft
   WAL replay: segment 412/1247, 4.01 GiB / 12.18 GiB (32%), 891204 jobs so far
   …
   WAL: replayed 2480915 jobs and 1289 idempotency tombstones from "/var/lib/tuber/binlog"
-  tuber v0.6.2 [splat-booko] listening on 0.0.0.0:11300 …
+  tuber vX.Y.Z [splat-booko] listening on 0.0.0.0:11300 …
   ```
 
   Progress lines are time-throttled to one every ~5 s, so they don't drown the log on small WALs.
@@ -114,7 +116,7 @@ Most job queue systems treat performance monitoring as the application's problem
 - **Queue time (time-in-queue)** — EWMA, min, and max of how long jobs waited from `put` to `reserve`. Growing queue time means you need more workers — and you'll know before your users do.
 - **Bury rate** — fraction of reserves that ended in a bury, for quick failure monitoring.
 
-All stats are available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-tui). See the full [Statistics Reference](docs/statistics.md) for field details.
+All stats are available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-rs). See the full [Statistics Reference](docs/statistics.md) for field details.
 
 ### Weighted Reserve
 
@@ -256,24 +258,8 @@ waiting-jobs: 1
 
 A buried job blocks group completion (`complete: false`). Kick it to let the group finish.
 
-Group names are global — jobs in the same group can span multiple tubes. Note that the server does not detect cycles: if two groups depend on each other, the waiting jobs will be held indefinitely. Cycle avoidance is the client's responsibility.
-
-
-
-```text
-stats-group import
-→ OK <bytes>
----
-name: "import"
-ready: 0
-reserved: 0
-delayed: 0
-buried: 0
-waiting-jobs: 0
-cooldown-remaining: 247
-```
-
-After the cooldown expires, the group is removed and `stats-group` returns `NOT_FOUND`.
+- **Group names are global** — jobs in the same group can span multiple tubes.
+- **No cycle detection** — if two groups depend on each other, the waiting jobs will be held indefinitely. Cycle avoidance is the client's responsibility.
 
 ### Concurrency Keys
 
@@ -333,11 +319,37 @@ delete-batch 1 2 3 99
 
 Returns `DELETED_BATCH <deleted_count> <not_found_count>` — here 3 jobs were deleted and 1 was not found.
 
+## Installation
+
+### Cargo
+
+```bash
+cargo install --git https://github.com/tuberq/tuber
+```
+
+Pre-built binaries for Linux and macOS are available on the [releases page](https://github.com/tuberq/tuber/releases).
+
+### Docker
+
+```bash
+docker run ghcr.io/tuberq/tuber server -l 0.0.0.0 -p 11300
+```
+
+### Building from source
+
+```bash
+cargo build --release
+```
+
+The binary will be at `target/release/tuber`.
+
 ## Using Tuber from the Shell
 
 `tuber put` and `tuber work` make tuber usable as a distributed shell task runner — no client library required. Queue commands as strings, workers execute them as shell commands. Handy for cron-like workloads, batch jobs, ad-hoc pipelines, and driving tuber during development or debugging.
 
 For application integration, use a [beanstalkd client library](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) in your language of choice — tuber speaks the beanstalkd wire protocol.
+
+> Flags used below (`-t`, `-g`, `-i`, `-c`, `--aft`, `-j`, etc.) are summarised in the [CLI Reference](#cli-reference).
 
 ### Basics
 
@@ -391,7 +403,8 @@ Running the same cron on multiple hosts? Idempotency keys prevent duplicate work
 
 ```bash
 # Safe to call from multiple cron hosts — only one job created
-tuber put -i "nightly-report:300" "./generate-report.sh"
+# Cooldown is 24h, so duplicates stay deduped across clock skew between hosts.
+tuber put -i "nightly-report:86400" "./generate-report.sh"
 ```
 
 ### Rate-limited processing
@@ -414,28 +427,6 @@ tuber work -j 4 &
 tuber put "curl -s https://example.com/api/webhook -d '{\"event\": \"done\"}'"
 tuber put -i "transcode-42" "ffmpeg -i /data/video-42.raw -c:v libx264 /data/video-42.mp4"
 ```
-
-### Cargo
-
-```bash
-cargo install --git https://github.com/tuberq/tuber
-```
-
-Pre-built binaries for Linux and macOS are available on the [releases page](https://github.com/tuberq/tuber/releases).
-
-### Docker
-
-```bash
-docker run ghcr.io/tuberq/tuber server -l 0.0.0.0 -p 11300
-```
-
-### Building from source
-
-```bash
-cargo build --release
-```
-
-The binary will be at `target/release/tuber`.
 
 ## CLI Reference
 
@@ -469,6 +460,16 @@ tuber server -VV --metrics-port 9100
 # Memory-bounded + disk-bounded server (Docker-friendly)
 tuber server --max-jobs-size 2g -b /var/lib/tuber -s 100g --metrics-port 9100
 ```
+
+#### Prometheus metrics
+
+Pass `--metrics-port <port>` to expose a `/metrics` endpoint in Prometheus text format. Scrape it with Prometheus, or just `curl` it:
+
+```bash
+curl localhost:9100/metrics
+```
+
+Gauges cover queue depth, memory/storage budgets, WAL and TOAST footprints, and per-tube job counts and latency stats. Note that `/metrics` is for scraping — don't point TCP-only health probes at it; use the beanstalk port (default `11300`) instead. See [Readiness & Health Checks](#readiness--health-checks).
 
 #### Durability & fsync
 
@@ -667,6 +668,18 @@ The batch API (`reserve-batch`, `delete-batch`) significantly improves throughpu
 
 Results will vary by hardware, network, and workload. Run your own benchmarks for production sizing.
 
+## Limitations
+
+Tuber is a deliberately small, focused queue server. It is **not** for you if you need any of the following:
+
+- **Single-node only.** No clustering, sharding, or replication. Capacity is bounded by one host's RAM and disk.
+- **No high availability.** A crashed server is down until it restarts. Replay can take minutes on a large WAL — the [readiness signal](#readiness--health-checks) lets orchestrators wait, but there's no automatic failover.
+- **No authentication or TLS.** Like beanstalkd, the protocol is plaintext and unauthenticated. Run it on a trusted network, or front it with a TLS-terminating tunnel (e.g. WireGuard, stunnel).
+- **Ephemeral without `-b`.** Without the binlog directory, all jobs are lost on restart. Fine for transient workloads; not fine for anything you'd be sad to lose.
+- **No multi-tenancy.** Tubes are namespaces, not security boundaries — any connection can `use`/`watch` any tube.
+
+If you need any of these, tuber is the wrong choice. If you don't, that's the whole pitch: one binary, no database, no co-ordinator.
+
 ## Claude Code Skill
 
 The `skill/` directory contains a [Claude Code skill](https://support.claude.com/en/articles/12512198-how-to-create-custom-skills) that teaches AI coding agents how to interact with Tuber (and beanstalkd) using `echo` and `nc`. It covers the full protocol with copy-paste examples.
@@ -679,7 +692,7 @@ ln -s "$(pwd)/skill" ~/.claude/skills/tuber
 
 ## How was this built?
 
-Every line of Rust in this project was written by Claude Opus 4.6. The architecture, testing strategy, and design decisions were human-driven.  I program in Ruby, I have programmed in C, Java and PHP - I have never programmed in Rust.
+Every line of Rust in this project was written by Claude Code. The architecture, testing strategy, and design decisions were human-driven.  I program in Ruby, I have programmed in C, Java and PHP - I have never programmed in Rust.
 
 I used Beanstalkd's C source code and tests as the foundation, first building a minimal working version, duplicating the tests, then incrementally adding the new extensions.
 

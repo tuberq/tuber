@@ -1,4 +1,25 @@
 Tuber Body-Spill / TOAST Design
+
+## Revision: three-tier bodies (WAL v6, 2026-05)
+
+Thesis (original design, below): always split bodies to TOAST when persistence is on. One path, one mental model, one set of tests. The reserve-side pread is essentially free against page-cache-hot bytes; branch complexity has a real long-tail cost. Take the simplification.
+
+Antithesis (empirical finding): under a flood of small bodies (1 M × 64 B puts) the client sees multi-second put stalls aligning exactly with `TOAST segment compacted` log lines. TOAST compaction holds the body-store mutex per migrated body, and `BodyStore::write_body` on the put path needs the same mutex — so puts queue behind the migration. The original analysis was correct about reserve-side cost being cheap, but didn't account for the *put-side* cost of TOAST itself under contention. Independent of compaction, very small bodies pay a structural tax that swamps the body: a 20-byte segment-header per body + a ~32-byte in-RAM index entry + a positioned disk read on every reserve, for a 64-byte payload that already fits in the unused half of the `BodyRef` enum slot.
+
+Synthesis (current design): TOAST is the right home for bodies large enough to amortise its fixed costs; below that boundary, keep the body with its metadata. WAL v6 carries a per-record `body_kind` discriminant, so the boundary is a runtime choice in code, not a format commitment — changing it later doesn't bump the WAL version.
+
+Three tiers replace the original two:
+
+- `BodyRef::Tiny { len: u8, bytes: [u8; 23] }` — body ≤ 23 B inline inside the enum slot. Zero heap allocation. Sized so a binary UUID (16 B) or a `u64` decimal (≤ 20 B) fits with room to spare. Width matches the existing 24-byte `Vec<u8>` / `BodyId` payload slot, so the enum is no wider than before.
+- `BodyRef::Heap(Vec<u8>)` — body 24 – 256 B. Heap-allocated, but still inline inside the WAL FullJob record. No body-store traffic. Covers medium bodies whose TOAST fixed cost would exceed the body itself.
+- `BodyRef::External(BodyId)` — body > 256 B. Body bytes in TOAST, WAL record carries the id. The original design path, now serving the size range where it actually pays off.
+
+The rest of this doc — the rationale for splitting at all, for logical body addressing, for TOAST-then-WAL fsync ordering, for the GC story — is unchanged. Those parts of the thesis were never in tension with the new evidence; only the "no threshold" decision was.
+
+---
+
+## Original design (preserved below for context)
+
 Goal
 Allow Tuber to absorb bursty workloads where ingest rate temporarily exceeds processing rate, without holding all job bodies in RAM. Splat is the motivating use case: Sentry-style envelope ingest with 10–100KB JSON payloads, where a few hours of downstream backlog should be survivable rather than triggering OOM.
 The default Tuber posture remains "if you're running out of RAM, you have a processing problem, not a queue problem." Body-spill is opt-in via persistence mode, not a workaround for slow workers.

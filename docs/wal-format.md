@@ -1,18 +1,22 @@
 # WAL + TOAST Binary Format Specification
 
-WAL version 5 + TOAST version 1 — Tuber persistence layer.
+WAL version 6 + TOAST version 1 — Tuber persistence layer.
 
 ## Overview
 
 When persistence is enabled (`-b <dir>`), tuber maintains two on-disk stores
 side by side:
 
-- **WAL** (`binlog.NNNNNN`) — metadata records (FullJob carrying a `BodyId`
-  reference, StateChange for delete/release/bury/kick/timeout). Small, churny,
-  append-only. Replays on startup to rebuild the in-memory job map.
+- **WAL** (`binlog.NNNNNN`) — metadata records (FullJob carrying either an
+  inline body or a `BodyId` reference, StateChange for
+  delete/release/bury/kick/timeout). Replays on startup to rebuild the
+  in-memory job map.
 - **TOAST** (`toast/body.NNNNNN`) — append-only body segments holding raw job
-  payload bytes, addressed by `BodyId`. The in-memory `BodyId → BodyLocation`
-  index is reconstructed on startup by scanning segment headers.
+  payload bytes, addressed by `BodyId`. Holds only bodies large enough to
+  amortise its per-body fixed overhead (currently > 256 B); smaller bodies
+  live inline inside the WAL FullJob record. The in-memory `BodyId →
+  BodyLocation` index is reconstructed on startup by scanning segment
+  headers.
 
 ```
 wal-dir/
@@ -51,7 +55,7 @@ space, never dangling references. Orphans are reclaimed on the next replay.
 | Offset | Size | Field     | Value                                      |
 |--------|------|-----------|--------------------------------------------|
 | 0      | 4    | magic     | `TWAL` (`0x5457414C`)                      |
-| 4      | 4    | version   | `5` (u32 LE) — current; v3 and v4 still readable |
+| 4      | 4    | version   | `6` (u32 LE) — current; v5, v4, and v3 still readable |
 | 8      | 4    | flags     | `0` — reserved for future use              |
 
 **Total: 12 bytes**
@@ -73,11 +77,12 @@ Two record types follow the header. Both share a common envelope:
 The CRC32 (`crc32fast`) covers everything from the type byte through the end
 of the payload — the CRC itself is excluded.
 
-### 0x01 — FullJob (v5)
+### 0x01 — FullJob (v6)
 
-Written on `put`. Contains the complete job metadata plus a `BodyId`
-reference into the TOAST store. The body bytes themselves live in TOAST,
-not in this record.
+Written on `put`. Contains the complete job metadata plus a body section
+that is either inline bytes or a `BodyId` reference into the TOAST store.
+Per-record `body_kind` discriminant decides which — see "Body section"
+below.
 
 ```
 +------+----------+-------------+-----------------------------------+-----+
@@ -86,7 +91,7 @@ not in this record.
 +------+----------+-------------+-----------------------------------+-----+
 ```
 
-**Payload layout (v5)** — field order matches `serialize_full_job`:
+**Payload layout (v6)** — field order matches `serialize_full_job`:
 
 ```
 +------------------------------------------------------------------+
@@ -124,13 +129,32 @@ not in this record.
 +------------------------------------------------------------------+
 | concurrency_limit (u32)                                           |  4
 +------------------------------------------------------------------+
-| body_id (u64)                                                     |  8     <-- v5
+| body_kind (u8)                                                    |  1     <-- v6
++------------------------------------------------------------------+
+| body section (variant — see below)                                |  variable
 +------------------------------------------------------------------+
 ```
 
-The trailing `body_id` is what changed in v5: it replaced the v3/v4 inline
-body fields (`body_len (u32)` + raw bytes). The body itself is read from
-TOAST at reserve/peek time using this id.
+**Body section (v6):**
+
+- `body_kind = 0x00` — Inline. Followed by `body_len (u32 LE)` and `body_len`
+  raw body bytes. The runtime materialises this as `BodyRef::Tiny` for very
+  small bodies (≤ 23 B, no heap allocation) or `BodyRef::Heap` (heap-allocated
+  `Vec<u8>`) for larger ones. The on-disk format is the same either way — the
+  tier boundary is a runtime choice carried in code, not in the format.
+- `body_kind = 0x01` — External. Followed by `body_id (u64 LE)`. The body
+  bytes themselves live in TOAST and are read at reserve/peek time using
+  this id.
+
+The decision of which kind to write happens at `put`-time based on body
+length and whether a body store is configured. Bodies up to
+`HEAP_INLINE_MAX` (256 B by default) stay inline; larger ones go external
+when a body store is available, otherwise they remain inline.
+
+This is what changed in v6: v5 unconditionally serialised a `body_id (u64)`
+trailer (the body always lived in TOAST). v6 introduces the discriminant
+so small bodies ride inside the WAL record itself, eliminating TOAST
+overhead and compaction contention for small-body workloads.
 
 ### 0x02 — StateChange (v4+)
 
@@ -213,12 +237,19 @@ re-insertion of recently completed jobs.
 
 On startup, files are read in sequence order. For each record:
 
-- **FullJob (v5)**: Insert or replace in the job map; `body` is set to
-  `BodyRef::External(BodyId)`. The corresponding body bytes are looked up
-  from TOAST at reserve/peek time.
-- **FullJob (v3/v4)**: Inline body bytes are read into a `BodyRef::Inline`,
-  then **migrated** into TOAST during the post-replay step (see
-  "Legacy migration" below). v3/v4 reads require the `--migrate-wal` flag.
+- **FullJob (v6)**: Insert or replace in the job map. The `body_kind`
+  discriminant decides: kind `0x00` → inline bytes materialised as
+  `BodyRef::Tiny` (≤ 23 B) or `BodyRef::Heap`; kind `0x01` →
+  `BodyRef::External(BodyId)` whose bytes are looked up from TOAST at
+  reserve/peek time.
+- **FullJob (v5)**: `body` is set to `BodyRef::External(BodyId)` — every
+  v5 body lives in TOAST.
+- **FullJob (v3/v4)**: Inline body bytes are read directly into the
+  appropriate tier (`Tiny`/`Heap`). The post-replay migration step
+  (see "Legacy migration" below) pushes only bodies larger than
+  `HEAP_INLINE_MAX` into TOAST; smaller bodies stay inline and get
+  rewritten as v6 inline records on the next put. v3/v4 reads require
+  the `--migrate-wal` flag.
 - **StateChange (delete)**: Remove from job map. If `expiry_epoch_secs > now`,
   extract the idempotency key and restore the tombstone. Track the body's
   `BodyId` as a candidate orphan for the post-replay reclaim step.
@@ -243,10 +274,13 @@ runtime `BodyStore::delete` self-healing.
 
 ### Legacy migration (`--migrate-wal`)
 
-When the server detects pre-v5 WAL records on startup it refuses to start
-unless `--migrate-wal` is set. With the flag, the replay path lifts inline
-body bytes from v3/v4 FullJob records into TOAST (assigning fresh
-`BodyId`s), fsyncs TOAST, and proceeds. Subsequent writes are v5.
+When the server detects pre-current-version WAL records on startup it
+refuses to start unless `--migrate-wal` is set. With the flag, the replay
+path lifts inline body bytes that exceed `HEAP_INLINE_MAX` from v3/v4
+FullJob records into TOAST (assigning fresh `BodyId`s), fsyncs TOAST, and
+proceeds. Smaller v3/v4 inline bodies stay inline and will be rewritten
+as v6 inline records the next time their owning job's state changes
+(or on a subsequent put of a successor). Subsequent fresh writes are v6.
 
 The migration is one-way and in-place. Back up the WAL directory first if
 you want a rollback option.
@@ -336,6 +370,7 @@ This prevents multiple tuber instances from writing to the same WAL.
 | 3       | 12 bytes    | Reordered FullJob payload: body moved to end, idempotency_ttl grouped with idempotency_key, concurrency_limit grouped with concurrency_key. |
 | 4       | 12 bytes    | Added `reason` (u8) byte to StateChange payload (21 → 22 bytes), enabling per-job counter reconstruction on replay. |
 | 5       | 12 bytes    | Replaced inline body bytes (`body_len u32` + raw bytes) in FullJob with `body_id (u64)` reference. Bodies live in TOAST. v3/v4 reads still supported via `--migrate-wal`. |
+| 6       | 12 bytes    | FullJob body field becomes a 1-byte `body_kind` discriminant followed by inline (`body_len u32` + bytes) or external (`body_id u64`). Small bodies stay inline; only larger bodies go to TOAST. Per-record kind decouples the on-disk format from the runtime threshold. v3–v5 reads still supported (v3/v4 via `--migrate-wal`). |
 
 ---
 

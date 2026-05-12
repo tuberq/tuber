@@ -20,3 +20,18 @@ send-summary
 The TTL ratchets up across producers and never resets the countdown. If `grp:import:300` and `grp:import:600` are both used, the cooldown is 600s; a later `grp:import:100` has no effect. The countdown begins when the last job in the group is deleted, not when the TTL is set. `grp:name` (no TTL) keeps the original behaviour — group removed immediately. `grp:name:0` is an explicit "no cooldown" and is equivalent to `grp:name`.
 
 During the cooldown window, `stats-group` reports the group as complete with a `cooldown-remaining` field:
+
+```text
+stats-group import
+→ OK <bytes>
+---
+name: "import"
+ready: 0
+reserved: 0
+delayed: 0
+buried: 0
+waiting-jobs: 0
+cooldown-remaining: 247
+```
+
+After the cooldown expires, the group is removed and `stats-group` returns `NOT_FOUND`.

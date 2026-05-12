@@ -1020,8 +1020,12 @@ async fn test_binlog_toast_directory_created() {
     let srv = TestServer::start_with_wal(dir.path()).await;
     let mut c = srv.connect().await;
 
-    c.mustsend("put 0 0 60 5\r\n").await;
-    c.mustsend("hello\r\n").await;
+    // Body large enough to exceed HEAP_INLINE_MAX (256B) — bodies at or
+    // below that threshold ride inside the WAL record and never touch
+    // TOAST. 300B forces the external path that creates a TOAST segment.
+    let body = vec![b'x'; 300];
+    c.mustsend(&format!("put 0 0 60 {}\r\n", body.len())).await;
+    c.mustsend(&format!("{}\r\n", std::str::from_utf8(&body).unwrap())).await;
     c.ckresp("INSERTED 1\r\n").await;
 
     drop(c);
@@ -1037,9 +1041,52 @@ async fn test_binlog_toast_directory_created() {
     let name = entries[0].as_ref().unwrap().file_name();
     assert_eq!(name.to_string_lossy(), "body.000000");
 
-    // 16 (file header) + 20 (body header) + 5 (body) = 41 bytes.
+    // 16 (file header) + 20 (body header) + 300 (body) = 336 bytes.
     let len = std::fs::metadata(toast_dir.join("body.000000")).unwrap().len();
-    assert_eq!(len, 41, "segment size should match header(16) + body_hdr(20) + body(5)");
+    assert_eq!(
+        len, 336,
+        "segment size should match header(16) + body_hdr(20) + body(300)"
+    );
+}
+
+/// Inline-small-bodies: a put whose body fits inside `HEAP_INLINE_MAX`
+/// must NOT create a TOAST segment. The body rides along inside the
+/// WAL FullJob record. This is the whole point of three-tier storage.
+#[tokio::test]
+async fn test_binlog_small_body_skips_toast() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 5\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    drop(c);
+    let _ = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let toast_dir = dir.path().join("toast");
+    // The toast/ directory is opened on startup so it always exists,
+    // but it must be empty — no body was ever pushed external.
+    assert!(toast_dir.is_dir(), "toast/ subdirectory must exist");
+    let entries: Vec<_> = std::fs::read_dir(&toast_dir).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "no TOAST segments should be created for ≤256B bodies, found {:?}",
+        entries
+            .iter()
+            .map(|e| e.as_ref().unwrap().file_name())
+            .collect::<Vec<_>>(),
+    );
+
+    // The body still round-trips after restart from the WAL record.
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.mustsend("peek 1\r\n").await;
+    c.ckresp("FOUND 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
 }
 
 /// TOAST: many puts span multiple segments and all bodies survive a
@@ -1124,24 +1171,30 @@ async fn test_binlog_toast_large_body_restart() {
 async fn test_startup_reaps_jobs_with_missing_toast_bodies() {
     let dir = tempfile::tempdir().unwrap();
 
-    // First run: put two jobs, shut down cleanly so the WAL+TOAST are
-    // both fully on disk.
+    // First run: put two jobs with bodies > HEAP_INLINE_MAX (256B) so
+    // they take the external path and land in TOAST. Small bodies stay
+    // inline in the WAL record and don't exercise the missing-body
+    // reaping path. Shut down cleanly so WAL+TOAST are both on disk.
+    let big_a = vec![b'a'; 300];
+    let big_b = vec![b'b'; 300];
     {
         let srv = TestServer::start_with_wal(dir.path()).await;
         let mut c = srv.connect().await;
-        c.mustsend("put 0 0 60 5\r\n").await;
-        c.mustsend("aaaaa\r\n").await;
+        c.mustsend(&format!("put 0 0 60 {}\r\n", big_a.len())).await;
+        c.mustsend(&format!("{}\r\n", std::str::from_utf8(&big_a).unwrap()))
+            .await;
         c.ckresp("INSERTED 1\r\n").await;
-        c.mustsend("put 0 0 60 5\r\n").await;
-        c.mustsend("bbbbb\r\n").await;
+        c.mustsend(&format!("put 0 0 60 {}\r\n", big_b.len())).await;
+        c.mustsend(&format!("{}\r\n", std::str::from_utf8(&big_b).unwrap()))
+            .await;
         c.ckresp("INSERTED 2\r\n").await;
         drop(c);
         let _ = srv.shutdown();
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Wipe the TOAST segment — both bodies are in body.000000 (tiny
-    // payloads, default 64 MiB segment). The WAL still references them.
+    // Wipe the TOAST segment — both bodies are in body.000000 (default
+    // 64 MiB segment, so both fit). The WAL still references them.
     let toast_seg = dir.path().join("toast").join("body.000000");
     assert!(toast_seg.exists(), "TOAST segment must exist before removal");
     std::fs::remove_file(&toast_seg).expect("rm toast segment");
@@ -1386,7 +1439,11 @@ async fn test_legacy_wal_refuses_start_without_migrate_flag() {
 #[tokio::test]
 async fn test_legacy_wal_migrates_when_flag_set() {
     let dir = tempfile::tempdir().unwrap();
-    write_legacy_v4_wal(dir.path(), 42, b"legacy-body");
+    // Use a body > HEAP_INLINE_MAX (256B) so the migration push-to-TOAST
+    // path is exercised. Smaller bodies stay inline on rewrite as v6
+    // and are covered by the inline-stays-inline test below.
+    let big = vec![b'L'; 300];
+    write_legacy_v4_wal(dir.path(), 42, &big);
 
     let srv = TestServer::try_start_with_migrate_wal(dir.path(), true)
         .await
@@ -1397,14 +1454,45 @@ async fn test_legacy_wal_migrates_when_flag_set() {
     // The replayed job is reservable; its body is what we wrote to the
     // legacy WAL, now served from the body store.
     c.mustsend("reserve-with-timeout 1\r\n").await;
-    c.ckresp("RESERVED 42 11\r\n").await;
-    c.ckresp("legacy-body\r\n").await;
+    c.ckresp(&format!("RESERVED 42 {}\r\n", big.len())).await;
+    c.ckresp(&format!("{}\r\n", std::str::from_utf8(&big).unwrap()))
+        .await;
 
     // The body store now has the migrated body on disk.
     let toast_dir = dir.path().join("toast");
     assert!(toast_dir.is_dir(), "migration must populate toast/");
     let entries: Vec<_> = std::fs::read_dir(&toast_dir).unwrap().collect();
     assert!(!entries.is_empty(), "toast/ must contain at least one segment");
+}
+
+/// Legacy migration with a body that fits inline: the v4 inline body is
+/// rewritten as v6 inline (Tiny/Heap), never touches TOAST.
+#[tokio::test]
+async fn test_legacy_wal_small_body_stays_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    write_legacy_v4_wal(dir.path(), 42, b"legacy-body");
+
+    let srv = TestServer::try_start_with_migrate_wal(dir.path(), true)
+        .await
+        .expect("migration must succeed");
+
+    let mut c = srv.connect().await;
+
+    c.mustsend("reserve-with-timeout 1\r\n").await;
+    c.ckresp("RESERVED 42 11\r\n").await;
+    c.ckresp("legacy-body\r\n").await;
+
+    // Small body stayed inline through the migration — TOAST is empty.
+    let toast_dir = dir.path().join("toast");
+    let entries: Vec<_> = std::fs::read_dir(&toast_dir).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "small legacy body must stay inline, found {:?}",
+        entries
+            .iter()
+            .map(|e| e.as_ref().unwrap().file_name())
+            .collect::<Vec<_>>(),
+    );
 }
 
 /// `--migrate-wal` against an already-migrated (v5) WAL is a no-op: the
