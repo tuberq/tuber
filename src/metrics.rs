@@ -10,7 +10,11 @@ use tokio::net::TcpListener;
 pub async fn serve(listen_addr: IpAddr, port: u16, beanstalk_addr: String) -> io::Result<()> {
     let listener = TcpListener::bind((listen_addr, port)).await?;
     tracing::info!("metrics endpoint on {}:{}/metrics", listen_addr, port);
+    serve_with_listener(listener, beanstalk_addr).await
+}
 
+/// Serve on an already-bound listener (split out so tests can bind port 0).
+pub async fn serve_with_listener(listener: TcpListener, beanstalk_addr: String) -> io::Result<()> {
     loop {
         let (socket, _) = listener.accept().await?;
         let beanstalk_addr = beanstalk_addr.clone();
@@ -87,13 +91,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
 
     // Info metric with instance name and version labels
     {
-        let name = stats.get("name").unwrap_or(&"");
-        let version = stats.get("version").unwrap_or(&"");
-        let id = stats.get("id").unwrap_or(&"");
+        let name = escape_label(stats.get("name").unwrap_or(&""));
+        let version = escape_label(stats.get("version").unwrap_or(&""));
+        let id = escape_label(stats.get("id").unwrap_or(&""));
         out.push_str("# HELP tuber_info Tuber instance information\n");
         out.push_str("# TYPE tuber_info gauge\n");
         out.push_str(&format!(
-            "tuber_info{{name=\"{name}\",version={version},id=\"{id}\"}} 1\n\n"
+            "tuber_info{{name=\"{name}\",version=\"{version}\",id=\"{id}\"}} 1\n\n"
         ));
     }
 
@@ -473,8 +477,19 @@ fn prom_counter(out: &mut String, name: &str, help: &str, stats: &HashMap<&str, 
 
 fn tube_metric(out: &mut String, name: &str, tube: &str, stats: &HashMap<&str, &str>, key: &str) {
     if let Some(val) = stats.get(key) {
+        let tube = escape_label(tube);
         out.push_str(&format!("{name}{{tube=\"{tube}\"}} {val}\n"));
     }
+}
+
+/// Escape a value for use inside a Prometheus label: backslash, double
+/// quote, and newline per the text exposition format. An unescaped (or
+/// unquoted) label value makes Prometheus reject the entire scrape.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Parse simple YAML `key: value` lines into a map.
@@ -496,4 +511,27 @@ fn parse_yaml_list(yaml: &str) -> Vec<String> {
     yaml.lines()
         .filter_map(|line| line.strip_prefix("- ").map(|s| s.trim().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_label() {
+        assert_eq!(escape_label("plain"), "plain");
+        assert_eq!(escape_label("tuber 0.7.1"), "tuber 0.7.1");
+        assert_eq!(escape_label(r#"has "quotes""#), r#"has \"quotes\""#);
+        assert_eq!(escape_label(r"back\slash"), r"back\\slash");
+        assert_eq!(escape_label("new\nline"), r"new\nline");
+    }
+
+    #[test]
+    fn test_parse_yaml_map_strips_quotes() {
+        let yaml = "---\nname: \"\"\nversion: \"tuber 0.7.1\"\nuptime: 5\n";
+        let map = parse_yaml_map(yaml);
+        assert_eq!(map.get("version"), Some(&"tuber 0.7.1"));
+        assert_eq!(map.get("name"), Some(&""));
+        assert_eq!(map.get("uptime"), Some(&"5"));
+    }
 }

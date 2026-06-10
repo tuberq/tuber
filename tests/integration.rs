@@ -5498,3 +5498,118 @@ async fn test_many_waiters_concurrency_keyed_drain() {
         elapsed
     );
 }
+
+// --- metrics endpoint ---
+
+/// /metrics must emit valid Prometheus text exposition. Regression test:
+/// the tuber_info line emitted `version=tuber 0.7.1` (unquoted label
+/// value with a space), which makes Prometheus reject the whole scrape.
+#[tokio::test]
+async fn test_metrics_exposition_format() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Some activity so global and per-tube series have data
+    c.mustsend("use mtube\r\n").await;
+    c.ckresp("USING mtube\r\n").await;
+    c.mustsend("put 0 0 60 3\r\n").await;
+    c.mustsend("abc\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Metrics server on an ephemeral port, pointed at the queue
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mport = ml.local_addr().unwrap().port();
+    let baddr = format!("127.0.0.1:{}", srv.port);
+    tokio::spawn(async move {
+        tuber::metrics::serve_with_listener(ml, baddr).await.ok();
+    });
+
+    let mut s = TcpStream::connect(("127.0.0.1", mport)).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    let resp = String::from_utf8(resp).unwrap();
+
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "got: {}",
+        resp.lines().next().unwrap_or("")
+    );
+    let body = resp.split_once("\r\n\r\n").expect("no HTTP body").1;
+
+    // Walk a label set (`k="v",k="v"`) and panic on anything that isn't
+    // a quoted, escaped label value.
+    fn assert_valid_labels(labels: &str, line: &str) {
+        let mut chars = labels.chars();
+        loop {
+            let mut saw_key = false;
+            loop {
+                match chars.next() {
+                    Some('=') => break,
+                    Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' => saw_key = true,
+                    other => panic!("bad label key char {other:?} in: {line}"),
+                }
+            }
+            assert!(saw_key, "empty label key in: {line}");
+            assert_eq!(chars.next(), Some('"'), "unquoted label value in: {line}");
+            loop {
+                match chars.next() {
+                    Some('\\') => {
+                        chars.next();
+                    }
+                    Some('"') => break,
+                    Some(_) => {}
+                    None => panic!("unterminated label value in: {line}"),
+                }
+            }
+            match chars.next() {
+                Some(',') => continue,
+                None => break,
+                Some(ch) => panic!("unexpected {ch:?} after label value in: {line}"),
+            }
+        }
+    }
+
+    for line in body.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (series, value) = line
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("bad sample line: {line}"));
+        assert!(
+            value.parse::<f64>().is_ok(),
+            "non-numeric sample value in: {line}"
+        );
+        if let Some((name, rest)) = series.split_once('{') {
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'),
+                "bad metric name in: {line}"
+            );
+            let labels = rest
+                .strip_suffix('}')
+                .unwrap_or_else(|| panic!("unclosed label set in: {line}"));
+            assert_valid_labels(labels, line);
+        }
+    }
+
+    // The specific lines that were broken / matter most
+    let info = body
+        .lines()
+        .find(|l| l.starts_with("tuber_info{"))
+        .expect("tuber_info missing");
+    assert!(
+        info.contains("version=\"tuber "),
+        "version label must be quoted: {info}"
+    );
+    assert!(
+        body.contains("tuber_tube_ready_jobs{tube=\"mtube\"} 1"),
+        "per-tube gauge missing: {body}"
+    );
+    assert!(body.contains("tuber_jobs_ready 1"), "global gauge missing");
+}
