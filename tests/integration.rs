@@ -2020,6 +2020,84 @@ async fn test_group_buried_blocks_completion() {
     c.ckresp("z\r\n").await;
 }
 
+/// `reserve-job` on a buried group member must decrement the group's
+/// buried count (like kick does). Regression test: the count leaked, so
+/// the group never completed and its after-jobs were held forever.
+#[tokio::test]
+async fn test_reserve_job_buried_group_member_unblocks_group() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:g-rj\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 aft:g-rj\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Bury the member, then pull it back with reserve-job
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Deleting the member completes the group; the after-job must fire
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// Re-burying after `reserve-job` must not double-count the group's
+/// buried total: bury → reserve-job → bury → kick has to net out to zero.
+#[tokio::test]
+async fn test_reserve_job_rebury_group_member_counts_once() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:g-rb\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 aft:g-rb\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Bury, un-bury via reserve-job, bury again
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // Kick it back to ready, then finish it
+    c.mustsend("kick 1\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Group is complete — the after-job must fire
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
 /// Multiple after-jobs per group.
 #[tokio::test]
 async fn test_group_multiple_after_jobs() {

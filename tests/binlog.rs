@@ -1655,3 +1655,54 @@ async fn test_group_commit_durability_clean_shutdown() {
         c.ckresp("payload\r\n").await;
     }
 }
+
+/// A TOAST read failure during reserve must surface INTERNAL_ERROR and
+/// leave the job in the ready queue. Regression test: the job was pulled
+/// out of the ready heap before the body fetch, so a failed read silently
+/// stranded it — invisible to every subsequent reserve.
+#[tokio::test]
+async fn test_reserve_toast_read_failure_keeps_job_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // > 256 bytes ⇒ body is stored externally in TOAST
+    let body = "x".repeat(300);
+    c.mustsend(&format!("put 0 0 60 {}\r\n", body.len())).await;
+    c.mustsend(&format!("{}\r\n", body)).await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Truncate the TOAST segment in place (same inode the server holds
+    // open) down to its file header, so the body read fails.
+    let toast_dir = dir.path().join("toast");
+    for entry in std::fs::read_dir(&toast_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(16).unwrap();
+    }
+
+    // The reserve fails, but must not consume the job
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("INTERNAL_ERROR\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let stats = c.read_ok_body().await;
+    assert!(
+        stats.contains("current-jobs-ready: 1"),
+        "job must remain in the ready queue after a failed body read, got: {}",
+        stats
+    );
+
+    // Still there: a second reserve hits the same error rather than
+    // TIMED_OUT (which would mean the job vanished from the heap)
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("INTERNAL_ERROR\r\n").await;
+
+    // reserve-job by id behaves the same way
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("INTERNAL_ERROR\r\n").await;
+
+    // The job is still deletable — it never left the job table
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+}

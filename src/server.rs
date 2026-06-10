@@ -1183,6 +1183,13 @@ impl ServerState {
         let state = job.state;
         let tube_name = job.tube_name.clone();
 
+        // Materialise the body before dequeuing — if the body-store read
+        // fails the job must stay where it is, not vanish from every queue.
+        let body = match self.fetch_body(job) {
+            Some(b) => b,
+            None => return Response::InternalError,
+        };
+
         // Remove from current state
         match state {
             JobState::Ready => {
@@ -1205,6 +1212,15 @@ impl ServerState {
                     self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
+                // Group tracking: un-bury decrements the buried count, as
+                // in kick — otherwise the group can never complete and its
+                // aft: jobs are held forever.
+                if let Some(job) = self.jobs.get(&id)
+                    && let Some(ref grp) = job.group
+                    && let Some(gs) = self.groups.get_mut(grp)
+                {
+                    gs.buried = gs.buried.saturating_sub(1);
+                }
             }
             JobState::Delayed => {
                 if let Some(tube) = self.tubes.get_mut(&tube_name) {
@@ -1214,15 +1230,20 @@ impl ServerState {
             _ => return Response::NotFound,
         }
 
-        self.do_reserve_inner(conn_id, id)
+        self.do_reserve_inner(conn_id, id, body)
     }
 
     fn do_reserve(&mut self, conn_id: u64, job_id: u64) -> Response {
-        // Remove from ready heap
-        let (tube_name, is_urgent) = match self.jobs.get(&job_id) {
-            Some(j) => (j.tube_name.clone(), j.priority < URGENT_THRESHOLD),
+        // Materialise the body before dequeuing — if the body-store read
+        // fails the job must stay in the ready heap, not vanish.
+        let (tube_name, is_urgent, body) = match self.jobs.get(&job_id) {
+            Some(j) => match self.fetch_body(j) {
+                Some(b) => (j.tube_name.clone(), j.priority < URGENT_THRESHOLD, b),
+                None => return Response::InternalError,
+            },
             None => return Response::NotFound,
         };
+        // Remove from ready heap
         if let Some(tube) = self.tubes.get_mut(&tube_name) {
             tube.ready.remove_by_id(job_id);
             if is_urgent {
@@ -1234,20 +1255,15 @@ impl ServerState {
             self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
         }
 
-        self.do_reserve_inner(conn_id, job_id)
+        self.do_reserve_inner(conn_id, job_id, body)
     }
 
-    fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64) -> Response {
+    /// Final step of every reserve path. `body` is materialised by the
+    /// caller *before* the job is removed from its queue, so a body-store
+    /// read failure surfaces as `INTERNAL_ERROR` while the job stays
+    /// reservable.
+    fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64, body: Vec<u8>) -> Response {
         let now = Instant::now();
-        // Materialise the body before mutating job state — `fetch_body` may
-        // hit the body store and needs its own immutable borrow of self.
-        let body = match self.jobs.get(&job_id) {
-            Some(job) => match self.fetch_body(job) {
-                Some(b) => b,
-                None => return Response::InternalError,
-            },
-            None => return Response::NotFound,
-        };
         let (tube_name, created_at) = match self.jobs.get_mut(&job_id) {
             Some(job) => {
                 let tube_name = job.tube_name.clone();
