@@ -669,6 +669,11 @@ struct WalFile {
     fd: Option<BufWriter<File>>,
     refs: u64,
     bytes_written: usize,
+    /// Value of `Wal::ops_written` when `refs` last dropped to zero.
+    /// GC only unlinks the file once `synced_ops` has caught up — the
+    /// records that superseded this file's contents (migration FullJobs,
+    /// delete StateChanges) must be durable before the old copy goes away.
+    zero_refs_at_op: u64,
 }
 
 /// Configuration for [`Wal::open`].
@@ -717,6 +722,11 @@ pub struct Wal {
     /// True iff there are buffered writes since the last `sync()`. Set on
     /// every `write_put` / `write_state_change`; cleared by `sync()`.
     dirty: bool,
+    /// Monotonic count of records written (puts + state changes).
+    ops_written: u64,
+    /// Value of `ops_written` covered by the last completed fsync. Pairs
+    /// with `WalFile::zero_refs_at_op` to gate GC on durability.
+    synced_ops: u64,
     /// External body store. When present, every WAL fsync is preceded by a
     /// body-store fsync so that any `BodyId` referenced by an acked WAL
     /// record is already durable on disk.
@@ -831,6 +841,8 @@ impl Wal {
             total_disk_bytes: 0,
             records_migrated: 0,
             dirty: false,
+            ops_written: 0,
+            synced_ops: 0,
             body_store: None,
             lock_fd: Some(lock_fd),
             #[cfg(test)]
@@ -947,6 +959,7 @@ impl Wal {
                 fd: None,
                 refs: 0,
                 bytes_written: bytes,
+                zero_refs_at_op: 0,
             });
             self.total_disk_bytes += bytes as u64;
             if seq >= self.next_seq {
@@ -972,6 +985,12 @@ impl Wal {
             .truncate(true)
             .open(&path)?;
 
+        // Persist the dirent: without a directory fsync a crash can lose
+        // the file entirely even after its contents are fsynced, and a
+        // vanished segment drops every record in it — including delete
+        // records, which would resurrect jobs from older segments.
+        crate::body_store::fsync_dir(&self.dir)?;
+
         let mut fd = BufWriter::with_capacity(BUF_CAPACITY, file);
         write_header(&mut fd)?;
 
@@ -981,6 +1000,7 @@ impl Wal {
             fd: Some(fd),
             refs: 0,
             bytes_written: HEADER_SIZE,
+            zero_refs_at_op: 0,
         });
         self.total_disk_bytes += HEADER_SIZE as u64;
 
@@ -1007,13 +1027,17 @@ impl Wal {
         fd.get_ref().sync_all()
     }
 
-    /// Record that a sync happened, updating tracking state.
+    /// Record that a sync happened, updating tracking state. Only called
+    /// after everything buffered so far is durable (`sync()` fsyncs the
+    /// current file; rotation fsyncs the outgoing file, and all older
+    /// files were fsynced at their own rotation).
     fn record_sync(&mut self) {
         #[cfg(test)]
         {
             self.sync_count += 1;
         }
         self.last_sync_at = Instant::now();
+        self.synced_ops = self.ops_written;
     }
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
@@ -1061,6 +1085,10 @@ impl Wal {
         file.bytes_written += record_len;
         let file_seq = file.seq;
         self.total_disk_bytes += record_len as u64;
+        // Count the op before the decref below: the old file's zero-refs
+        // stamp must include this record, since this record is what
+        // supersedes it.
+        self.ops_written += 1;
 
         // Update job's WAL tracking
         let old_seq = job.wal_file_seq;
@@ -1122,6 +1150,8 @@ impl Wal {
         fd.write_all(&record)?;
         file.bytes_written += record_len;
         self.total_disk_bytes += record_len as u64;
+        // Count the op before the delete-decref below (see write_put).
+        self.ops_written += 1;
 
         // Release reservation
         self.reserved_bytes = self
@@ -1158,9 +1188,13 @@ impl Wal {
     }
 
     fn decref_file(&mut self, seq: u64, used: usize) {
+        let ops_written = self.ops_written;
         for f in self.files.iter_mut() {
             if f.seq == seq {
                 f.refs = f.refs.saturating_sub(1);
+                if f.refs == 0 {
+                    f.zero_refs_at_op = ops_written;
+                }
                 break;
             }
         }
@@ -1378,17 +1412,40 @@ impl Wal {
     // --- GC and compaction ---
 
     pub fn gc(&mut self) {
-        // Remove head files with refs == 0, but never the current writable file
+        // Remove head files with refs == 0, but never the current writable
+        // file. Two safety gates:
+        //
+        // - Durability: a file is only unlinked once the records that
+        //   superseded its contents (migration FullJobs, delete
+        //   StateChanges) are fsynced — `zero_refs_at_op <= synced_ops`.
+        //   Unlinking earlier would destroy the only durable copy of a
+        //   live job if we crash before the next sync.
+        // - Ordering: stop at the first failed unlink. Files behind the
+        //   head may hold the delete records for its jobs; removing them
+        //   while the head survives would resurrect deleted jobs on
+        //   replay. The head is retried on the next tick.
         while self.files.len() > 1 {
-            if self.files.front().map(|f| f.refs == 0).unwrap_or(false) {
-                let f = self.files.pop_front().unwrap();
-                self.total_disk_bytes = self
-                    .total_disk_bytes
-                    .saturating_sub(f.bytes_written as u64);
-                if let Err(e) = fs::remove_file(&f.path) {
-                    tracing::warn!("WAL: failed to remove {:?}: {}", f.path, e);
-                }
-            } else {
+            let unlinkable = self
+                .files
+                .front()
+                .map(|f| f.refs == 0 && f.zero_refs_at_op <= self.synced_ops)
+                .unwrap_or(false);
+            if !unlinkable {
+                break;
+            }
+            let path = self.files.front().unwrap().path.clone();
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!("WAL: failed to remove {:?}: {}", path, e);
+                break;
+            }
+            let f = self.files.pop_front().unwrap();
+            self.total_disk_bytes = self
+                .total_disk_bytes
+                .saturating_sub(f.bytes_written as u64);
+            // Make the unlink durable before touching the next file, so a
+            // crash can't persist a later unlink without this one.
+            if let Err(e) = crate::body_store::fsync_dir(&self.dir) {
+                tracing::warn!("WAL: dir fsync after GC unlink failed: {}", e);
                 break;
             }
         }
@@ -2247,10 +2304,76 @@ mod tests {
         )
         .unwrap();
 
+        // GC only unlinks once the superseding delete records are durable.
+        wal.sync().unwrap();
         wal.gc();
         assert!(
             wal.file_count() < count_before_gc,
             "gc should remove files with 0 refs: before={}, after={}",
+            count_before_gc,
+            wal.file_count()
+        );
+    }
+
+    /// GC must not unlink a file whose superseding records (compaction
+    /// migrations, deletes) are still buffered. Regression test: gc() ran
+    /// at tick start, before the tick's migration writes were fsynced —
+    /// power loss in that window destroyed the only durable copy of
+    /// migrated jobs.
+    #[test]
+    fn test_gc_waits_for_sync_of_superseding_records() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny file size: every record rotates into its own file.
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(64)).unwrap();
+
+        let mut job1 = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body1".to_vec(),
+            "default".to_string(),
+        );
+        external_body(&mut job1);
+        wal.write_put(&mut job1).unwrap();
+
+        let mut job2 = Job::new(
+            2,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"body2".to_vec(),
+            "default".to_string(),
+        );
+        external_body(&mut job2);
+        wal.write_put(&mut job2).unwrap();
+        wal.sync().unwrap();
+
+        assert!(wal.file_count() > 1, "need a sealed file to GC");
+
+        // Compaction-style migration: rewrite job1 into the current file.
+        // Its old file's refs drop to zero, but the migration record is
+        // only buffered.
+        wal.write_put(&mut job1).unwrap();
+        assert_eq!(
+            wal.files.front().unwrap().refs,
+            0,
+            "old file fully superseded by the migration"
+        );
+
+        let count_before_gc = wal.file_count();
+        wal.gc();
+        assert_eq!(
+            wal.file_count(),
+            count_before_gc,
+            "gc must not unlink a file whose superseding record is unsynced"
+        );
+
+        wal.sync().unwrap();
+        wal.gc();
+        assert!(
+            wal.file_count() < count_before_gc,
+            "after sync the superseded file is reclaimable: before={}, after={}",
             count_before_gc,
             wal.file_count()
         );

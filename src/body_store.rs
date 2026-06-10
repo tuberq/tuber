@@ -672,7 +672,11 @@ impl BodyStore {
         self.total_bytes
             .fetch_sub(segment_total, Ordering::Relaxed);
         self.segment_count.fetch_sub(1, Ordering::Relaxed);
-        let _ = std::fs::remove_file(&path);
+        if std::fs::remove_file(&path).is_ok() {
+            // Persist the unlink; a resurrected segment after a crash
+            // double-counts its bodies against the storage budget.
+            let _ = fsync_dir(&self.dir);
+        }
 
         self.compactions_total.fetch_add(1, Ordering::Relaxed);
         self.bodies_migrated_total
@@ -738,6 +742,9 @@ impl Inner {
             .open(&path)?;
         write_file_header(&mut file)?;
         file.sync_data()?;
+        // Persist the dirent — an fsynced segment that vanishes from the
+        // directory after a crash loses every acked body in it.
+        fsync_dir(dir)?;
 
         self.segments.insert(
             seq,
@@ -756,6 +763,13 @@ impl Inner {
 
 fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{}{:06}", TOAST_FILE_PREFIX, seq))
+}
+
+/// fsync a directory so file creations/unlinks inside it survive a crash.
+/// POSIX only persists dirents when the directory itself is synced; an
+/// fsynced file can still vanish wholesale if its dirent never lands.
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 fn encode_body_header(body_id: BodyId, len: u32, crc: u32) -> [u8; BODY_HEADER_SIZE] {
@@ -802,15 +816,26 @@ fn scan_segment(file: &mut File) -> Result<SegmentScan, BodyStoreError> {
     let file_len = file.metadata()?.len();
 
     if file_len < FILE_HEADER_SIZE as u64 {
-        // Empty or truncated file header — treat as fresh segment, but a
-        // missing header on a non-empty file is genuinely corrupt.
-        if file_len == 0 {
-            return Ok(SegmentScan { entries: Vec::new(), consumed: 0 });
+        // Crash artifact: rotate() creates the segment and writes its
+        // header non-atomically, so a crash can leave 0..FILE_HEADER_SIZE
+        // bytes behind. No complete body record fits in such a file, so
+        // repair the header in place. Adopting the file bare would let
+        // appends start at offset 0 — producing a headerless segment that
+        // fails the scan (BadMagic) on the *next* restart.
+        if file_len > 0 {
+            tracing::warn!(
+                "TOAST: segment with torn file header ({} bytes), rewriting header",
+                file_len,
+            );
         }
-        return Err(BodyStoreError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "TOAST segment file shorter than file header",
-        )));
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        write_file_header(file)?;
+        file.sync_data()?;
+        return Ok(SegmentScan {
+            entries: Vec::new(),
+            consumed: FILE_HEADER_SIZE as u64,
+        });
     }
 
     let mut hbuf = [0u8; FILE_HEADER_SIZE];
@@ -857,6 +882,62 @@ mod tests {
 
     fn open(dir: &Path) -> BodyStore {
         BodyStore::open(dir, 1024 * 1024).expect("open body store")
+    }
+
+    /// A crash between rotate()'s file create and its header write leaves
+    /// a zero-byte segment. Regression test: open() adopted it bare, so
+    /// appends started at offset 0, the segment never got its TBOD header,
+    /// and the restart *after that* failed with BadMagic — the server
+    /// refused to start until the file was removed by hand.
+    #[test]
+    fn test_open_repairs_crash_artifact_empty_segment() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Run 1: one durable body in segment 0.
+        let store = open(dir);
+        let id1 = store.write_body(b"first body").unwrap();
+        store.fsync().unwrap();
+        drop(store);
+
+        // Crash artifact: segment 1 created but headerless.
+        File::create(segment_path(dir, 1)).unwrap();
+
+        // Run 2: adopt the segment, repair its header, append normally.
+        let store = open(dir);
+        assert_eq!(store.read_body(id1).unwrap(), b"first body");
+        let id2 = store.write_body(b"second body").unwrap();
+        store.fsync().unwrap();
+        drop(store);
+
+        // Run 3: before the fix this failed with BadMagic.
+        let store = open(dir);
+        assert_eq!(store.read_body(id1).unwrap(), b"first body");
+        assert_eq!(store.read_body(id2).unwrap(), b"second body");
+    }
+
+    /// Same crash window, but some of the file header made it to disk.
+    #[test]
+    fn test_open_repairs_torn_segment_header() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let store = open(dir);
+        let id1 = store.write_body(b"alpha").unwrap();
+        store.fsync().unwrap();
+        drop(store);
+
+        // 4 of FILE_HEADER_SIZE bytes survived the crash.
+        fs::write(segment_path(dir, 1), b"TBOD").unwrap();
+
+        let store = open(dir);
+        let id2 = store.write_body(b"beta").unwrap();
+        store.fsync().unwrap();
+        drop(store);
+
+        let store = open(dir);
+        assert_eq!(store.read_body(id1).unwrap(), b"alpha");
+        assert_eq!(store.read_body(id2).unwrap(), b"beta");
     }
 
     /// Deterministic xorshift PRNG, in tests only. Avoids pulling in `rand`
