@@ -164,11 +164,17 @@ impl Tube {
     }
 
     /// Returns true if the tube is completely empty and unused.
+    ///
+    /// Reserved jobs live in `conn.reserved_jobs`, not in any tube
+    /// structure, so `reserved_ct` is the only thing keeping a tube with
+    /// in-flight jobs alive — without it, idle GC would delete the tube
+    /// and release/bury/TTR-expiry would re-enqueue into a void.
     pub fn is_idle(&self) -> bool {
         self.ready.is_empty()
             && self.delay.is_empty()
             && self.buried.is_empty()
             && self.stat.waiting_ct == 0
+            && self.stat.reserved_ct == 0
             && self.idempotency_keys.is_empty()
             && self.idempotency_cooldowns.is_empty()
             && self.using_ct == 0
@@ -290,6 +296,16 @@ mod tests {
         let (key, id) = t.ready.pop().unwrap();
         assert_eq!(key.0, 1);
         assert_eq!(id, 2);
+    }
+
+    #[test]
+    fn test_tube_with_reserved_jobs_not_idle() {
+        let mut t = Tube::new("test");
+        assert!(t.is_idle());
+        t.stat.reserved_ct = 1;
+        assert!(!t.is_idle());
+        t.stat.reserved_ct = 0;
+        assert!(t.is_idle());
     }
 
     #[test]

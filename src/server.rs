@@ -523,15 +523,17 @@ impl ServerState {
             // Re-enqueue reserved jobs
             for job_id in conn.reserved_jobs {
                 self.release_concurrency_key(job_id);
+                let mut requeue = None;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.state = JobState::Ready;
                     job.reserver_id = None;
                     job.deadline_at = None;
-                    let tube_name = job.tube_name.clone();
-                    let key = job.ready_key();
-                    let id = job.id;
+                    requeue = Some((job.tube_name.clone(), job.ready_key()));
+                }
+                if let Some((tube_name, key)) = requeue {
+                    self.ensure_tube(&tube_name);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
-                        tube.ready.insert(key, id);
+                        tube.ready.insert(key, job_id);
                         self.ready_ct += 1;
                         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -1639,6 +1641,10 @@ impl ServerState {
         }
 
         let tube_name = job.tube_name.clone();
+        // The tube should always exist while it has reserved jobs, but if it
+        // is ever missing the silent-skip alternative strands the job in no
+        // heap — recreate it instead.
+        self.ensure_tube(&tube_name);
 
         // Remove from reserved
         self.release_concurrency_key(id);
@@ -1717,6 +1723,8 @@ impl ServerState {
         }
 
         let tube_name = job.tube_name.clone();
+        // See cmd_release: never let a missing tube strand the job.
+        self.ensure_tube(&tube_name);
 
         // Remove from reserved
         self.release_concurrency_key(id);
@@ -2721,13 +2729,16 @@ impl ServerState {
 
         // Promote each waiting after-job to ready
         for job_id in &waiting_jobs {
+            let mut promoted = None;
             if let Some(job) = self.jobs.get_mut(job_id)
                 && job.state == JobState::Delayed
                 && job.deadline_at.is_none()
             {
                 job.state = JobState::Ready;
-                let key = job.ready_key();
-                let tn = job.tube_name.clone();
+                promoted = Some((job.tube_name.clone(), job.ready_key()));
+            }
+            if let Some((tn, key)) = promoted {
+                self.ensure_tube(&tn);
                 if let Some(tube) = self.tubes.get_mut(&tn) {
                     tube.ready.insert(key, *job_id);
                 }

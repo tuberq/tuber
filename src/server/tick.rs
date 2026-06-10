@@ -104,14 +104,17 @@ impl ServerState {
                 self.stats.timeout_ct += 1;
 
                 // Re-enqueue as ready
+                let mut requeue = None;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.timeout_ct += 1;
                     job.state = JobState::Ready;
                     job.reserver_id = None;
                     job.reserved_at = None;
                     job.deadline_at = None;
-                    let key = job.ready_key();
-                    let tube_name = job.tube_name.clone();
+                    requeue = Some((job.tube_name.clone(), job.ready_key()));
+                }
+                if let Some((tube_name, key)) = requeue {
+                    self.ensure_tube(&tube_name);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
                         tube.stat.total_timeout_ct += 1;
@@ -245,9 +248,21 @@ impl ServerState {
             }
         }
 
+        // After-group-held jobs (state Delayed, no deadline) live only in
+        // GroupState::waiting_jobs — their tube looks idle but must survive
+        // GC, or group completion would promote them into a deleted tube.
+        let held_tubes: std::collections::HashSet<&String> = self
+            .groups
+            .values()
+            .flat_map(|gs| gs.waiting_jobs.iter())
+            .filter_map(|id| self.jobs.get(id))
+            .filter(|j| j.state == JobState::Delayed && j.deadline_at.is_none())
+            .map(|j| &j.tube_name)
+            .collect();
+
         // New connections default to "use default" + "watch default", so always keep it
         self.tubes
-            .retain(|name, tube| name == "default" || !tube.is_idle());
+            .retain(|name, tube| name == "default" || !tube.is_idle() || held_tubes.contains(name));
     }
 
     /// Restore jobs from WAL replay into server state.

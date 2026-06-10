@@ -4603,6 +4603,146 @@ async fn test_idle_tubes_reaped() {
     );
 }
 
+/// A tube whose only live job is reserved must survive idle-tube GC, and the
+/// job must be reservable again after release. Regression test: reserved jobs
+/// live in conn.reserved_jobs rather than any tube structure, so the tube
+/// looked idle, was reaped, and release re-enqueued into a void.
+#[tokio::test]
+async fn test_tube_with_reserved_job_survives_gc() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Produce into "ghost", then stop using it
+    c.mustsend("use ghost\r\n").await;
+    c.ckresp("USING ghost\r\n").await;
+    c.mustsend("put 0 0 60 4\r\n").await;
+    c.mustsend("test\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("use default\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    // Reserve the job, then ignore the tube — nothing in the tube's own
+    // structures references it anymore, only the reserved job
+    c.mustsend("watch ghost\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 4\r\n").await;
+    c.ckresp("test\r\n").await;
+    c.mustsend("ignore ghost\r\n").await;
+    c.ckresp("WATCHING 1\r\n").await;
+
+    // Let idle-tube GC run a few ticks
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    c.mustsend("list-tubes\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("ghost"),
+        "tube with a reserved job must survive GC, got: {}",
+        body
+    );
+
+    // Release must land the job in a live ready heap...
+    c.mustsend("release 1 0 0\r\n").await;
+    c.ckresp("RELEASED\r\n").await;
+
+    // ...so it can be reserved again
+    c.mustsend("watch ghost\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 4\r\n").await;
+    c.ckresp("test\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+}
+
+/// Same setup as above, but the reserved job is buried after the GC window:
+/// the bury must land in a live buried list so kick can find it.
+#[tokio::test]
+async fn test_bury_after_tube_gc_window_still_kickable() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("use ghost\r\n").await;
+    c.ckresp("USING ghost\r\n").await;
+    c.mustsend("put 0 0 60 4\r\n").await;
+    c.mustsend("test\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("use default\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    c.mustsend("watch ghost\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 4\r\n").await;
+    c.ckresp("test\r\n").await;
+    c.mustsend("ignore ghost\r\n").await;
+    c.ckresp("WATCHING 1\r\n").await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    c.mustsend("use ghost\r\n").await;
+    c.ckresp("USING ghost\r\n").await;
+    c.mustsend("kick 10\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+
+    c.mustsend("watch ghost\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 4\r\n").await;
+    c.ckresp("test\r\n").await;
+}
+
+/// A tube whose only live job is held for an incomplete after-group must
+/// survive idle-tube GC: held jobs exist only in GroupState::waiting_jobs,
+/// so the tube looks idle, and group completion would otherwise promote the
+/// job into a deleted tube.
+#[tokio::test]
+async fn test_tube_with_held_after_job_survives_gc() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Group member in default keeps the group incomplete
+    c.mustsend("put 0 0 60 1 grp:g-held\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Held after-job in an otherwise idle tube
+    c.mustsend("use heldtube\r\n").await;
+    c.ckresp("USING heldtube\r\n").await;
+    c.mustsend("put 0 0 60 1 aft:g-held\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("use default\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    c.mustsend("list-tubes\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("heldtube"),
+        "tube with a group-held job must survive GC, got: {}",
+        body
+    );
+
+    // Complete the group; the held job must land in a live ready heap
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("watch heldtube\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
 #[tokio::test]
 async fn test_stats_tube_new_fields_present() {
     let srv = TestServer::start().await;
