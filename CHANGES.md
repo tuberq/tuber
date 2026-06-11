@@ -1,5 +1,15 @@
 # Changes
 
+## v0.7.2
+
+**Worker, protocol, and startup bug fixes** (from the 2026-06-11 full-app review)
+
+- **`tuber work` no longer double-executes jobs.** The worker now touches a job every ~ttr/2 while its shell command runs, so a job whose runtime exceeds its TTR is no longer timed out server-side and re-run by another worker. delete/bury responses are checked (a `NOT_FOUND` after a TTR loss is logged loudly instead of as success), `watch`/`ignore` are validated (a failed subscription refuses to run rather than silently draining `default`), and the worker lifecycle is hardened: reconnect with exponential backoff, non-zero exit on total failure, SIGTERM handling, and in-flight jobs are *released* (not buried) on graceful shutdown. Adds client `touch`/`release`/`stats_job`.
+
+- **`put` with a bad extension tag can no longer smuggle commands.** Tag validation (`idp:`/`grp:`/`aft:`/`con:`) fails after the declared `<bytes>` is parsed, but the body wasn't drained on `BAD_FORMAT`, so a client payload like `delete 1\r\n` was parsed and executed as a command. The server now drains the declared body (plus CRLF) on any rejected `put` line, mirroring the existing `JOB_TOO_BIG` path. Covered by a targeted regression test and a deterministic fuzz test.
+
+- **Persistence env vars no longer block in-memory startup.** clap `requires = "binlog_dir"` fired on env-provided values, so `TUBER_SYNC_INTERVAL=… tuber server` (no `-b`) refused to start; the legacy `TUBER_WAL_SYNC_INTERVAL` shim made it worse. `--sync-interval`, `--max-storage-bytes`, and `--migrate-wal` are now validated after parse — ignored (with a warning) in-memory, while the genuine "persistence requires a disk budget" constraint is still enforced. Adds the first CLI-layer tests (`tests/cli.rs`).
+
 ## v0.7.1
 
 **Three-tier body storage cleanup**
