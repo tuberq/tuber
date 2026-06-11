@@ -295,6 +295,25 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
     }
 }
 
+/// If `cmd_str` is a `put` command line that declares a body length in its 5th
+/// whitespace field, return that length — regardless of whether the rest of the
+/// line parses (e.g. an invalid extension tag).
+///
+/// A `put` is always followed by `<bytes>` body bytes plus `\r\n`. When the
+/// command line is rejected with `BAD_FORMAT`, the body still arrives on the
+/// wire; the server must drain exactly that many bytes (plus the trailing CRLF)
+/// or the client's payload gets parsed as commands (protocol desync). This lets
+/// the server recover the declared length from a line it couldn't fully parse.
+pub fn put_declared_body_len(cmd_str: &str) -> Option<u32> {
+    let mut parts = cmd_str.split_whitespace();
+    if parts.next()? != "put" {
+        return None;
+    }
+    // After the verb the fields are: pri, delay, ttr, bytes. The byte count is
+    // the 4th, parsed independently of the (possibly invalid) preceding fields.
+    parts.nth(3)?.parse::<u32>().ok()
+}
+
 fn parse_uint<T: std::str::FromStr>(s: &str) -> Result<T, Response> {
     let s = s.trim();
     if s.is_empty() || s.starts_with('-') {
@@ -557,6 +576,22 @@ mod tests {
     #[test]
     fn test_parse_put() {
         assert_eq!(parse_command("put 0 0 10 5").unwrap(), put_cmd(0, 0, 10, 5));
+    }
+
+    #[test]
+    fn test_put_declared_body_len() {
+        // Valid puts, including ones with a (bad or good) trailing tag.
+        assert_eq!(put_declared_body_len("put 0 0 10 5"), Some(5));
+        assert_eq!(put_declared_body_len("put 0 0 10 8 bogus:tag"), Some(8));
+        assert_eq!(put_declared_body_len("put 0 0 10 0 idp:-bad"), Some(0));
+        // Length is recovered even when an earlier field is garbage, because
+        // the body still follows on the wire.
+        assert_eq!(put_declared_body_len("put x 0 10 12 idp:"), Some(12));
+        // Not a put, or no parseable byte count → nothing to drain.
+        assert_eq!(put_declared_body_len("delete 1"), None);
+        assert_eq!(put_declared_body_len("put 0 0 10"), None);
+        assert_eq!(put_declared_body_len("put 0 0 10 notanumber"), None);
+        assert_eq!(put_declared_body_len(""), None);
     }
 
     #[test]

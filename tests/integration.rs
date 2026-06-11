@@ -79,6 +79,12 @@ impl TestConn {
         self.writer.write_all(s.as_bytes()).await.unwrap();
     }
 
+    /// Send raw bytes (used for crafting put bodies that contain arbitrary,
+    /// possibly non-UTF-8 or command-like, content).
+    async fn mustsend_bytes(&mut self, b: &[u8]) {
+        self.writer.write_all(b).await.unwrap();
+    }
+
     /// Read a full line (ending with \r\n) and assert it equals `expected`.
     async fn ckresp(&mut self, expected: &str) {
         let line = self.readline().await;
@@ -5612,4 +5618,109 @@ async fn test_metrics_exposition_format() {
         "per-tube gauge missing: {body}"
     );
     assert!(body.contains("tuber_jobs_ready 1"), "global gauge missing");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: `put` with a bad extension tag must not desync the protocol.
+//
+// `parse_put` validates the idp:/grp:/aft:/con: tags *after* it has parsed the
+// declared <bytes>. On BAD_FORMAT the server must still drain the inbound body,
+// otherwise the client's payload is read as commands — a request-smuggling bug
+// (review item #2). These tests assert the body is consumed instead.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_put_bad_tag_does_not_smuggle_command() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // A real, ready job we will try to destroy via a smuggled command.
+    let id = c.put_job(0, 0, 100, "keep-me").await;
+    assert_eq!(id, 1);
+
+    // A put with an invalid extension tag. Its body is exactly `delete 1` (8
+    // bytes); if the body isn't drained, the server reads `delete 1\r\n` as a
+    // command and destroys job 1.
+    let smuggled = b"delete 1";
+    c.mustsend(&format!("put 0 0 100 {} bogus:tag\r\n", smuggled.len()))
+        .await;
+    c.mustsend_bytes(smuggled).await;
+    c.mustsend("\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+
+    // Job 1 must still exist. On the buggy server the next line read here is
+    // `DELETED\r\n` (the response to the smuggled delete), not `FOUND ...`.
+    c.mustsend("peek 1\r\n").await;
+    c.ckresp("FOUND 1 7\r\n").await;
+    c.ckresp("keep-me\r\n").await;
+}
+
+#[tokio::test]
+async fn test_put_bad_tag_body_never_executed_fuzz() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Sentinel job: every iteration confirms it still exists, proving no body
+    // content was ever interpreted as a command.
+    let id = c.put_job(0, 0, 1000, "sentinel").await;
+    assert_eq!(id, 1);
+
+    // Adversarial fragments a desynced parser would happily execute.
+    let fragments: [&[u8]; 7] = [
+        b"delete 1\r\n",
+        b"flush-tube default\r\n",
+        b"drain\r\n",
+        b"quit\r\n",
+        b"put 0 0 10 3\r\nXXX\r\n",
+        b"\r\n",
+        b"reserve\r\n",
+    ];
+
+    // Deterministic xorshift64 PRNG (no external crate, reproducible).
+    let mut rng: u64 = 0x9E3779B97F4A7C15;
+    let next = |rng: &mut u64| -> u64 {
+        let mut x = *rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *rng = x;
+        x
+    };
+
+    for iter in 0..200u32 {
+        // Build a random body: a mix of dangerous fragments, raw bytes
+        // (including CR/LF and NUL), of a random total length up to ~300.
+        let target = (next(&mut rng) % 300) as usize;
+        let mut body: Vec<u8> = Vec::with_capacity(target + 16);
+        while body.len() < target {
+            match next(&mut rng) % 4 {
+                0 => {
+                    let f = fragments[(next(&mut rng) as usize) % fragments.len()];
+                    body.extend_from_slice(f);
+                }
+                _ => body.push((next(&mut rng) & 0xff) as u8),
+            }
+        }
+
+        // Vary which invalid tag we use so we exercise each tag branch.
+        let bad_tag = match iter % 5 {
+            0 => "bogus:tag", // unknown tag prefix
+            1 => "idp:",      // empty key
+            2 => "idp:-bad",  // invalid key (leading '-')
+            3 => "con:api:0", // zero concurrency limit
+            _ => "grp:",      // empty key
+        };
+
+        c.mustsend(&format!("put 0 0 100 {} {}\r\n", body.len(), bad_tag))
+            .await;
+        c.mustsend_bytes(&body).await;
+        c.mustsend("\r\n").await;
+        c.ckresp("BAD_FORMAT\r\n").await;
+
+        // The connection must still be in sync: the sentinel is intact and
+        // peekable. A desync surfaces here as a wrong response or a timeout.
+        c.mustsend("peek 1\r\n").await;
+        c.ckrespsub("FOUND 1 8").await; // "sentinel" is 8 bytes
+        c.ckresp("sentinel\r\n").await;
+    }
 }

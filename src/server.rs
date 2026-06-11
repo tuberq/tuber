@@ -3815,6 +3815,19 @@ async fn handle_connection(
                 resp_buf.clear();
                 resp.serialize_into(&mut resp_buf);
                 let _ = writer.write_all(&resp_buf).await;
+                // If the rejected line was a `put` with a known declared body
+                // length, the body is still inbound — drain it (plus the
+                // trailing CRLF) so the client's payload isn't parsed as
+                // commands. Mirrors the JOB_TOO_BIG drain path below.
+                if let Some(body_size) = protocol::put_declared_body_len(cmd_str) {
+                    let to_drain = body_size as u64 + 2;
+                    if tokio::io::copy(&mut (&mut reader).take(to_drain), &mut tokio::io::sink())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 continue;
             }
         };
