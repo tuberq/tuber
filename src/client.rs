@@ -153,6 +153,22 @@ impl TuberClient {
         self.read_line().await
     }
 
+    pub async fn release(&mut self, id: u64, pri: u32, delay: u32) -> io::Result<String> {
+        self.send_line(&format!("release {id} {pri} {delay}"))
+            .await?;
+        self.read_line().await
+    }
+
+    pub async fn touch(&mut self, id: u64) -> io::Result<String> {
+        self.send_line(&format!("touch {id}")).await?;
+        self.read_line().await
+    }
+
+    pub async fn stats_job(&mut self, id: u64) -> io::Result<String> {
+        self.send_line(&format!("stats-job {id}")).await?;
+        self.read_ok_body().await
+    }
+
     pub async fn stats(&mut self) -> io::Result<String> {
         self.send_line("stats").await?;
         self.read_ok_body().await
