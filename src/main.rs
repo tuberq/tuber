@@ -3,7 +3,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 /// Parse a human-readable byte count for `--max-job-size`, clamping to u32.
 fn parse_max_job_size(s: &str) -> Result<u32, String> {
@@ -77,7 +78,6 @@ enum Commands {
             alias = "wal-sync-interval",
             default_value = "100ms",
             value_parser = parse_sync_interval,
-            requires = "binlog_dir",
             env = "TUBER_SYNC_INTERVAL"
         )]
         sync_interval: Duration,
@@ -111,7 +111,6 @@ enum Commands {
             short = 's',
             long,
             value_parser = tuber::server::parse_bytes,
-            requires = "binlog_dir",
             env = "TUBER_MAX_STORAGE_BYTES"
         )]
         max_storage_bytes: Option<u64>,
@@ -122,7 +121,7 @@ enum Commands {
         /// explicit decision point before in-place format conversion.
         /// Set once on the upgrade run; once the WAL has been migrated
         /// the flag becomes a no-op.
-        #[arg(long, requires = "binlog_dir", env = "TUBER_MIGRATE_WAL")]
+        #[arg(long, env = "TUBER_MIGRATE_WAL")]
         migrate_wal: bool,
 
         /// Increase verbosity (-V for info, -VV for debug)
@@ -229,7 +228,17 @@ async fn main() {
         unsafe { std::env::set_var("TUBER_SYNC_INTERVAL", old) };
     }
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    // Did the operator set --sync-interval explicitly (CLI or env), or is it
+    // just the default? Used to warn only when it was actually set but can't
+    // take effect (in-memory mode). We no longer use clap `requires` for this:
+    // an env-provided value counts as "present" and would otherwise refuse
+    // in-memory startup whenever TUBER_SYNC_INTERVAL is exported.
+    let sync_interval_explicit = matches
+        .subcommand_matches("server")
+        .and_then(|m| m.value_source("sync_interval"))
+        .is_some_and(|src| src != ValueSource::DefaultValue);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match cli.command {
         Commands::Server {
@@ -251,6 +260,30 @@ async fn main() {
                 _ => tracing::Level::DEBUG,
             };
             tracing_subscriber::fmt().with_max_level(level).init();
+
+            // Persistence-only flags are harmlessly ignored in-memory. Warn —
+            // don't refuse — when one was set without --binlog-dir, so a
+            // globally-exported env var (TUBER_SYNC_INTERVAL etc.) can't block
+            // in-memory startup. The genuine "persistence requires a disk
+            // budget" constraint is still enforced in server::run.
+            if binlog_dir.is_none() {
+                if sync_interval_explicit {
+                    tracing::warn!(
+                        "--sync-interval / TUBER_SYNC_INTERVAL is ignored without --binlog-dir (running in-memory)"
+                    );
+                }
+                if migrate_wal {
+                    tracing::warn!(
+                        "--migrate-wal / TUBER_MIGRATE_WAL is ignored without --binlog-dir (running in-memory)"
+                    );
+                }
+                if max_storage_bytes.is_some() {
+                    tracing::warn!(
+                        "--max-storage-bytes / TUBER_MAX_STORAGE_BYTES is ignored without --binlog-dir (running in-memory)"
+                    );
+                }
+            }
+
             if let Err(e) = tuber::server::run(
                 &listen,
                 port,
