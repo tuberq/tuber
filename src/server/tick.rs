@@ -150,7 +150,9 @@ impl ServerState {
         }
         for &i in deadline_soon_indices.iter().rev() {
             let waiter = self.remove_waiter_at(i);
-            let _ = waiter.reply_tx.send(Response::DeadlineSoon);
+            // Batch waiters are woken with an empty batch rather than
+            // DEADLINE_SOON to keep their response shape uniform.
+            self.deliver_waiter_failure(waiter, now);
         }
 
         // Check waiting connection timeouts
@@ -169,11 +171,7 @@ impl ServerState {
         }
 
         for waiter in expired {
-            if self.conn_deadline_soon(waiter.conn_id, now) {
-                let _ = waiter.reply_tx.send(Response::DeadlineSoon);
-            } else {
-                let _ = waiter.reply_tx.send(Response::TimedOut);
-            }
+            self.deliver_waiter_failure(waiter, now);
         }
 
         // Try to fulfill remaining waiters with newly ready jobs

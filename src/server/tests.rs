@@ -695,7 +695,7 @@ fn test_cmd_delete_wakes_concurrency_waiter() {
 
     // c2 parks as a waiter (j2 is con-blocked by j1's slot).
     let (tx, mut rx) = oneshot::channel();
-    s.add_waiter(c2, tx, None);
+    s.add_waiter(c2, tx, None, None);
     assert_eq!(s.stats.waiting_ct, 1);
 
     // c1 deletes j1 — slot freed, waiter must be fulfilled with j2.
@@ -1958,7 +1958,7 @@ fn test_waiting_ct_reserve_blocks() {
     let mut s = make_state();
     let c = register(&mut s);
     let (tx, _rx) = oneshot::channel();
-    s.add_waiter(c, tx, None);
+    s.add_waiter(c, tx, None, None);
     assert_eq!(s.stats.waiting_ct, 1);
     assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 1);
 }
@@ -1968,7 +1968,7 @@ fn test_waiting_ct_fulfilled_waiter_resets() {
     let mut s = make_state();
     let c = register(&mut s);
     let (tx, _rx) = oneshot::channel();
-    s.add_waiter(c, tx, None);
+    s.add_waiter(c, tx, None, None);
     assert_eq!(s.stats.waiting_ct, 1);
 
     // Put a job — process_queue should wake the waiter
@@ -1994,9 +1994,9 @@ fn test_waiting_ct_disconnect_clears() {
     );
 
     let (tx1, _rx1) = oneshot::channel();
-    s.add_waiter(c1, tx1, None);
+    s.add_waiter(c1, tx1, None, None);
     let (tx2, _rx2) = oneshot::channel();
-    s.add_waiter(c2, tx2, None);
+    s.add_waiter(c2, tx2, None, None);
 
     assert_eq!(s.stats.waiting_ct, 2);
     assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 2);

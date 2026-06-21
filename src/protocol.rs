@@ -80,6 +80,11 @@ pub enum Command {
     },
     ReserveBatch {
         count: u32,
+        /// Optional long-poll timeout in seconds. `None` = non-blocking
+        /// (return immediately, even with 0 jobs). `Some(0)` = explicit
+        /// non-blocking poll. `Some(t>0)` = block up to `t` seconds for the
+        /// first job to arrive.
+        timeout: Option<u32>,
     },
     DeleteBatch {
         ids: Vec<u64>,
@@ -411,11 +416,23 @@ fn parse_peek(rest: &str) -> Result<Command, Response> {
 const MAX_RESERVE_BATCH: u32 = 1000;
 
 fn parse_reserve_batch(rest: &str) -> Result<Command, Response> {
-    let count: u32 = parse_uint(rest)?;
+    let mut parts = rest.split_whitespace();
+    let count: u32 = parts
+        .next()
+        .ok_or(Response::BadFormat)?
+        .parse()
+        .map_err(|_| Response::BadFormat)?;
     if count == 0 || count > MAX_RESERVE_BATCH {
         return Err(Response::BadFormat);
     }
-    Ok(Command::ReserveBatch { count })
+    let timeout = match parts.next() {
+        Some(tok) => Some(tok.parse().map_err(|_| Response::BadFormat)?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::ReserveBatch { count, timeout })
 }
 
 pub const MAX_DELETE_BATCH: usize = 1000;
@@ -1061,15 +1078,38 @@ mod tests {
     fn test_parse_reserve_batch() {
         assert_eq!(
             parse_command("reserve-batch 5").unwrap(),
-            Command::ReserveBatch { count: 5 }
+            Command::ReserveBatch {
+                count: 5,
+                timeout: None
+            }
         );
         assert_eq!(
             parse_command("reserve-batch 1").unwrap(),
-            Command::ReserveBatch { count: 1 }
+            Command::ReserveBatch {
+                count: 1,
+                timeout: None
+            }
         );
         assert_eq!(
             parse_command("reserve-batch 1000").unwrap(),
-            Command::ReserveBatch { count: 1000 }
+            Command::ReserveBatch {
+                count: 1000,
+                timeout: None
+            }
+        );
+        assert_eq!(
+            parse_command("reserve-batch 5 10").unwrap(),
+            Command::ReserveBatch {
+                count: 5,
+                timeout: Some(10)
+            }
+        );
+        assert_eq!(
+            parse_command("reserve-batch 5 0").unwrap(),
+            Command::ReserveBatch {
+                count: 5,
+                timeout: Some(0)
+            }
         );
     }
 
@@ -1080,6 +1120,8 @@ mod tests {
         assert!(parse_command("reserve-batch").is_err());
         assert!(parse_command("reserve-batch abc").is_err());
         assert!(parse_command("reserve-batch -1").is_err());
+        assert!(parse_command("reserve-batch 5 abc").is_err());
+        assert!(parse_command("reserve-batch 5 10 1").is_err());
     }
 
     #[test]

@@ -72,6 +72,7 @@ Tuber extensions beyond standard beanstalkd:
 - `reserve-mode <default|weighted>` - switch between priority-first and weighted-random reserve strategies.
 - `peek-reserved` - peek at the oldest reserved job in the current `use` tube. Returns `FOUND <id> <bytes>` or `NOT_FOUND`.
 - `flush-tube <tube>` - delete all jobs from a tube. Returns `FLUSHED <count>`.
+- `reserve-batch <count> [timeout]` - reserve up to `<count>` ready jobs at once (1..=1000). Returns `RESERVED_BATCH <n>` followed by `<n>` `RESERVED <id> <bytes>` blocks. Without `timeout` (or with `timeout 0`) it is non-blocking and may return `RESERVED_BATCH 0`. With a positive `timeout` (seconds) it long-polls: it blocks while 0 jobs are available, then drains whatever is ready (up to `<count>`) the moment the first job arrives, or replies `RESERVED_BATCH 0` on timeout. Use the timeout form to avoid clients hot-looping on empty polls.
 - `put` extension tags (appended after `<bytes>`): `idp:<key>` (idempotency), `grp:<name>` (job group), `aft:<name>` (after-group dependency), `con:<key>` (concurrency key).
 - `watch <tube> [weight]` - optional weight parameter for weighted reserve mode.
 

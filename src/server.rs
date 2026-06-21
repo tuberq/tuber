@@ -106,6 +106,11 @@ struct WaitingReserve {
     conn_id: u64,
     reply_tx: oneshot::Sender<Response>,
     deadline: Option<Instant>,
+    /// `None` for a single `reserve`/`reserve-with-timeout`; `Some(n)` for a
+    /// blocking `reserve-batch` wanting up to `n` jobs. Determines both how the
+    /// waiter is fulfilled (single job vs. drained batch) and what it receives
+    /// on timeout (TIMED_OUT/DEADLINE_SOON vs. an empty RESERVED_BATCH).
+    batch_count: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -691,9 +696,9 @@ impl ServerState {
                 self.stats.op_ct[OP_RESERVE_MODE] += 1;
                 self.cmd_reserve_mode(conn_id, &mode)
             }
-            Command::ReserveBatch { count } => {
+            Command::ReserveBatch { count, timeout } => {
                 self.stats.op_ct[OP_RESERVE] += 1;
-                self.cmd_reserve_batch(conn_id, count)
+                self.cmd_reserve_batch(conn_id, count, timeout)
             }
             Command::Delete { id } => {
                 self.stats.op_ct[OP_DELETE] += 1;
@@ -1324,26 +1329,26 @@ impl ServerState {
         Response::Using(mode.to_string())
     }
 
-    fn cmd_reserve_batch(&mut self, conn_id: u64, count: u32) -> Response {
+    fn cmd_reserve_batch(&mut self, conn_id: u64, count: u32, timeout: Option<u32>) -> Response {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.set_worker();
         }
 
-        let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
+        let collected = self.collect_batch(conn_id, count);
 
-        for _ in 0..count {
-            let Some(jid) = self.find_next_ready_job(conn_id) else {
-                break;
-            };
-            let resp = self.do_reserve(conn_id, jid);
-            if let Response::Reserved { id, body } = resp {
-                collected.push((id, body));
-            } else {
-                break;
-            }
+        // Drain-what's-ready: any jobs in hand are returned immediately.
+        if !collected.is_empty() {
+            return Response::ReservedBatch(collected);
         }
 
-        Response::ReservedBatch(collected)
+        // Nothing available. With a positive timeout, park onto the waiter
+        // list by returning the TimedOut sentinel (intercepted by
+        // dispatch_command, never reaches the client). Otherwise reply with an
+        // empty batch immediately (non-blocking / `timeout 0` poll).
+        match timeout {
+            Some(t) if t > 0 => Response::TimedOut,
+            _ => Response::ReservedBatch(Vec::new()),
+        }
     }
 
     fn cmd_delete(&mut self, conn_id: u64, id: u64) -> Response {
@@ -2804,11 +2809,7 @@ impl ServerState {
         }
 
         for waiter in timed_out {
-            if self.conn_deadline_soon(waiter.conn_id, now) {
-                let _ = waiter.reply_tx.send(Response::DeadlineSoon);
-            } else {
-                let _ = waiter.reply_tx.send(Response::TimedOut);
-            }
+            self.deliver_waiter_failure(waiter, now);
         }
 
         // Second pass: fulfill waiters. Recomputing the per-tube unblocked
@@ -2842,8 +2843,18 @@ impl ServerState {
                 break;
             };
             let waiter = self.remove_waiter_at(i);
-            let resp = self.do_reserve(waiter.conn_id, job_id);
-            let _ = waiter.reply_tx.send(resp);
+            match waiter.batch_count {
+                // Batch waiter: drain up to `count` ready jobs now. A job was
+                // just confirmed available, so the batch is non-empty.
+                Some(count) => {
+                    let jobs = self.collect_batch(conn_id, count);
+                    let _ = waiter.reply_tx.send(Response::ReservedBatch(jobs));
+                }
+                None => {
+                    let resp = self.do_reserve(conn_id, job_id);
+                    let _ = waiter.reply_tx.send(resp);
+                }
+            }
         }
     }
 
@@ -2884,7 +2895,13 @@ impl ServerState {
         }
     }
 
-    fn add_waiter(&mut self, conn_id: u64, reply_tx: oneshot::Sender<Response>, deadline: Option<Instant>) {
+    fn add_waiter(
+        &mut self,
+        conn_id: u64,
+        reply_tx: oneshot::Sender<Response>,
+        deadline: Option<Instant>,
+        batch_count: Option<u32>,
+    ) {
         self.stats.waiting_ct += 1;
         if let Some(conn) = self.conns.get(&conn_id) {
             for w in &conn.watched {
@@ -2893,7 +2910,47 @@ impl ServerState {
                 }
             }
         }
-        self.waiters.push(WaitingReserve { conn_id, reply_tx, deadline });
+        self.waiters.push(WaitingReserve {
+            conn_id,
+            reply_tx,
+            deadline,
+            batch_count,
+        });
+    }
+
+    /// Deliver the "no job for you" reply to a waiter being removed without a
+    /// job. Batch waiters get an empty `RESERVED_BATCH 0` so clients parse one
+    /// response shape uniformly; single waiters get DEADLINE_SOON when their
+    /// connection is within the TTR safety margin, otherwise TIMED_OUT.
+    fn deliver_waiter_failure(&self, waiter: WaitingReserve, now: Instant) {
+        let resp = if waiter.batch_count.is_some() {
+            Response::ReservedBatch(Vec::new())
+        } else if self.conn_deadline_soon(waiter.conn_id, now) {
+            Response::DeadlineSoon
+        } else {
+            Response::TimedOut
+        };
+        let _ = waiter.reply_tx.send(resp);
+    }
+
+    /// Reserve up to `count` ready jobs for `conn_id`, respecting watched tubes
+    /// and reserve mode. Returns whatever is immediately available (may be
+    /// fewer than `count`, possibly empty). Shared by the non-blocking
+    /// `reserve-batch` path and blocking batch-waiter fulfilment.
+    fn collect_batch(&mut self, conn_id: u64, count: u32) -> Vec<(u64, Vec<u8>)> {
+        let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
+        for _ in 0..count {
+            let Some(jid) = self.find_next_ready_job(conn_id) else {
+                break;
+            };
+            let resp = self.do_reserve(conn_id, jid);
+            if let Response::Reserved { id, body } = resp {
+                collected.push((id, body));
+            } else {
+                break;
+            }
+        }
+        collected
     }
 
     /// Pop the waiter at `i` and decrement both global and per-tube waiting
@@ -3472,12 +3529,18 @@ fn dispatch_command(
     body: Option<Vec<u8>>,
     reply_tx: oneshot::Sender<Response>,
 ) -> DispatchOutcome {
-    // Single match decides both is-this-a-reserve and what timeout was set.
-    // `Some(None)` = infinite-wait Reserve; `Some(Some(t))` = with timeout;
-    // `None` = not a reserve at all.
-    let timeout = match &cmd {
-        Command::Reserve => Some(None),
-        Command::ReserveWithTimeout { timeout } => Some(Some(*timeout)),
+    // Single match decides is-this-a-reserve, what timeout was set, and whether
+    // it's a batch reserve. `wait` is `Some((timeout, batch_count))`:
+    // timeout `None` = infinite-wait Reserve, `Some(t)` = with timeout;
+    // batch_count `None` = single reserve, `Some(n)` = batch wanting up to n.
+    // A `reserve-batch` with no/zero timeout never parks (returns `None` here).
+    let wait: Option<(Option<u32>, Option<u32>)> = match &cmd {
+        Command::Reserve => Some((None, None)),
+        Command::ReserveWithTimeout { timeout } => Some((Some(*timeout), None)),
+        Command::ReserveBatch {
+            count,
+            timeout: Some(t),
+        } if *t > 0 => Some((Some(*t), Some(*count))),
         _ => None,
     };
 
@@ -3486,12 +3549,12 @@ fn dispatch_command(
     // Reserve with no available job — park onto the waiter list rather
     // than ack TimedOut. The reply_tx travels with the waiter; it'll fire
     // when a put wakes the waiter (after that put's sync) or on timeout.
-    if let Some(t) = timeout
+    if let Some((t, batch_count)) = wait
         && matches!(resp, Response::TimedOut)
         && t != Some(0)
     {
         let deadline = t.map(|secs| Instant::now() + Duration::from_secs(secs as u64));
-        state.add_waiter(conn_id, reply_tx, deadline);
+        state.add_waiter(conn_id, reply_tx, deadline, batch_count);
         return DispatchOutcome::Deferred;
     }
 
