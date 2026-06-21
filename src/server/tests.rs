@@ -2008,3 +2008,72 @@ fn test_waiting_ct_disconnect_clears() {
     assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 1);
     assert_eq!(s.tubes.get("foo").unwrap().stat.waiting_ct, 1);
 }
+
+// Point an already-ready job at a non-existent external body. make_state has no
+// body_store, so fetch_body returns None and do_reserve yields INTERNAL_ERROR —
+// simulating a TOAST read failure without a real on-disk store.
+fn poison_body(s: &mut ServerState, id: u64) {
+    s.jobs.get_mut(&id).unwrap().body = BodyRef::External(BodyId(9999));
+}
+
+#[test]
+fn test_reserve_batch_surfaces_body_store_error() {
+    // The only ready job has an unreadable body. A batch reserve must surface
+    // INTERNAL_ERROR, not mask the storage fault as an empty RESERVED_BATCH.
+    let mut s = make_state();
+    let c = register(&mut s);
+
+    let resp = s.handle_command(c, put_cmd(0, 0, 10, 4), Some(b"poof".to_vec()));
+    assert!(matches!(resp, Response::Inserted(1)));
+    poison_body(&mut s, 1);
+
+    let resp = s.handle_command(
+        c,
+        Command::ReserveBatch {
+            count: 5,
+            timeout: None,
+        },
+        None,
+    );
+    assert!(
+        matches!(resp, Response::InternalError),
+        "expected INTERNAL_ERROR, got {resp:?}"
+    );
+}
+
+#[test]
+fn test_reserve_batch_partial_wins_over_body_store_error() {
+    // A healthy job precedes the poison one (same pri ⇒ ordered by id). The
+    // batch returns the good job; the unreadable job stays ready (its body is
+    // materialised before dequeue) and the error is suppressed for this call.
+    let mut s = make_state();
+    let c = register(&mut s);
+
+    assert!(matches!(
+        s.handle_command(c, put_cmd(0, 0, 10, 4), Some(b"good".to_vec())),
+        Response::Inserted(1)
+    ));
+    assert!(matches!(
+        s.handle_command(c, put_cmd(0, 0, 10, 4), Some(b"poof".to_vec())),
+        Response::Inserted(2)
+    ));
+    poison_body(&mut s, 2);
+
+    let resp = s.handle_command(
+        c,
+        Command::ReserveBatch {
+            count: 5,
+            timeout: None,
+        },
+        None,
+    );
+    match resp {
+        Response::ReservedBatch(jobs) => {
+            assert_eq!(jobs.len(), 1, "only the healthy job should be returned");
+            assert_eq!(jobs[0].0, 1);
+        }
+        other => panic!("expected RESERVED_BATCH with one job, got {other:?}"),
+    }
+    // The poison job is untouched and still ready.
+    assert_eq!(s.jobs.get(&2).unwrap().state, JobState::Ready);
+}

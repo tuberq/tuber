@@ -1334,11 +1334,18 @@ impl ServerState {
             conn.set_worker();
         }
 
-        let collected = self.collect_batch(conn_id, count);
+        let (collected, err) = self.collect_batch(conn_id, count);
 
         // Drain-what's-ready: any jobs in hand are returned immediately.
         if !collected.is_empty() {
             return Response::ReservedBatch(collected);
+        }
+
+        // Nothing collected. If draining aborted on a body-store read failure,
+        // surface it instead of masking it as an empty batch — matching the
+        // single-reserve path. (Parking would only retry the same fault.)
+        if let Some(err) = err {
+            return err;
         }
 
         // Nothing available. With a positive timeout, park onto the waiter
@@ -2845,10 +2852,17 @@ impl ServerState {
             let waiter = self.remove_waiter_at(i);
             match waiter.batch_count {
                 // Batch waiter: drain up to `count` ready jobs now. A job was
-                // just confirmed available, so the batch is non-empty.
+                // just confirmed available, so the batch is normally non-empty;
+                // the only way back to empty is a body-store read failure, which
+                // surfaces as INTERNAL_ERROR (mirroring the single-waiter path).
                 Some(count) => {
-                    let jobs = self.collect_batch(conn_id, count);
-                    let _ = waiter.reply_tx.send(Response::ReservedBatch(jobs));
+                    let (jobs, err) = self.collect_batch(conn_id, count);
+                    let resp = if jobs.is_empty() {
+                        err.unwrap_or(Response::ReservedBatch(Vec::new()))
+                    } else {
+                        Response::ReservedBatch(jobs)
+                    };
+                    let _ = waiter.reply_tx.send(resp);
                 }
                 None => {
                     let resp = self.do_reserve(conn_id, job_id);
@@ -2937,22 +2951,30 @@ impl ServerState {
 
     /// Reserve up to `count` ready jobs for `conn_id`, respecting watched tubes
     /// and reserve mode. Returns whatever is immediately available (may be
-    /// fewer than `count`, possibly empty). Shared by the non-blocking
-    /// `reserve-batch` path and blocking batch-waiter fulfilment.
-    fn collect_batch(&mut self, conn_id: u64, count: u32) -> Vec<(u64, Vec<u8>)> {
+    /// fewer than `count`, possibly empty), plus a terminal `INTERNAL_ERROR`
+    /// when draining stopped because a body-store read failed rather than
+    /// because the queue ran dry. The error is only meaningful when no jobs
+    /// were collected: with a non-empty batch the failed job simply stays
+    /// ready (do_reserve materialises the body before dequeuing) and resurfaces
+    /// on a later reserve, just as for single `reserve`. Shared by the
+    /// non-blocking `reserve-batch` path and blocking batch-waiter fulfilment.
+    fn collect_batch(&mut self, conn_id: u64, count: u32) -> (Vec<(u64, Vec<u8>)>, Option<Response>) {
         let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
         for _ in 0..count {
             let Some(jid) = self.find_next_ready_job(conn_id) else {
                 break;
             };
-            let resp = self.do_reserve(conn_id, jid);
-            if let Response::Reserved { id, body } = resp {
-                collected.push((id, body));
-            } else {
-                break;
+            match self.do_reserve(conn_id, jid) {
+                Response::Reserved { id, body } => collected.push((id, body)),
+                // A body-store read failure is a real fault worth surfacing so
+                // batch clients don't mistake it for an empty queue. Any other
+                // non-Reserved result means the job is no longer reservable, so
+                // just stop draining and return what we have.
+                Response::InternalError => return (collected, Some(Response::InternalError)),
+                _ => break,
             }
         }
-        collected
+        (collected, None)
     }
 
     /// Pop the waiter at `i` and decrement both global and per-tube waiting
