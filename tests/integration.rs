@@ -3706,6 +3706,98 @@ async fn test_reserve_batch_empty() {
 }
 
 #[tokio::test]
+async fn test_reserve_batch_timeout_zero_poll() {
+    // `reserve-batch <count> 0` is an explicit non-blocking poll: returns an
+    // empty batch immediately on an empty queue.
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.mustsend("reserve-batch 5 0\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 0);
+}
+
+#[tokio::test]
+async fn test_reserve_batch_immediate_when_ready() {
+    // With jobs already queued, a blocking batch reserve drains what's ready
+    // and returns immediately without waiting for the timeout.
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.put_job(0, 0, 120, "a").await;
+    c.put_job(0, 0, 120, "b").await;
+    c.put_job(0, 0, 120, "c").await;
+
+    c.mustsend("reserve-batch 5 30\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 3);
+}
+
+#[tokio::test]
+async fn test_reserve_batch_timeout_empty_returns_empty_batch() {
+    // On timeout with nothing available, a blocking batch reserve replies with
+    // an empty RESERVED_BATCH (not TIMED_OUT), keeping the response uniform.
+    let s = TestServer::start().await;
+    let mut c = s.connect().await;
+
+    c.mustsend("reserve-batch 5 1\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 0);
+}
+
+#[tokio::test]
+async fn test_reserve_batch_blocks_then_wakes() {
+    // A blocking batch reserve parks when empty and is woken by a later put.
+    let s = TestServer::start().await;
+    let mut c0 = s.connect().await;
+    let mut c1 = s.connect().await;
+
+    c0.mustsend("watch foo\r\n").await;
+    c0.ckresp("WATCHING 2\r\n").await;
+    c0.mustsend("ignore default\r\n").await;
+    c0.ckresp("WATCHING 1\r\n").await;
+
+    // Park c0 with a generous timeout, then produce into foo from c1.
+    c0.mustsend("reserve-batch 5 30\r\n").await;
+    c1.mustsend("use foo\r\n").await;
+    c1.ckresp("USING foo\r\n").await;
+    c1.put_job(0, 0, 120, "hello").await;
+
+    let jobs = c0.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].1, "hello");
+}
+
+#[tokio::test]
+async fn test_reserve_batch_waiter_stats_accounting() {
+    // A parked batch waiter is counted in current-waiting while blocked, and
+    // the count returns to zero once it times out.
+    let s = TestServer::start().await;
+    let mut c0 = s.connect().await;
+    let mut probe = s.connect().await;
+
+    c0.mustsend("reserve-batch 5 1\r\n").await;
+    // Give the engine a moment to register the waiter.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    probe.mustsend("stats\r\n").await;
+    let body = probe.read_ok_body().await;
+    assert!(
+        body.contains("current-waiting: 1"),
+        "expected one waiter, got: {body}"
+    );
+
+    // c0 times out with an empty batch; the waiter is then removed.
+    let jobs = c0.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 0);
+    probe.mustsend("stats\r\n").await;
+    let body = probe.read_ok_body().await;
+    assert!(
+        body.contains("current-waiting: 0"),
+        "expected zero waiters after timeout, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_reserve_batch_priority_order() {
     let s = TestServer::start().await;
     let mut c = s.connect().await;
