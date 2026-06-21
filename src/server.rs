@@ -2919,14 +2919,16 @@ impl ServerState {
     }
 
     /// Deliver the "no job for you" reply to a waiter being removed without a
-    /// job. Batch waiters get an empty `RESERVED_BATCH 0` so clients parse one
-    /// response shape uniformly; single waiters get DEADLINE_SOON when their
-    /// connection is within the TTR safety margin, otherwise TIMED_OUT.
+    /// job. DEADLINE_SOON takes priority for everyone: it's an out-of-band
+    /// interrupt telling the connection to service its about-to-expire reserved
+    /// job, not an answer to the reserve, so a batch waiter gets it too (mirrors
+    /// `reserve-with-timeout`). Otherwise batch waiters get an empty
+    /// `RESERVED_BATCH 0` and single waiters get TIMED_OUT.
     fn deliver_waiter_failure(&self, waiter: WaitingReserve, now: Instant) {
-        let resp = if waiter.batch_count.is_some() {
-            Response::ReservedBatch(Vec::new())
-        } else if self.conn_deadline_soon(waiter.conn_id, now) {
+        let resp = if self.conn_deadline_soon(waiter.conn_id, now) {
             Response::DeadlineSoon
+        } else if waiter.batch_count.is_some() {
+            Response::ReservedBatch(Vec::new())
         } else {
             Response::TimedOut
         };

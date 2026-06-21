@@ -3769,6 +3769,34 @@ async fn test_reserve_batch_blocks_then_wakes() {
 }
 
 #[tokio::test]
+async fn test_reserve_batch_deadline_soon_wake() {
+    // A connection holding a near-TTR reserved job and blocked on a batch
+    // reserve must be woken with DEADLINE_SOON (not an empty batch), mirroring
+    // reserve-with-timeout — the signal to service the expiring job is an
+    // out-of-band interrupt, not an answer to the reserve.
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Reserve a job with TTR=2 so it enters the 1-second safety margin soon.
+    c.mustsend("put 0 0 2 1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Block on a batch reserve with a generous timeout; deadline_soon should
+    // preempt it well before the 30s timeout.
+    c.mustsend("reserve-batch 5 30\r\n").await;
+    let start = std::time::Instant::now();
+    c.ckresp("DEADLINE_SOON\r\n").await;
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "expected proactive DEADLINE_SOON wake within 5s"
+    );
+}
+
+#[tokio::test]
 async fn test_reserve_batch_waiter_stats_accounting() {
     // A parked batch waiter is counted in current-waiting while blocked, and
     // the count returns to zero once it times out.

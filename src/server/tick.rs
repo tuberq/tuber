@@ -150,8 +150,8 @@ impl ServerState {
         }
         for &i in deadline_soon_indices.iter().rev() {
             let waiter = self.remove_waiter_at(i);
-            // Batch waiters are woken with an empty batch rather than
-            // DEADLINE_SOON to keep their response shape uniform.
+            // deliver_waiter_failure sends DEADLINE_SOON here (the connection is
+            // within the TTR safety margin) for batch and single waiters alike.
             self.deliver_waiter_failure(waiter, now);
         }
 

@@ -191,7 +191,8 @@ echo -e "stats-group batch-1\r\n" | nc localhost 11300
 # Batch operations (up to 1000)
 echo -e "reserve-batch 5\r\n" | nc localhost 11300
 # Blocking batch reserve: long-poll up to 30s, then drain what's ready
-# (avoids hot-looping when the queue is empty). Returns RESERVED_BATCH 0 on timeout.
+# (avoids hot-looping when the queue is empty). Returns RESERVED_BATCH 0 on
+# timeout, or DEADLINE_SOON if one of your reserved jobs is about to hit its TTR.
 echo -e "reserve-batch 5 30\r\n" | nc localhost 11300
 echo -e "delete-batch 1 2 3 4 5\r\n" | nc localhost 11300
 ```
