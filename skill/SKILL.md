@@ -126,6 +126,10 @@ echo -e "pause-tube emails 60\r\n" | nc localhost 11300
 echo -e "flush-tube mytube\r\n" | nc localhost 11300
 # Response: FLUSHED <count>
 
+# Delete only the buried jobs in a tube (tuber extension)
+echo -e "flush-buried mytube\r\n" | nc localhost 11300
+# Response: FLUSHED <count>
+
 # Delete a specific job
 echo -e "delete 42\r\n" | nc localhost 11300
 ```

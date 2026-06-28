@@ -78,6 +78,9 @@ pub enum Command {
     FlushTube {
         tube: String,
     },
+    FlushBuried {
+        tube: String,
+    },
     ReserveBatch {
         count: u32,
         /// Optional long-poll timeout in seconds. `None` = non-blocking
@@ -291,6 +294,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_pause_tube(line.strip_prefix("pause-tube").unwrap())
     } else if let Some(rest) = line.strip_prefix("flush-tube ") {
         parse_flush_tube(rest)
+    } else if let Some(rest) = line.strip_prefix("flush-buried ") {
+        parse_flush_buried(rest)
     } else if line == "drain" {
         Ok(Command::Drain)
     } else if line == "undrain" {
@@ -553,6 +558,16 @@ fn parse_flush_tube(rest: &str) -> Result<Command, Response> {
         return Err(Response::BadFormat);
     }
     Ok(Command::FlushTube {
+        tube: name.to_string(),
+    })
+}
+
+fn parse_flush_buried(rest: &str) -> Result<Command, Response> {
+    let name = rest;
+    if !is_valid_tube_name(name) {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::FlushBuried {
         tube: name.to_string(),
     })
 }

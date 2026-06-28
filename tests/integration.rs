@@ -1663,6 +1663,100 @@ async fn test_flush_tube_with_reserved() {
 }
 
 // ---------------------------------------------------------------------------
+// flush-buried tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_flush_buried_basic() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Bury a job: put, reserve, bury.
+    let id = c.put_and_reserve(0, 0, 120, "bury_me").await;
+    c.mustsend(&format!("bury {} 0\r\n", id)).await;
+    c.ckresp("BURIED\r\n").await;
+
+    c.mustsend("flush-buried default\r\n").await;
+    c.ckresp("FLUSHED 1\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-buried: 0"),
+        "buried should be 0"
+    );
+
+    // The job is gone for good.
+    c.mustsend("peek-buried\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+#[tokio::test]
+async fn test_flush_buried_only_buried_removed() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // One buried job.
+    let id = c.put_and_reserve(0, 0, 120, "bury_me").await;
+    c.mustsend(&format!("bury {} 0\r\n", id)).await;
+    c.ckresp("BURIED\r\n").await;
+
+    // One ready job that must survive.
+    c.put_job(0, 0, 1, "keep_me").await;
+
+    c.mustsend("flush-buried default\r\n").await;
+    c.ckresp("FLUSHED 1\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-buried: 0"),
+        "buried should be 0"
+    );
+    assert!(
+        body.contains("current-jobs-ready: 1"),
+        "ready job should survive"
+    );
+
+    // The ready job is still reservable.
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    let line = c.readline().await;
+    assert!(line.starts_with("RESERVED "), "expected RESERVED, got {line}");
+    c.readline().await; // body line
+}
+
+#[tokio::test]
+async fn test_flush_buried_not_found() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("flush-buried nonexistent\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+#[tokio::test]
+async fn test_flush_buried_empty() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Tube exists with a ready job but nothing buried.
+    c.put_job(0, 0, 1, "ready").await;
+
+    c.mustsend("flush-buried default\r\n").await;
+    c.ckresp("FLUSHED 0\r\n").await;
+}
+
+#[tokio::test]
+async fn test_flush_buried_bad_format() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Invalid tube name (contains a space) hits the parser's BadFormat path.
+    c.mustsend("flush-buried bad name\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
 // Idempotency key tests
 // ---------------------------------------------------------------------------
 

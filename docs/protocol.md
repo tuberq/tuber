@@ -152,6 +152,12 @@ Delete all jobs from a tube.
 
 Response: `FLUSHED <count>\r\n` or `NOT_FOUND\r\n`
 
+### flush-buried \<tube\>\r\n
+
+Delete all buried jobs from a tube. Ready, delayed, and reserved jobs are left untouched.
+
+Response: `FLUSHED <count>\r\n` or `NOT_FOUND\r\n`
+
 ### drain\r\n
 
 Enter drain mode — rejects new `put` commands with `DRAINING`, allows in-flight work to complete. Also triggered by `SIGUSR1`.

@@ -789,6 +789,7 @@ impl ServerState {
                 self.cmd_pause_tube(&tube, delay)
             }
             Command::FlushTube { tube } => self.cmd_flush_tube(&tube),
+            Command::FlushBuried { tube } => self.cmd_flush_buried(&tube),
             Command::Drain => {
                 self.drain_mode = true;
                 tracing::info!("entering drain mode (requested by connection {})", conn_id);
@@ -1656,6 +1657,108 @@ impl ServerState {
         }
 
         Response::Flushed(count)
+    }
+
+    /// Delete every buried job in a tube, leaving ready/delayed/reserved jobs
+    /// untouched. Returns `FLUSHED <count>`. Each job gets the same teardown as
+    /// a single `delete` of a buried job (cmd_delete's Buried path) — stats,
+    /// idempotency tombstone, group tracking, WAL delete — but body releases are
+    /// batched into one BodyStore call like cmd_flush_tube. Buried jobs hold no
+    /// concurrency slot (cmd_delete only releases those on the Reserved path),
+    /// so there is no waiter to unblock here.
+    fn cmd_flush_buried(&mut self, tube_name: &str) -> Response {
+        let tube = match self.tubes.get_mut(tube_name) {
+            Some(t) => t,
+            None => return Response::NotFound,
+        };
+
+        let ids: Vec<u64> = tube.buried.drain(..).collect();
+        if ids.is_empty() {
+            return Response::Flushed(0);
+        }
+
+        use std::collections::HashSet;
+        let mut affected_groups: HashSet<String> = HashSet::new();
+        let mut external_bodies: Vec<BodyId> = Vec::new();
+        // Count jobs we actually delete rather than trusting the drained-list
+        // length, so a buried/jobs desync can't skew the stats counters.
+        let mut deleted: u64 = 0;
+        for id in ids {
+            let (idempotency_key, group_name, after_group_name) = match self.jobs.get(&id) {
+                Some(job) => (
+                    job.idempotency_key.clone(),
+                    job.group.clone(),
+                    job.after_group.clone(),
+                ),
+                None => continue,
+            };
+            deleted += 1;
+
+            // Idempotency key: drop the index entry, optionally leave a cooldown
+            // tombstone (mirror cmd_delete:1452-1466).
+            let mut expiry_epoch_secs: u64 = 0;
+            if let Some(ref key_tuple) = idempotency_key {
+                if let Some(tube) = self.tubes.get_mut(tube_name) {
+                    tube.idempotency_keys.remove(&key_tuple.0);
+                }
+                if key_tuple.1 > 0 {
+                    let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
+                    expiry_epoch_secs = expires_at
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    self.insert_tombstone(tube_name, key_tuple.0.clone(), id, expires_at);
+                }
+            }
+
+            // Group tracking (mirror cmd_delete:1467-1479).
+            if let Some(ref grp) = group_name
+                && let Some(gs) = self.groups.get_mut(grp)
+            {
+                gs.pending = gs.pending.saturating_sub(1);
+                gs.buried = gs.buried.saturating_sub(1);
+                affected_groups.insert(grp.clone());
+            }
+            if let Some(ref ag) = after_group_name
+                && let Some(gs) = self.groups.get_mut(ag)
+            {
+                gs.remove_waiting_job(id);
+            }
+
+            // WAL delete record, then drop the job from memory and collect its
+            // external body for a single batched release.
+            self.wal_write_state_change(
+                id,
+                None,
+                0,
+                Duration::ZERO,
+                expiry_epoch_secs,
+                StateChangeReason::None,
+            );
+            if let Some(job) = self.take_job(id)
+                && let BodyRef::External(body_id) = job.body
+            {
+                external_bodies.push(body_id);
+            }
+        }
+        if let Some(bs) = self.body_store.as_ref() {
+            bs.delete_many(&external_bodies);
+        }
+
+        // Counters: buried jobs are leaving for good. Derived from jobs actually
+        // removed (`deleted`), not the drained-list length.
+        if let Some(tube) = self.tubes.get_mut(tube_name) {
+            tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(deleted);
+            tube.stat.total_delete_ct += deleted;
+        }
+        self.stats.buried_ct = self.stats.buried_ct.saturating_sub(deleted);
+        self.stats.total_delete_ct += deleted;
+
+        for grp in &affected_groups {
+            self.check_group_completion(grp);
+        }
+
+        Response::Flushed(deleted as u32)
     }
 
     fn cmd_release(&mut self, conn_id: u64, id: u64, pri: u32, delay: u32) -> Response {

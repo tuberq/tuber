@@ -636,6 +636,7 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `kick-job <id>\r\n` | Kick a specific buried or delayed job. Returns `KICKED` or `NOT_FOUND`. |
 | `pause-tube <tube> <delay>\r\n` | Pause a tube for `<delay>` seconds. Returns `PAUSED`. |
 | **+** `flush-tube <tube>\r\n` | Delete all jobs from a tube. Returns `FLUSHED <count>`. |
+| **+** `flush-buried <tube>\r\n` | Delete all buried jobs from a tube; leaves ready/delayed/reserved jobs. Returns `FLUSHED <count>`. |
 | `stats\r\n` | Server-wide statistics in YAML. See [Statistics Reference](docs/statistics.md). |
 | `stats-job <id>\r\n` | Statistics for a single job in YAML. See [Statistics Reference](docs/statistics.md#job-stats-stats-job-id). |
 | `stats-tube <tube>\r\n` | Statistics for a tube in YAML. See [Statistics Reference](docs/statistics.md#tube-stats-stats-tube-tube). |

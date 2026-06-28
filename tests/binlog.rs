@@ -352,6 +352,52 @@ async fn test_binlog_bury() {
     c2.ckresp("hello\r\n").await;
 }
 
+/// flush-buried deletes buried jobs durably: bury two jobs, flush-buried,
+/// restart, and confirm nothing comes back (and external bodies are reclaimed).
+#[tokio::test]
+async fn test_binlog_flush_buried() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // Bury two jobs.
+    for _ in 0..2 {
+        c.mustsend("put 10 0 60 5\r\n").await;
+        c.mustsend("hello\r\n").await;
+    }
+    c.ckresp("INSERTED 1\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    for id in 1..=2 {
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp(&format!("RESERVED {id} 5\r\n")).await;
+        c.ckresp("hello\r\n").await;
+        c.mustsend(&format!("bury {id} 10\r\n")).await;
+        c.ckresp("BURIED\r\n").await;
+    }
+
+    c.mustsend("flush-buried default\r\n").await;
+    c.ckresp("FLUSHED 2\r\n").await;
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    // Nothing buried survived the restart.
+    c2.mustsend("peek-buried\r\n").await;
+    c2.ckresp("NOT_FOUND\r\n").await;
+    c2.mustsend("stats-tube default\r\n").await;
+    let body = c2.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-buried: 0"),
+        "buried should be 0 after restart, body: {body}"
+    );
+}
+
 /// Test 3: Put to named tube, release with new pri, restart, verify state
 #[tokio::test]
 async fn test_binlog_read() {
