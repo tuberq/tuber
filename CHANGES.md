@@ -1,5 +1,30 @@
 # Changes
 
+## v0.9.0
+
+**`flush-buried <tube>`: bulk-delete buried jobs**
+
+A new protocol command that deletes every buried job in a tube, leaving ready, delayed, and reserved jobs untouched, and returns `FLUSHED <count>`. It fills the gap between `flush-tube` (deletes everything) and `kick` (only revives buried jobs) — the operator move for clearing a poison-pill backlog without disturbing live work.
+
+`cmd_flush_buried` drains the tube's buried queue and applies the same per-job teardown as `delete`: idempotency tombstone, group pending/buried decrement, after-group waiter removal, and WAL delete. External bodies are released in a single batched `BodyStore` call, mirroring `flush-tube`. Stats counters are derived from the jobs actually removed (not the drained-list length), so a buried/jobs desync can't skew them. Buried jobs hold no concurrency slot — it's released at bury time — so no waiter needs waking. Covered by integration tests and a WAL-replay durability test.
+
+## v0.8.1
+
+**`reserve-batch`: deliver `DEADLINE_SOON` to blocking waiters; surface body-store faults**
+
+Two follow-up fixes to the v0.8.0 long-poll timeout:
+
+- **`DEADLINE_SOON` is no longer swallowed.** A connection holding a near-TTR reserved job while blocked on a positive-timeout `reserve-batch` was being woken with an empty `RESERVED_BATCH` instead of `DEADLINE_SOON`, silently dropping the signal to service its expiring job. `DEADLINE_SOON` is a connection-scoped out-of-band interrupt, not an answer to the reserve, so `deliver_waiter_failure` now checks deadline-soon before the batch short-circuit and returns it for batch and single waiters alike — matching `reserve-with-timeout`. Normal batch timeouts (no reserved jobs held) still return `RESERVED_BATCH 0`.
+- **Body-store read failures are surfaced, not masked.** `collect_batch` broke on any non-`Reserved` reserve result and returned the jobs gathered so far, so a TOAST read failure on the head-of-line job looked identical to an empty queue — a batch client would poll forever, never learning of the fault, while a single reserve returns `INTERNAL_ERROR`. `collect_batch` now also returns the terminal `INTERNAL_ERROR`; both call sites surface it when zero jobs were collected. A non-empty partial batch still wins — the unreadable job stays ready and resurfaces on a later reserve — matching the single-reserve path.
+
+## v0.8.0
+
+**`reserve-batch` optional long-poll timeout**
+
+`reserve-batch` was non-blocking: an empty queue returned `RESERVED_BATCH 0` immediately, so clients busy-looped polling for work. The command now accepts an optional timeout — `reserve-batch <count> [timeout]`. With no timeout (or `timeout 0`) it stays non-blocking. With a positive timeout it long-polls on the existing waiter machinery: it blocks only while 0 jobs are available, then drains whatever is ready (up to `<count>`) the instant the first job arrives, or replies `RESERVED_BATCH 0` on timeout. The response shape is uniform — never `TIMED_OUT` — so use the timeout form to stop clients hot-looping on empty polls.
+
+`WaitingReserve` carries the batch count; `cmd_reserve_batch` parks a waiter when empty with a positive timeout, and `process_queue` drains a batch on wakeup. New shared helpers `collect_batch` and `deliver_waiter_failure` are reused across `process_queue` and the maintenance tick. Covered by protocol grammar tests and integration tests for the non-blocking, timeout-0, immediate-when-ready, timeout-empty, blocks-then-wakes, and waiter-accounting cases.
+
 ## v0.7.2
 
 **Worker, protocol, and startup bug fixes** (from the 2026-06-11 full-app review)
