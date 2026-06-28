@@ -148,15 +148,17 @@ Response: `PAUSED\r\n` or `NOT_FOUND\r\n`
 
 ### flush-tube \<tube\>\r\n
 
-Delete all jobs from a tube.
+Delete all jobs from a tube. An absent tube is treated as already-empty: the
+response is `FLUSHED 0`, not `NOT_FOUND`.
 
-Response: `FLUSHED <count>\r\n` or `NOT_FOUND\r\n`
+Response: `FLUSHED <count>\r\n`
 
 ### flush-buried \<tube\>\r\n
 
-Delete all buried jobs from a tube. Ready, delayed, and reserved jobs are left untouched.
+Delete all buried jobs from a tube. Ready, delayed, and reserved jobs are left
+untouched. Like `flush-tube`, an absent tube yields `FLUSHED 0`.
 
-Response: `FLUSHED <count>\r\n` or `NOT_FOUND\r\n`
+Response: `FLUSHED <count>\r\n`
 
 ### drain\r\n
 

@@ -1524,9 +1524,12 @@ impl ServerState {
     }
 
     fn cmd_flush_tube(&mut self, tube_name: &str) -> Response {
+        // Absent tube: nothing to flush. Report FLUSHED 0 (idempotent) rather
+        // than NOT_FOUND — flush-tube is a tuber extension, not a beanstalkd
+        // command, so it isn't bound to the named-admin NOT_FOUND convention.
         let tube = match self.tubes.get(tube_name) {
             Some(t) => t,
-            None => return Response::NotFound,
+            None => return Response::Flushed(0),
         };
 
         // Collect all job IDs from ready, delay, and buried queues
@@ -1667,9 +1670,10 @@ impl ServerState {
     /// concurrency slot (cmd_delete only releases those on the Reserved path),
     /// so there is no waiter to unblock here.
     fn cmd_flush_buried(&mut self, tube_name: &str) -> Response {
+        // Absent tube: FLUSHED 0, mirroring cmd_flush_tube (see note there).
         let tube = match self.tubes.get_mut(tube_name) {
             Some(t) => t,
-            None => return Response::NotFound,
+            None => return Response::Flushed(0),
         };
 
         let ids: Vec<u64> = tube.buried.drain(..).collect();
