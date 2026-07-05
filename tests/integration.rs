@@ -1614,12 +1614,14 @@ async fn test_flush_tube_mixed_states() {
 }
 
 #[tokio::test]
-async fn test_flush_tube_not_found() {
+async fn test_flush_tube_absent_tube_is_flushed_zero() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
+    // flush-tube is a tuber extension: an absent tube flushes nothing
+    // (idempotent FLUSHED 0), it does not return NOT_FOUND.
     c.mustsend("flush-tube nonexistent\r\n").await;
-    c.ckresp("NOT_FOUND\r\n").await;
+    c.ckresp("FLUSHED 0\r\n").await;
 }
 
 #[tokio::test]
@@ -1726,12 +1728,13 @@ async fn test_flush_buried_only_buried_removed() {
 }
 
 #[tokio::test]
-async fn test_flush_buried_not_found() {
+async fn test_flush_buried_absent_tube_is_flushed_zero() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
+    // Mirrors flush-tube: absent tube → FLUSHED 0, not NOT_FOUND.
     c.mustsend("flush-buried nonexistent\r\n").await;
-    c.ckresp("NOT_FOUND\r\n").await;
+    c.ckresp("FLUSHED 0\r\n").await;
 }
 
 #[tokio::test]
