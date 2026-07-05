@@ -1,5 +1,11 @@
 # Changes
 
+## v0.9.1
+
+**`flush-tube`/`flush-buried`: `FLUSHED 0` for an absent tube**
+
+Both commands previously returned `NOT_FOUND` when the named tube did not exist, copying beanstalkd's named-admin convention (`pause-tube`/`stats-tube`). But they are tuber extensions, not beanstalkd commands, so they aren't bound to that convention. An absent tube now yields `FLUSHED 0` — a bulk delete against a tube holding nothing has correctly deleted nothing. It's the idempotent, more ergonomic answer, and it's stable against the idle-tube reaper, which would otherwise make `NOT_FOUND` appear racily once a drained tube is reclaimed. A tube that exists but has nothing to flush already returned `FLUSHED 0`; only the absent-tube case changes. The beanstalkd-compatible commands are unchanged.
+
 ## v0.9.0
 
 **`flush-buried <tube>`: bulk-delete buried jobs**
