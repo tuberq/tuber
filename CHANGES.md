@@ -1,5 +1,29 @@
 # Changes
 
+## v0.10.0
+
+**Durability & protocol correctness pass (WAL v7)** — from a three-part server/protocol/persistence review.
+
+Server & protocol fixes:
+
+- **`con:` concurrency limits no longer leak.** The per-key limit is now registered lazily on first reserve instead of eagerly at `put`, so a key whose jobs are deleted before ever being reserved no longer strands a stale (and, via the `.max` rule, higher) limit that would let later same-key jobs run wider than intended, nor accumulate unique keys in the map forever.
+- **`flush-tube` now sweeps `aft:`-held jobs.** After-group jobs held for a group's completion live only in the group's waiting list, not the ready/delay/buried heaps, so a flush missed them and group completion later promoted the survivor back into the "flushed" tube. Sweeping them (plus reserved jobs) covers every job state, which also makes the blanket idempotency-key clear correct — no live job is left behind to lose its key.
+- **Strict durability (`--sync-interval 0`) no longer leaks a job before its fsync.** A parked consumer woken by a `put` was answered `RESERVED` immediately, before the group-commit fsync; a crash in that window left the consumer holding a job that didn't survive replay. Woken-waiter acks are now deferred through the same fsync. On an fsync *failure*, deferred acks return `INTERNAL_ERROR` rather than a false success.
+- **Unreadable TOAST bodies auto-bury instead of wedging a tube.** A bit-rotted body at the head of the ready heap failed every reserve; the job is now buried (and the bury persisted) so the tube keeps flowing and the job is preserved for inspection.
+- `bury` wakes parked waiters when it frees a concurrency slot (matching delete/release); a non-UTF-8 command line is answered with `UNKNOWN_COMMAND` instead of dropping the connection; an idempotent re-put priority upgrade only bumps `current-jobs-urgent` for Ready jobs.
+
+Persistence:
+
+- **WAL v7 — delayed jobs replay with their remaining delay.** State-change records gained a change-time timestamp so a released/kicked-to-delayed job no longer resets to its full delay on every restart (a 1h-delay job restarted at t=59m would previously wait another full hour). Initial delayed puts use `created_at_epoch`. WAL compaction re-asserts delayed jobs with their remaining delay so a compaction rewrite can't make one fire early. Reads v3–v7; pre-v7 records fall back to the full delay.
+- **Corrupt WAL segments are quarantined, not destroyed.** An unreadable or bad-header segment is renamed to `<name>.corrupt` instead of being skipped and later GC-unlinked (a transient EIO would otherwise permanently drop its live jobs); a mid-segment corruption is copied aside before the file is truncated (which would otherwise destroy the valid records — including deletes — after the bad one, resurrecting deleted jobs). Both failure modes become operator-recoverable.
+- **Storage budget survives a WAL disable.** `--max-storage-bytes` now keys off the body store rather than the WAL, so a transient WAL error that disables the WAL (while TOAST stays attached) no longer silently removes the disk cap.
+- Torn TOAST tails are truncated at scan time so stray bytes can't be parsed as a phantom body; a startup/rotation warning fires when the open TOAST segment count nears the process fd limit.
+
+Client & operational:
+
+- The client rejects whitespace/CRLF in tube names and `idp:`/`grp:`/`aft:`/`con:` values before sending (protocol-injection guard), and `reserve-with-timeout` guards a truncated reply instead of panicking.
+- The Prometheus metrics HTTP read is bounded by a timeout and per-line size cap; `-z`/`--max-job-size` is rejected above the 1 GiB protocol limit; the deprecated-env-var alias is applied before the async runtime starts (`set_var` soundness); per-tube processing-time percentiles combine the fast and slow sample rings instead of skewing toward the slow tail.
+
 ## v0.9.1
 
 **`flush-tube`/`flush-buried`: `FLUSHED 0` for an absent tube**
