@@ -2,8 +2,17 @@ use crate::client::TuberClient;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+
+/// Max bytes accepted for a single request line / header line. Prevents a
+/// client that never sends a newline from growing the read buffer unbounded.
+const MAX_HTTP_LINE: u64 = 8 * 1024;
+/// Upper bound on request header lines read before the blank-line terminator.
+const MAX_HTTP_HEADERS: usize = 100;
+/// Wall-clock budget for reading the whole request head.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start the Prometheus metrics HTTP server.
 /// Connects to the beanstalkd port as a client to gather stats.
@@ -41,17 +50,40 @@ fn http_response(status: &str, content_type: &str, body: &str) -> String {
 async fn handle_http(socket: tokio::net::TcpStream, beanstalk_addr: &str) -> io::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut buf_reader = BufReader::new(reader);
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await?;
 
-    // Drain remaining headers
-    loop {
-        let mut header = String::new();
-        buf_reader.read_line(&mut header).await?;
-        if header.trim().is_empty() {
-            break;
+    // Bound both the time and the bytes spent reading the request head, so a
+    // slow or oversized client can't tie up the task or exhaust memory.
+    let read_head = async {
+        let mut request_line = String::new();
+        (&mut buf_reader)
+            .take(MAX_HTTP_LINE)
+            .read_line(&mut request_line)
+            .await?;
+        for _ in 0..MAX_HTTP_HEADERS {
+            let mut header = String::new();
+            let n = (&mut buf_reader)
+                .take(MAX_HTTP_LINE)
+                .read_line(&mut header)
+                .await?;
+            if n == 0 || header.trim().is_empty() {
+                break;
+            }
         }
-    }
+        Ok::<String, io::Error>(request_line)
+    };
+    let request_line = match tokio::time::timeout(HTTP_READ_TIMEOUT, read_head).await {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            let _ = writer
+                .write_all(
+                    http_response("408 Request Timeout", "text/plain", "408 Request Timeout\n")
+                        .as_bytes(),
+                )
+                .await;
+            return Ok(());
+        }
+    };
 
     if request_line.starts_with("GET /metrics") {
         let body = match gather_metrics(beanstalk_addr).await {

@@ -241,6 +241,34 @@ impl ServerState {
                         self.wal = None;
                         break;
                     }
+                    // A compaction FullJob only carries created_at_epoch, so a
+                    // release/kick-to-delayed job would replay its delay from
+                    // creation and fire early (the mirror of the v7 fix). Re-
+                    // assert Delayed with the *remaining* delay stamped at now,
+                    // so the v7 StateChange arm reconstructs the real deadline.
+                    // Skips held after-group jobs (Delayed, no deadline), which
+                    // the group logic re-holds on restore regardless.
+                    if job.state == JobState::Delayed
+                        && let Some(deadline) = job.deadline_at
+                    {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let pri = job.priority;
+                        if let Err(e) = wal.write_state_change(
+                            job,
+                            Some(JobState::Delayed),
+                            pri,
+                            remaining,
+                            0,
+                            StateChangeReason::None,
+                        ) {
+                            tracing::error!(
+                                "WAL compaction delay re-assert error: {}, disabling WAL",
+                                e
+                            );
+                            self.wal = None;
+                            break;
+                        }
+                    }
                     wal.record_migration();
                 }
             }

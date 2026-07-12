@@ -28,7 +28,11 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 ///       are pushed to the body store. The discriminant decouples the
 ///       on-disk format from the runtime threshold choice — changing
 ///       `HEAP_INLINE_MAX` doesn't require a format bump.
-pub const WAL_VERSION: u32 = 6;
+/// - v7: state-change records gained a `change_epoch_secs` (wall-clock
+///       second the change was applied). A release/kick-to-delayed job
+///       replays with its remaining delay instead of resetting to the
+///       full delay on every restart. Pre-v7 records replay full-delay.
+pub const WAL_VERSION: u32 = 7;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 
 // v6 body_kind discriminant values
@@ -38,9 +42,12 @@ const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
 const STATE_CHANGE_PAYLOAD_LEN_V3: u32 = 21;
-const STATE_CHANGE_PAYLOAD_LEN: u32 = 22; // v4: added reason byte
-/// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload(22) + crc(4)
-const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 22 + 4;
+const STATE_CHANGE_PAYLOAD_LEN_V4: u32 = 22; // v4: added reason byte
+const STATE_CHANGE_PAYLOAD_LEN_V7: u32 = 30; // v7: added change_epoch_secs (u64)
+/// Payload length written by the current serializer (v7).
+const STATE_CHANGE_PAYLOAD_LEN: u32 = STATE_CHANGE_PAYLOAD_LEN_V7;
+/// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload + crc(4)
+const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + STATE_CHANGE_PAYLOAD_LEN as usize + 4;
 /// Default cap on a single WAL segment before rotation (10 MiB).
 pub const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 const FILE_PREFIX: &str = "binlog.";
@@ -185,6 +192,11 @@ pub enum WalRecord {
         new_delay_nanos: u64,
         expiry_epoch_secs: u64, // For idempotency tombstones (0 = no tombstone)
         reason: StateChangeReason,
+        // Wall-clock second at which this change was applied (v7+). Lets a
+        // release/kick-to-delayed job replay with its *remaining* delay rather
+        // than resetting to the full delay on every restart. 0 = absent
+        // (pre-v7 record) → fall back to full delay.
+        change_epoch_secs: u64,
     },
 }
 
@@ -278,13 +290,15 @@ pub fn serialize_state_change(
     delay_nanos: u64,
     expiry_epoch_secs: u64,
     reason: StateChangeReason,
+    change_epoch_secs: u64,
 ) -> Vec<u8> {
     let mut record = Vec::with_capacity(STATE_CHANGE_RECORD_SIZE);
     record.push(RECORD_TYPE_STATE_CHANGE);
     record.extend_from_slice(&job_id.to_le_bytes());
     record.extend_from_slice(&STATE_CHANGE_PAYLOAD_LEN.to_le_bytes());
 
-    // payload: state + priority + delay_nanos + expiry_epoch_secs + reason
+    // payload (v7): state + priority + delay_nanos + expiry_epoch_secs + reason
+    //             + change_epoch_secs
     let state_byte = match state {
         Some(s) => state_to_u8(s),
         None => STATE_DELETED,
@@ -294,6 +308,7 @@ pub fn serialize_state_change(
     record.extend_from_slice(&delay_nanos.to_le_bytes());
     record.extend_from_slice(&expiry_epoch_secs.to_le_bytes());
     record.push(reason_to_u8(reason));
+    record.extend_from_slice(&change_epoch_secs.to_le_bytes());
 
     let crc = crc32fast::hash(&record);
     record.extend_from_slice(&crc.to_le_bytes());
@@ -534,11 +549,11 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
             // Replay with the *remaining* delay, not the full original delay,
             // so a delayed job doesn't reset its countdown on every restart
             // (a 1h-delay job restarted at t=59m would otherwise wait another
-            // full hour). created_at_epoch is when the delay started for an
-            // initial delayed put; subtract the elapsed wall-clock. Note:
-            // release/kick-to-delayed flows through StateChange, which carries
-            // no state-change timestamp, so that path still replays the full
-            // delay — see the StateChange replay arm.
+            // full hour). For an initial delayed put, created_at_epoch is when
+            // the delay started; subtract the elapsed wall-clock. A later
+            // release/kick-to-delayed is superseded on replay by its v7
+            // StateChange record, which carries its own change_epoch_secs — see
+            // the StateChange replay arm.
             let now_epoch = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -573,7 +588,9 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
 }
 
 fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
-    // Determine record size from payload_len to support both v3 (21) and v4 (22)
+    // Determine record size from payload_len to support v3 (21), v4-v6 (22),
+    // and v7 (30). The record is self-describing via payload_len, so a newer
+    // reader can still decode older, shorter records.
     if data.len() < 13 {
         return Err(WalError::Truncated);
     }
@@ -583,7 +600,10 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
     if data.len() < record_size {
         return Err(WalError::Truncated);
     }
-    if payload_len != STATE_CHANGE_PAYLOAD_LEN_V3 && payload_len != STATE_CHANGE_PAYLOAD_LEN {
+    if payload_len != STATE_CHANGE_PAYLOAD_LEN_V3
+        && payload_len != STATE_CHANGE_PAYLOAD_LEN_V4
+        && payload_len != STATE_CHANGE_PAYLOAD_LEN_V7
+    {
         return Err(WalError::InvalidData);
     }
 
@@ -613,10 +633,15 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
     let expiry_epoch_secs =
         u64::from_le_bytes(data[26..34].try_into().map_err(|_| WalError::Truncated)?);
 
-    let reason = if payload_len >= STATE_CHANGE_PAYLOAD_LEN {
+    let reason = if payload_len >= STATE_CHANGE_PAYLOAD_LEN_V4 {
         u8_to_reason(data[34])
     } else {
         StateChangeReason::None
+    };
+    let change_epoch_secs = if payload_len >= STATE_CHANGE_PAYLOAD_LEN_V7 {
+        u64::from_le_bytes(data[35..43].try_into().map_err(|_| WalError::Truncated)?)
+    } else {
+        0
     };
 
     Ok((
@@ -627,9 +652,27 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
             new_delay_nanos,
             expiry_epoch_secs,
             reason,
+            change_epoch_secs,
         },
         record_size,
     ))
+}
+
+/// Path a corrupt segment is moved/copied aside to: `<path>.corrupt`.
+fn corrupt_sidecar_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".corrupt");
+    PathBuf::from(os)
+}
+
+/// Rename a corrupt segment to `<path>.corrupt` so it is preserved for operator
+/// recovery instead of being skipped-then-GC-unlinked (which turns a transient
+/// read error into permanent loss of the segment's live jobs). Returns the
+/// sidecar path on success.
+fn quarantine_corrupt_segment(path: &Path) -> io::Result<PathBuf> {
+    let dest = corrupt_sidecar_path(path);
+    fs::rename(path, &dest)?;
+    Ok(dest)
 }
 
 fn write_header(w: &mut impl Write) -> io::Result<()> {
@@ -1145,6 +1188,13 @@ impl Wal {
         self.rotate_if_needed()?;
 
         let delay_nanos = new_delay.as_nanos().min(u64::MAX as u128) as u64;
+        // Stamp the wall-clock instant of this change so a delayed replay can
+        // subtract the elapsed time (v7). For a release/kick-to-delayed, this
+        // is when the delay started; for other changes it is simply unused.
+        let change_epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let record = serialize_state_change(
             job.id,
             new_state,
@@ -1152,6 +1202,7 @@ impl Wal {
             delay_nanos,
             expiry_epoch_secs,
             reason,
+            change_epoch_secs,
         );
         let record_len = record.len();
 
@@ -1247,13 +1298,30 @@ impl Wal {
         let total_bytes = self.total_disk_bytes;
         let mut bytes_done: u64 = 0;
         let mut last_log = Instant::now();
+        // Segments quarantined this replay (moved to `.corrupt`); dropped from
+        // `self.files` after the loop so GC can't chase the renamed path.
+        let mut quarantined_seqs: Vec<u64> = Vec::new();
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
         for (idx, (seq, path)) in file_infos.iter().enumerate() {
             let data = match fs::read(path) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("WAL: skipping file {:?}: {}", path, e);
+                    match quarantine_corrupt_segment(path) {
+                        Ok(dest) => tracing::error!(
+                            "WAL: unreadable segment {:?} ({}); quarantined to {:?}",
+                            path,
+                            e,
+                            dest
+                        ),
+                        Err(re) => tracing::error!(
+                            "WAL: unreadable segment {:?} ({}); quarantine failed: {}",
+                            path,
+                            e,
+                            re
+                        ),
+                    }
+                    quarantined_seqs.push(*seq);
                     continue;
                 }
             };
@@ -1261,7 +1329,21 @@ impl Wal {
             let version = match read_header(&data) {
                 Ok((v, _flags)) => v,
                 Err(e) => {
-                    tracing::warn!("WAL: bad header in {:?}: {}", path, e);
+                    match quarantine_corrupt_segment(path) {
+                        Ok(dest) => tracing::error!(
+                            "WAL: bad header in {:?} ({}); quarantined to {:?}",
+                            path,
+                            e,
+                            dest
+                        ),
+                        Err(re) => tracing::error!(
+                            "WAL: bad header in {:?} ({}); quarantine failed: {}",
+                            path,
+                            e,
+                            re
+                        ),
+                    }
+                    quarantined_seqs.push(*seq);
                     continue;
                 }
             };
@@ -1297,6 +1379,7 @@ impl Wal {
                                 new_delay_nanos,
                                 expiry_epoch_secs,
                                 reason,
+                                change_epoch_secs,
                             } => {
                                 if job_id > max_id {
                                     max_id = job_id;
@@ -1341,17 +1424,27 @@ impl Wal {
                                             job.priority = new_priority;
                                             job.delay = Duration::from_nanos(new_delay_nanos);
                                             if replay_state == JobState::Delayed {
-                                                // Full-delay replay: StateChange
-                                                // records carry no timestamp for
-                                                // when the delay started (unlike a
-                                                // FullJob's created_at_epoch), so
-                                                // the remaining-delay computation
-                                                // used for delayed puts can't be
-                                                // applied here without a format
-                                                // bump. A released/kicked-to-delayed
-                                                // job may wait its full delay again
-                                                // after a restart.
-                                                job.deadline_at = Some(Instant::now() + job.delay);
+                                                // Replay with the *remaining*
+                                                // delay when the change carries a
+                                                // v7 timestamp (change_epoch_secs
+                                                // = when the delay started), so a
+                                                // released/kicked-to-delayed job
+                                                // doesn't reset its countdown on
+                                                // every restart. Pre-v7 records
+                                                // (0) fall back to the full delay.
+                                                let deadline = if change_epoch_secs > 0 {
+                                                    let now_epoch = SystemTime::now()
+                                                        .duration_since(UNIX_EPOCH)
+                                                        .map(|d| d.as_secs())
+                                                        .unwrap_or(change_epoch_secs);
+                                                    let elapsed = Duration::from_secs(
+                                                        now_epoch.saturating_sub(change_epoch_secs),
+                                                    );
+                                                    Instant::now() + job.delay.saturating_sub(elapsed)
+                                                } else {
+                                                    Instant::now() + job.delay
+                                                };
+                                                job.deadline_at = Some(deadline);
                                             } else {
                                                 job.deadline_at = None;
                                             }
@@ -1378,14 +1471,26 @@ impl Wal {
                         offset += consumed;
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "WAL: error reading record in {:?} at offset {}: {}, truncating",
+                        tracing::error!(
+                            "WAL: corrupt record in {:?} at offset {}: {}; preserving a .corrupt copy then truncating",
                             path,
                             offset,
                             e
                         );
-                        // Truncate the file at the corrupt offset to prevent
-                        // repeated warnings on every restart.
+                        // Preserve the whole segment before truncating so a
+                        // mid-segment bit-rot — valid records (including deletes)
+                        // after the bad one — is operator-recoverable rather than
+                        // physically destroyed (which would resurrect deleted
+                        // jobs). The active file is still truncated to the last
+                        // good offset so the WAL can continue.
+                        let dest = corrupt_sidecar_path(path);
+                        if let Err(ce) = fs::copy(path, &dest) {
+                            tracing::error!(
+                                "WAL: failed to preserve corrupt segment {:?}: {}",
+                                path,
+                                ce
+                            );
+                        }
                         if let Ok(f) = OpenOptions::new().write(true).open(path) {
                             if let Err(te) = f.set_len(offset as u64) {
                                 tracing::warn!("WAL: failed to truncate {:?}: {}", path, te);
@@ -1417,6 +1522,19 @@ impl Wal {
                 );
                 last_log = Instant::now();
             }
+        }
+
+        // Drop quarantined segments from tracking so GC never tries to unlink
+        // the (now renamed) path, and the byte accounting stays accurate.
+        if !quarantined_seqs.is_empty() {
+            let removed_bytes: u64 = self
+                .files
+                .iter()
+                .filter(|f| quarantined_seqs.contains(&f.seq))
+                .map(|f| f.bytes_written as u64)
+                .sum();
+            self.files.retain(|f| !quarantined_seqs.contains(&f.seq));
+            self.total_disk_bytes = self.total_disk_bytes.saturating_sub(removed_bytes);
         }
 
         // Reserve bytes for each live job's future delete
@@ -1688,6 +1806,7 @@ mod tests {
             0,
             0,
             StateChangeReason::Bury,
+            1_700_000_000,
         );
         assert_eq!(record.len(), STATE_CHANGE_RECORD_SIZE);
 
@@ -1701,6 +1820,7 @@ mod tests {
             new_delay_nanos,
             expiry_epoch_secs,
             reason,
+            change_epoch_secs,
         } = rec
         {
             assert_eq!(job_id, 99);
@@ -1709,6 +1829,7 @@ mod tests {
             assert_eq!(new_delay_nanos, 0);
             assert_eq!(expiry_epoch_secs, 0);
             assert_eq!(reason, StateChangeReason::Bury);
+            assert_eq!(change_epoch_secs, 1_700_000_000);
         } else {
             panic!("expected StateChange");
         }
@@ -1716,7 +1837,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_state_change_deleted() {
-        let record = serialize_state_change(77, None, 0, 0, 0, StateChangeReason::None);
+        let record = serialize_state_change(77, None, 0, 0, 0, StateChangeReason::None, 0);
         let (rec, _) = deserialize_record(&record, WAL_VERSION).unwrap();
 
         if let WalRecord::StateChange { new_state, .. } = rec {
@@ -1729,7 +1850,7 @@ mod tests {
     #[test]
     fn test_crc32_validation() {
         let mut record =
-            serialize_state_change(99, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
+            serialize_state_change(99, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None, 0);
         // Corrupt a byte in the middle
         record[5] ^= 0xFF;
         let result = deserialize_record(&record, WAL_VERSION);
@@ -1854,7 +1975,7 @@ mod tests {
     #[test]
     fn test_corrupted_state_change_crc() {
         let mut record =
-            serialize_state_change(1, Some(JobState::Ready), 100, 0, 0, StateChangeReason::None);
+            serialize_state_change(1, Some(JobState::Ready), 100, 0, 0, StateChangeReason::None, 0);
         let len = record.len();
         record[len - 2] ^= 0xFF;
         assert!(matches!(deserialize_record(&record, WAL_VERSION), Err(WalError::BadCrc)));
@@ -1881,7 +2002,7 @@ mod tests {
     #[test]
     fn test_invalid_state_byte_in_state_change() {
         let mut record =
-            serialize_state_change(1, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
+            serialize_state_change(1, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None, 0);
         // State byte is at offset 13 in state change record
         record[13] = 0xEE; // invalid state (not 0-3 or 0xFF)
         // Recompute CRC
@@ -1978,6 +2099,133 @@ mod tests {
         assert!(jobs.contains_key(&1));
         assert!(jobs.contains_key(&2));
         assert!(next_id >= 3);
+    }
+
+    #[test]
+    fn test_replay_quarantines_corrupt_segment() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // One durable job in a segment.
+        {
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+            let mut job = Job::new(
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body".to_vec(),
+                "default".to_string(),
+            );
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+        }
+
+        let seg = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(FILE_PREFIX))
+            .unwrap()
+            .path();
+
+        // Corrupt the segment's magic so its header fails to parse.
+        {
+            let mut f = OpenOptions::new().write(true).open(&seg).unwrap();
+            f.write_all(b"XXXX").unwrap();
+        }
+
+        // Replay must quarantine the segment (preserve it), not skip-then-GC it.
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+        let (jobs, _, _, _) = wal.replay().unwrap();
+        assert!(jobs.is_empty(), "corrupt segment's jobs are not loaded");
+        assert!(!seg.exists(), "corrupt segment must be renamed away");
+        assert!(
+            corrupt_sidecar_path(&seg).exists(),
+            "segment must be preserved as .corrupt for recovery"
+        );
+
+        // GC must not choke on the (now untracked) quarantined file.
+        wal.gc();
+    }
+
+    #[test]
+    fn test_state_change_to_delayed_replays_remaining_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Two ready jobs on disk.
+        {
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+            for id in [1u64, 2] {
+                let mut job = Job::new(
+                    id,
+                    10,
+                    Duration::ZERO,
+                    Duration::from_secs(60),
+                    b"body".to_vec(),
+                    "default".to_string(),
+                );
+                external_body(&mut job);
+                wal.write_put(&mut job).unwrap();
+            }
+        }
+
+        // Hand-craft two release-to-delayed records so we control change_epoch
+        // (the live API always stamps `now`). Job 1: delay started 2h ago with a
+        // 1h delay ⇒ already expired. Job 2: pre-v7 record (epoch 0) ⇒ replays
+        // the full delay.
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let one_hour_nanos = Duration::from_secs(3600).as_nanos() as u64;
+        let expired = serialize_state_change(
+            1,
+            Some(JobState::Delayed),
+            10,
+            one_hour_nanos,
+            0,
+            StateChangeReason::Release,
+            now_epoch - 7200,
+        );
+        let no_ts = serialize_state_change(
+            2,
+            Some(JobState::Delayed),
+            10,
+            one_hour_nanos,
+            0,
+            StateChangeReason::Release,
+            0,
+        );
+
+        let wal_file = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with(FILE_PREFIX))
+            .unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(wal_file.path()).unwrap();
+            f.write_all(&expired).unwrap();
+            f.write_all(&no_ts).unwrap();
+        }
+
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+        let (jobs, _, _, _) = wal.replay().unwrap();
+
+        let j1 = jobs.get(&1).unwrap();
+        assert_eq!(j1.state, JobState::Delayed);
+        assert!(
+            j1.deadline_at.unwrap() <= Instant::now(),
+            "expired release-delay must replay ready-soon, not the full hour"
+        );
+
+        let j2 = jobs.get(&2).unwrap();
+        assert_eq!(j2.state, JobState::Delayed);
+        assert!(
+            j2.deadline_at.unwrap() > Instant::now() + Duration::from_secs(1800),
+            "pre-v7 record must fall back to the full delay"
+        );
     }
 
     #[test]

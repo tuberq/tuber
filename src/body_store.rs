@@ -24,7 +24,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,7 +155,40 @@ pub struct BodyStore {
     /// (subsequent reserve/peek returns NotFound, surfaced as
     /// INTERNAL_ERROR by the server).
     bodies_dropped_corrupted: AtomicU64,
+    /// Set once the fd-pressure warning has been emitted, so it fires at most
+    /// once per process instead of on every rotation past the threshold.
+    fd_warning_emitted: AtomicBool,
     inner: Mutex<Inner>,
+}
+
+/// Process soft limit on open file descriptors (`RLIMIT_NOFILE`), if readable.
+fn fd_soft_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills `lim`; RLIMIT_NOFILE is always a valid resource.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    (rc == 0).then_some(u64::from(lim.rlim_cur))
+}
+
+/// Emit a one-shot warning when the number of open segment files (one fd each)
+/// is a large fraction of the process fd limit. Stopgap for the fd-per-segment
+/// design: at ~64 MiB per segment this bites around 16 GiB of bodies on a
+/// 256-fd limit, after which `accept()` and reads start failing with EMFILE.
+/// The real fix is an LRU'd open-file cache; this just turns the cliff into a
+/// signpost.
+fn warn_if_fd_pressure(segment_count: usize, warned: &AtomicBool) {
+    let Some(limit) = fd_soft_limit() else { return };
+    let threshold = limit.saturating_mul(3) / 4; // 75%
+    if threshold > 0 && segment_count as u64 >= threshold && !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "TOAST: {} open segment files vs fd soft-limit {} — approaching EMFILE; \
+             raise the limit (ulimit -n) or reduce body volume (segments are ~64 MiB each)",
+            segment_count,
+            limit,
+        );
+    }
 }
 
 // --- Public API ---
@@ -243,7 +276,7 @@ impl BodyStore {
         let current_seq = seqs.last().copied();
 
         let segment_count = segments.len();
-        Ok(BodyStore {
+        let store = BodyStore {
             dir: dir.to_path_buf(),
             segment_size,
             next_body_id: AtomicU64::new(max_body_id),
@@ -253,8 +286,13 @@ impl BodyStore {
             compactions_total: AtomicU64::new(0),
             bodies_migrated_total: AtomicU64::new(0),
             bodies_dropped_corrupted: AtomicU64::new(0),
+            fd_warning_emitted: AtomicBool::new(false),
             inner: Mutex::new(Inner { segments, current_seq, next_seq, index }),
-        })
+        };
+        // A restart with many existing segments can already be near the fd
+        // limit before serving a single request.
+        warn_if_fd_pressure(segment_count, &store.fd_warning_emitted);
+        Ok(store)
     }
 
     /// Append `bytes` to the current segment (rotating first if it would
@@ -297,7 +335,10 @@ impl BodyStore {
             inner.rotate(&self.dir)?;
             self.total_bytes
                 .fetch_add(FILE_HEADER_SIZE as u64, Ordering::Relaxed);
-            self.segment_count.fetch_add(1, Ordering::Relaxed);
+            let count = self.segment_count.fetch_add(1, Ordering::Relaxed) + 1;
+            // Runtime growth can cross the fd-pressure threshold long after
+            // startup; warn (once) as new segments are opened.
+            warn_if_fd_pressure(count, &self.fd_warning_emitted);
         }
 
         let current_seq = inner.current_seq.expect("rotation populates current_seq");

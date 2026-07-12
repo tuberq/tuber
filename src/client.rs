@@ -13,6 +13,25 @@ pub enum ReserveResult {
     Error(String),
 }
 
+/// Reject a tube name or tag value that would break the line-based protocol.
+/// Whitespace or control bytes (notably CR/LF) let a caller inject a second
+/// command or desync the stream, so they're refused before anything is sent.
+fn validate_token(kind: &str, s: &str) -> io::Result<()> {
+    if s.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} must not be empty"),
+        ));
+    }
+    if s.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{kind} contains whitespace or control characters: {s:?}"),
+        ));
+    }
+    Ok(())
+}
+
 impl TuberClient {
     pub async fn connect(addr: &str) -> io::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
@@ -25,16 +44,19 @@ impl TuberClient {
     }
 
     pub async fn use_tube(&mut self, tube: &str) -> io::Result<String> {
+        validate_token("tube name", tube)?;
         self.send_line(&format!("use {tube}")).await?;
         self.read_line().await
     }
 
     pub async fn watch(&mut self, tube: &str) -> io::Result<String> {
+        validate_token("tube name", tube)?;
         self.send_line(&format!("watch {tube}")).await?;
         self.read_line().await
     }
 
     pub async fn ignore(&mut self, tube: &str) -> io::Result<String> {
+        validate_token("tube name", tube)?;
         self.send_line(&format!("ignore {tube}")).await?;
         self.read_line().await
     }
@@ -52,15 +74,19 @@ impl TuberClient {
     ) -> io::Result<String> {
         let mut cmd = format!("put {} {} {} {}", pri, delay, ttr, body.len());
         if let Some(key) = idempotency_key {
+            validate_token("idp: value", key)?;
             cmd.push_str(&format!(" idp:{key}"));
         }
         if let Some(key) = group {
+            validate_token("grp: value", key)?;
             cmd.push_str(&format!(" grp:{key}"));
         }
         if let Some(key) = after_group {
+            validate_token("aft: value", key)?;
             cmd.push_str(&format!(" aft:{key}"));
         }
         if let Some(key) = concurrency_key {
+            validate_token("con: value", key)?;
             cmd.push_str(&format!(" con:{key}"));
         }
         cmd.push_str("\r\n");
@@ -77,6 +103,11 @@ impl TuberClient {
         let line = self.read_line().await?;
         if line.starts_with("RESERVED") {
             let parts: Vec<&str> = line.split_whitespace().collect();
+            // Guard before indexing: a truncated/malformed "RESERVED" reply
+            // (fewer than 3 fields) must surface as an error, not panic.
+            if parts.len() < 3 {
+                return Err(io::Error::other(format!("malformed RESERVED reply: {line}")));
+            }
             let id: u64 = parts[1]
                 .parse()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -175,6 +206,7 @@ impl TuberClient {
     }
 
     pub async fn stats_tube(&mut self, tube: &str) -> io::Result<String> {
+        validate_token("tube name", tube)?;
         self.send_line(&format!("stats-tube {tube}")).await?;
         self.read_ok_body().await
     }
@@ -217,5 +249,26 @@ impl TuberClient {
             ));
         }
         Ok(line.trim_end().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_token;
+
+    #[test]
+    fn validate_token_accepts_plain_and_colon_forms() {
+        assert!(validate_token("tube name", "orders").is_ok());
+        // con:/idp: values legitimately carry a colon (key:N).
+        assert!(validate_token("con: value", "api:5").is_ok());
+    }
+
+    #[test]
+    fn validate_token_rejects_injection_and_empty() {
+        assert!(validate_token("tube name", "").is_err());
+        assert!(validate_token("tube name", "a b").is_err());
+        assert!(validate_token("tube name", "a\r\nDELETE 1").is_err());
+        assert!(validate_token("tube name", "a\tb").is_err());
+        assert!(validate_token("tube name", "a\n").is_err());
     }
 }

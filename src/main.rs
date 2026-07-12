@@ -6,10 +6,20 @@ use std::time::Duration;
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-/// Parse a human-readable byte count for `--max-job-size`, clamping to u32.
+/// Parse a human-readable byte count for `--max-job-size`. Rejects anything
+/// above `JOB_DATA_SIZE_LIMIT_MAX` (1 GiB): the protocol can't carry a larger
+/// body, and a value beyond it (or beyond u32) is a configuration mistake, not
+/// something to silently honour.
 fn parse_max_job_size(s: &str) -> Result<u32, String> {
     let n = tuber::server::parse_bytes(s)?;
-    u32::try_from(n).map_err(|_| format!("max-job-size {s:?} does not fit in u32"))
+    let n = u32::try_from(n).map_err(|_| format!("max-job-size {s:?} does not fit in u32"))?;
+    if n > tuber::job::JOB_DATA_SIZE_LIMIT_MAX {
+        return Err(format!(
+            "max-job-size {s:?} exceeds the 1 GiB limit ({} bytes)",
+            tuber::job::JOB_DATA_SIZE_LIMIT_MAX
+        ));
+    }
+    Ok(n)
 }
 
 /// Parse a human-readable duration (e.g. `0`, `50ms`, `1s`, `2m`) into a `Duration`.
@@ -213,21 +223,27 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Deprecation alias: honour the old `TUBER_WAL_SYNC_INTERVAL` env var
     // when the new `TUBER_SYNC_INTERVAL` is unset, so existing deployments
     // keep working unchanged. Stamp a one-shot warning the first time.
+    //
+    // This MUST run before the tokio runtime starts: `#[tokio::main]` spawns
+    // worker threads as soon as `run()` is entered, and `set_var` is only
+    // sound while the process is still single-threaded.
     if std::env::var_os("TUBER_SYNC_INTERVAL").is_none()
         && let Some(old) = std::env::var_os("TUBER_WAL_SYNC_INTERVAL")
     {
-        eprintln!(
-            "tuber: TUBER_WAL_SYNC_INTERVAL is deprecated; use TUBER_SYNC_INTERVAL"
-        );
-        // SAFETY: mutating the process env before any threads spawn.
+        eprintln!("tuber: TUBER_WAL_SYNC_INTERVAL is deprecated; use TUBER_SYNC_INTERVAL");
+        // SAFETY: no runtime and no other threads exist yet — single-threaded.
         unsafe { std::env::set_var("TUBER_SYNC_INTERVAL", old) };
     }
 
+    run();
+}
+
+#[tokio::main]
+async fn run() {
     let matches = Cli::command().get_matches();
     // Did the operator set --sync-interval explicitly (CLI or env), or is it
     // just the default? Used to warn only when it was actually set but can't

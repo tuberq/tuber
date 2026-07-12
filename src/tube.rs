@@ -91,16 +91,20 @@ impl TubeStats {
         }
     }
 
-    /// Compute p50/p95/p99 from slow samples if available, otherwise fast samples.
+    /// Compute p50/p95/p99 over all recent samples — the fast (<100ms) and slow
+    /// (>=100ms) rings combined. Using the slow ring alone whenever it held any
+    /// sample skewed every percentile toward the slow tail: a single 200ms job
+    /// among a thousand 10ms jobs would report p50=200ms. (Each ring keeps its
+    /// own recent window, so a heavily bimodal tube weights the two modes by
+    /// window occupancy rather than raw counts — an acceptable approximation.)
     pub fn percentiles(&self) -> (f64, f64, f64) {
-        let ring = if !self.processing_time_ring_slow.is_empty() {
-            &self.processing_time_ring_slow
-        } else if !self.processing_time_ring_fast.is_empty() {
-            &self.processing_time_ring_fast
-        } else {
+        let total = self.processing_time_ring_fast.len() + self.processing_time_ring_slow.len();
+        if total == 0 {
             return (0.0, 0.0, 0.0);
-        };
-        let mut sorted: Vec<f64> = ring.iter().copied().collect();
+        }
+        let mut sorted: Vec<f64> = Vec::with_capacity(total);
+        sorted.extend(self.processing_time_ring_fast.iter().copied());
+        sorted.extend(self.processing_time_ring_slow.iter().copied());
         sorted.sort_unstable_by(f64::total_cmp);
         let len = sorted.len();
         let p = |pct: f64| -> f64 {
@@ -196,6 +200,30 @@ mod tests {
         assert_eq!(t.stat.waiting_ct, 0);
         assert!(!t.is_paused());
         assert!(t.is_idle());
+    }
+
+    #[test]
+    fn test_percentiles_combine_fast_and_slow_rings() {
+        let mut s = TubeStats::default();
+        // Many fast samples and a single slow outlier. The median must reflect
+        // the fast bulk, not be dragged to the slow tail (the slow-ring-only bug).
+        for _ in 0..999 {
+            s.record_fast_sample(0.010);
+        }
+        s.record_slow_sample(0.200);
+
+        let (p50, _p95, p99) = s.percentiles();
+        assert!(
+            (p50 - 0.010).abs() < 1e-9,
+            "p50 should reflect the fast bulk, got {p50}"
+        );
+        assert!(p99 >= p50, "percentiles must stay ordered");
+    }
+
+    #[test]
+    fn test_percentiles_empty_is_zero() {
+        let s = TubeStats::default();
+        assert_eq!(s.percentiles(), (0.0, 0.0, 0.0));
     }
 
     // Adapted from cttest_ms_append -- tests watch set add
