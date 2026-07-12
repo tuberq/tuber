@@ -5941,3 +5941,116 @@ async fn test_put_bad_tag_body_never_executed_fuzz() {
         c.ckresp("sentinel\r\n").await;
     }
 }
+
+// Regression tests for the server/protocol review findings.
+
+/// flush-tube must also remove `aft:`-held jobs. They live only in the group's
+/// waiting list (not the ready/delay/buried heaps), so a naive flush left them
+/// behind — and completing the group afterwards promoted the survivor straight
+/// back into the "flushed" tube.
+#[tokio::test]
+async fn test_flush_tube_removes_held_after_job() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // One group child (ready) and one after-job held on that group.
+    c.mustsend("put 0 0 60 1 grp:batch\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("put 0 0 60 1 aft:batch\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    // Both the ready child and the held after-job must be flushed.
+    c.mustsend("flush-tube default\r\n").await;
+    c.ckresp("FLUSHED 2\r\n").await;
+
+    // Nothing may be resurrected: completing the (now empty) group must not
+    // promote a held job back into the tube.
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+}
+
+/// A non-UTF-8 command line must be answered with UNKNOWN_COMMAND and keep the
+/// connection alive, not silently drop it (byte-oriented beanstalkd responds).
+#[tokio::test]
+async fn test_non_utf8_command_is_unknown_command() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend_bytes(b"\xff\xfe\r\n").await;
+    c.ckresp("UNKNOWN_COMMAND\r\n").await;
+
+    // Connection survives: a valid command still works.
+    c.mustsend("use default\r\n").await;
+    c.ckresp("USING default\r\n").await;
+}
+
+/// A `con:` limit registered by a job that is deleted before it is ever
+/// reserved must not leak. Previously the eager put-time registration left a
+/// stale (and, via `.max`, higher) limit behind, letting later same-key jobs
+/// run wider than their own declared limit.
+#[tokio::test]
+async fn test_concurrency_limit_not_leaked_by_unreserved_delete() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // A high-limit job for key "shared" that is never reserved, just deleted.
+    c.mustsend("put 0 0 60 1 con:shared:5\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    // Two default-limit (1) jobs on the same key.
+    c.mustsend("put 0 0 60 1 con:shared\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("put 0 0 60 1 con:shared\r\n").await;
+    c.mustsend("c\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    // Reserve one — it holds the single slot for "shared".
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("b\r\n").await;
+
+    // The second must be concurrency-blocked (limit 1), not widened to the
+    // leaked limit of 5.
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+}
+
+/// An idempotent re-put that upgrades priority across the urgent threshold must
+/// only bump `current-jobs-urgent` when the job is Ready. Upgrading a Reserved
+/// job used to inflate the counter (and double-count once it became ready).
+#[tokio::test]
+async fn test_urgent_ct_stable_on_reserved_reput_upgrade() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Non-urgent job (pri 2000 >= 1024) with an idempotency key.
+    c.mustsend("put 2000 0 60 1 idp:k1\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    // Reserve it, so the re-put upgrades a *Reserved* (non-Ready) job.
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+
+    // Re-put with urgent priority (0 < 1024): dedups to the reserved job and
+    // upgrades its priority.
+    c.mustsend("put 0 0 60 1 idp:k1\r\n").await;
+    c.mustsend("b\r\n").await;
+    c.ckresp("INSERTED 1 RESERVED 0\r\n").await;
+
+    // The reserved job is not Ready, so it must not count as urgent.
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("current-jobs-urgent: 0"),
+        "reserved job must not be counted urgent, got:\n{body}"
+    );
+}

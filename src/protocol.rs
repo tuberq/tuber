@@ -321,6 +321,14 @@ pub fn put_declared_body_len(cmd_str: &str) -> Option<u32> {
     }
     // After the verb the fields are: pri, delay, ttr, bytes. The byte count is
     // the 4th, parsed independently of the (possibly invalid) preceding fields.
+    //
+    // Deliberately parsed as u32 (the wire type for `<bytes>`): a declared
+    // length above u32::MAX has no trustworthy body length to drain — such a
+    // client is malformed and won't stream that many bytes, and a real body
+    // that large would exceed JOB_DATA_SIZE_LIMIT_MAX anyway. Returning None
+    // here leaves it as a pure BAD_FORMAT with no drain, which is what
+    // `test_job_size_invalid` pins down. Draining on an over-u32 value would
+    // instead swallow the client's next commands (the real desync).
     parts.nth(3)?.parse::<u32>().ok()
 }
 

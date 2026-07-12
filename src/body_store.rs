@@ -870,6 +870,22 @@ fn scan_segment(file: &mut File) -> Result<SegmentScan, BodyStoreError> {
         offset = next_offset;
     }
 
+    // Physically drop any torn tail (a partial record after the last complete
+    // one) now. If left in place, a later append writes at `offset` but the
+    // older stray bytes beyond the new record survive, where a subsequent scan
+    // could parse them as a phantom body record — worst case advancing
+    // next_body_id toward u64::MAX permanently. Only the active segment can
+    // carry a torn tail; a cleanly sealed one has offset == file_len here.
+    if offset < file_len {
+        tracing::warn!(
+            "TOAST: truncating torn tail ({} stray bytes) at offset {}",
+            file_len - offset,
+            offset,
+        );
+        file.set_len(offset)?;
+        file.sync_data()?;
+    }
+
     Ok(SegmentScan { entries, consumed: offset })
 }
 
@@ -914,6 +930,47 @@ mod tests {
         let store = open(dir);
         assert_eq!(store.read_body(id1).unwrap(), b"first body");
         assert_eq!(store.read_body(id2).unwrap(), b"second body");
+    }
+
+    /// A crash mid-append leaves a partial (torn) body record after the last
+    /// complete one. open() must physically truncate it at scan time, so a
+    /// later append can't strand older stray bytes beyond the new record where
+    /// a subsequent scan would parse them as a phantom body.
+    #[test]
+    fn test_open_truncates_torn_tail() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let store = open(dir);
+        let id = store.write_body(b"good body").unwrap();
+        store.fsync().unwrap();
+        drop(store);
+
+        let path = segment_path(dir, 0);
+        let len_before = fs::metadata(&path).unwrap().len();
+
+        // Stray partial header (< BODY_HEADER_SIZE) as if a write was torn.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xAB; 8]).unwrap();
+            f.sync_data().unwrap();
+        }
+        assert!(fs::metadata(&path).unwrap().len() > len_before);
+
+        // Reopen: the torn tail is truncated back to the last complete record.
+        let store = open(dir);
+        assert_eq!(store.read_body(id).unwrap(), b"good body");
+        drop(store);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            len_before,
+            "torn tail must be truncated at scan"
+        );
+
+        // A subsequent restart is clean — no phantom record resurrected.
+        let store = open(dir);
+        assert_eq!(store.read_body(id).unwrap(), b"good body");
     }
 
     /// Same crash window, but some of the file header made it to disk.

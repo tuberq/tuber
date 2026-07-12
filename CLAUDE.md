@@ -42,7 +42,7 @@ The codebase mirrors the original C beanstalkd structure:
 
 Two on-disk stores side by side:
 
-- **WAL** (`binlog.NNNNNN` files): metadata records — `FullJob` carrying a `BodyId` reference and `StateChange` for delete/release/bury/kick/timeout. v5 is current; v3 and v4 inline-body records are still readable and migrated into TOAST on first replay.
+- **WAL** (`binlog.NNNNNN` files): metadata records — `FullJob` carrying a `BodyId` reference and `StateChange` for delete/release/bury/kick/timeout. v6 is current; v3 and v4 inline-body records are still readable and migrated into TOAST on first replay.
 - **TOAST** (`toast/body.NNNNNN`): append-only body segments. Per-body record header is `body_id u64 + len u32 + crc32 u32 + reserved u32` followed by the bytes. File header is `"TBOD" + version + reserved`.
 
 **Sync ordering:** every WAL fsync is preceded by a TOAST fsync (`Wal::pre_sync_body_store`). A crash mid-sync leaves orphan bodies, never dangling references — orphans are detected on replay and reclaimed via `BodyStore::delete_many`.
@@ -59,7 +59,7 @@ Two on-disk stores side by side:
 - `JOB_DATA_SIZE_LIMIT_MAX`: 1GB (1073741824)
 - `MAX_TUBE_WEIGHT`: 9999 (for weighted reserve mode)
 - Default port: 11300
-- WAL version: 5 (reads v3, v4, v5; writes v5)
+- WAL version: 6 (reads v3–v6; writes v6)
 - TOAST version: 1
 - TOAST default segment size: 64 MiB
 - TOAST compaction threshold: live ratio < 0.5

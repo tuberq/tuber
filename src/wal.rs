@@ -530,7 +530,22 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
     let (replay_state, deadline_at) = match state {
         // Reserved jobs replay as Ready
         JobState::Reserved => (JobState::Ready, None),
-        JobState::Delayed => (JobState::Delayed, Some(now + delay)),
+        JobState::Delayed => {
+            // Replay with the *remaining* delay, not the full original delay,
+            // so a delayed job doesn't reset its countdown on every restart
+            // (a 1h-delay job restarted at t=59m would otherwise wait another
+            // full hour). created_at_epoch is when the delay started for an
+            // initial delayed put; subtract the elapsed wall-clock. Note:
+            // release/kick-to-delayed flows through StateChange, which carries
+            // no state-change timestamp, so that path still replays the full
+            // delay — see the StateChange replay arm.
+            let now_epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(created_at_epoch);
+            let elapsed = Duration::from_secs(now_epoch.saturating_sub(created_at_epoch));
+            (JobState::Delayed, Some(now + delay.saturating_sub(elapsed)))
+        }
         _ => (state, None),
     };
 
@@ -1326,6 +1341,16 @@ impl Wal {
                                             job.priority = new_priority;
                                             job.delay = Duration::from_nanos(new_delay_nanos);
                                             if replay_state == JobState::Delayed {
+                                                // Full-delay replay: StateChange
+                                                // records carry no timestamp for
+                                                // when the delay started (unlike a
+                                                // FullJob's created_at_epoch), so
+                                                // the remaining-delay computation
+                                                // used for delayed puts can't be
+                                                // applied here without a format
+                                                // bump. A released/kicked-to-delayed
+                                                // job may wait its full delay again
+                                                // after a restart.
                                                 job.deadline_at = Some(Instant::now() + job.delay);
                                             } else {
                                                 job.deadline_at = None;
@@ -1548,6 +1573,59 @@ mod tests {
         } else {
             panic!("expected FullJob");
         }
+    }
+
+    #[test]
+    fn test_delayed_job_replays_with_remaining_delay() {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Delay started an hour ago; total delay 60s ⇒ long expired. On replay
+        // the remaining delay must collapse to ~0 (deadline now/past), not reset
+        // to a fresh 60s each restart.
+        let mut expired = Job::new(
+            1,
+            0,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            Vec::new(),
+            "t".to_string(),
+        );
+        expired.body = BodyRef::new_inline(b"x".to_vec());
+        expired.created_at_epoch = now_epoch - 3600;
+        let record = serialize_full_job(&expired);
+        let (rec, _) = deserialize_record(&record, WAL_VERSION).unwrap();
+        let WalRecord::FullJob(j) = rec else {
+            panic!("expected FullJob");
+        };
+        assert_eq!(j.state, JobState::Delayed);
+        assert!(
+            j.deadline_at.unwrap() <= Instant::now(),
+            "expired-delay job must replay ready-soon, not reset to the full delay"
+        );
+
+        // A freshly-created delayed job keeps essentially all of its delay.
+        let mut fresh = Job::new(
+            2,
+            0,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            Vec::new(),
+            "t".to_string(),
+        );
+        fresh.body = BodyRef::new_inline(b"y".to_vec());
+        fresh.created_at_epoch = now_epoch;
+        let record = serialize_full_job(&fresh);
+        let (rec, _) = deserialize_record(&record, WAL_VERSION).unwrap();
+        let WalRecord::FullJob(j) = rec else {
+            panic!("expected FullJob");
+        };
+        assert!(
+            j.deadline_at.unwrap() > Instant::now() + Duration::from_secs(30),
+            "fresh delayed job must keep most of its delay"
+        );
     }
 
     #[test]

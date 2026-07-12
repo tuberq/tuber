@@ -224,6 +224,13 @@ struct ServerState {
     concurrency_keys: HashMap<String, u32>,
     /// Concurrency limit per key (max concurrent reservations allowed).
     concurrency_limits: HashMap<String, u32>,
+    /// Waiter replies that `process_queue` produced during the current engine
+    /// step but must not be sent yet. In strict durability mode a `RESERVED`
+    /// ack for a parked consumer has to wait for the same fsync as the write
+    /// that woke it, otherwise a crash could leave the consumer holding a job
+    /// that never made it to the WAL. The engine loop drains this after
+    /// `sync_wal`. Always empty in relaxed mode (process_queue sends directly).
+    deferred_replies: Vec<(oneshot::Sender<Response>, Response)>,
 }
 
 impl ServerState {
@@ -329,6 +336,7 @@ impl ServerState {
             groups: HashMap::new(),
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
+            deferred_replies: Vec::new(),
         }
     }
 
@@ -407,8 +415,13 @@ impl ServerState {
             Some(l) => l,
             None => return false,
         };
-        let wal = match self.wal.as_ref() {
-            Some(w) => w,
+        // Key the cap off the body store, not the WAL. A WAL fsync error
+        // disables the WAL (`self.wal = None`) but leaves TOAST attached, so
+        // keying off `wal` would silently drop the disk cap after any transient
+        // WAL error — bodies would then keep hitting disk uncapped. When the WAL
+        // is gone its byte count and reserve are simply zero.
+        let body_store = match self.body_store.as_ref() {
+            Some(bs) => bs,
             None => return false,
         };
         // Per-body TOAST overhead: record header + worst-case file-header
@@ -416,8 +429,7 @@ impl ServerState {
         // so this stays a generous over-estimate as the layout evolves.
         const BODY_OVERHEAD: u64 =
             (crate::body_store::BODY_HEADER_SIZE + crate::body_store::FILE_HEADER_SIZE) as u64 + 28;
-        let toast_bytes = self.body_store.as_ref().map_or(0, |bs| bs.total_bytes());
-        let wal_bytes = wal.total_disk_bytes();
+        let toast_bytes = body_store.total_bytes();
         // Reserve one WAL segment's worth of headroom for state-change
         // churn, matching the design doc ("WAL gets a small reserved
         // minimum, one segment's worth"). For the default 10 MiB segment
@@ -425,9 +437,16 @@ impl ServerState {
         // pathological configs (max_file_size in the kilobyte range)
         // without imposing the default segment size on operators who
         // deliberately picked a smaller one. ~1600 state-change records
-        // fit in 64 KiB, well above any realistic per-tick burst.
+        // fit in 64 KiB, well above any realistic per-tick burst. With the WAL
+        // disabled there is nothing to reserve for and no WAL bytes on disk.
         const MIN_WAL_RESERVE: u64 = 64 * 1024;
-        let wal_reserve = (wal.max_file_size() as u64).max(MIN_WAL_RESERVE);
+        let (wal_bytes, wal_reserve) = match self.wal.as_ref() {
+            Some(wal) => (
+                wal.total_disk_bytes(),
+                (wal.max_file_size() as u64).max(MIN_WAL_RESERVE),
+            ),
+            None => (0, 0),
+        };
         let projected = wal_bytes
             .saturating_add(toast_bytes)
             .saturating_add(body_len)
@@ -900,11 +919,14 @@ impl ServerState {
                     if state == JobState::Ready {
                         tube.ready.remove_by_id(existing_id);
                         tube.ready.insert((pri, existing_id), existing_id);
-                    }
-                    // Update urgent stats if crossing threshold
-                    if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
-                        self.stats.urgent_ct += 1;
-                        tube.stat.urgent_ct += 1;
+                        // Update urgent stats if crossing threshold. Only Ready
+                        // jobs are counted as urgent; bumping the counter for a
+                        // Reserved/Delayed/Buried job would drift it upward and
+                        // double-count once the job later becomes ready.
+                        if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
+                            self.stats.urgent_ct += 1;
+                            tube.stat.urgent_ct += 1;
+                        }
                     }
                 }
 
@@ -1012,11 +1034,13 @@ impl ServerState {
         job.after_group = after_group;
         job.concurrency_key = concurrency_key;
 
-        // Register concurrency limit
-        if let Some((ref key, limit)) = job.concurrency_key {
-            let entry = self.concurrency_limits.entry(key.clone()).or_insert(0);
-            *entry = (*entry).max(limit);
-        }
+        // Concurrency limit is registered lazily in `acquire_concurrency_key`
+        // (on reserve), not here. Registering eagerly at put time leaked the
+        // limit for keys whose jobs were deleted before ever being reserved:
+        // `release_concurrency_key` only prunes a limit when the *active*
+        // counter drains to 0, which never happens for a never-reserved key.
+        // That leak both grew the map without bound and, via the `.max(limit)`
+        // rule, let a stale high limit widen concurrency for later jobs.
 
         // Register idempotency key in tube index
         if let Some(ref key_tuple) = job.idempotency_key {
@@ -1239,13 +1263,81 @@ impl ServerState {
         self.do_reserve_inner(conn_id, id, body)
     }
 
+    /// Bury a Ready job whose TOAST body can't be read. Mirrors `cmd_bury`'s
+    /// teardown (ready-stats down, buried-stats up, group buried-count, WAL
+    /// state change) but is driven by the engine on a read fault rather than by
+    /// a client. Persisting the bury means the corrupt job replays as Buried,
+    /// not Ready, so it can't re-wedge the tube after a restart.
+    fn bury_unreadable_ready(&mut self, job_id: u64) {
+        let (tube_name, is_urgent, pri) = match self.jobs.get(&job_id) {
+            Some(j) => (j.tube_name.clone(), j.priority < URGENT_THRESHOLD, j.priority),
+            None => return,
+        };
+
+        // Remove from the ready heap + ready/urgent stats.
+        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            tube.ready.remove_by_id(job_id);
+            if is_urgent {
+                tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
+            }
+        }
+        self.ready_ct = self.ready_ct.saturating_sub(1);
+        if is_urgent {
+            self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
+        }
+
+        // Move to buried.
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.state = JobState::Buried;
+            job.reserver_id = None;
+            job.reserved_at = None;
+            job.deadline_at = None;
+            job.bury_ct += 1;
+        }
+        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            tube.buried.push_back(job_id);
+            tube.stat.buried_ct += 1;
+            tube.stat.total_bury_ct += 1;
+        }
+        self.stats.buried_ct += 1;
+
+        // A buried group member blocks its group's completion, same as cmd_bury.
+        if let Some(job) = self.jobs.get(&job_id)
+            && let Some(ref grp) = job.group
+            && let Some(gs) = self.groups.get_mut(grp)
+        {
+            gs.buried += 1;
+        }
+
+        self.wal_write_state_change(
+            job_id,
+            Some(JobState::Buried),
+            pri,
+            Duration::ZERO,
+            0,
+            StateChangeReason::Bury,
+        );
+
+        tracing::error!(
+            "TOAST: body for job {} unreadable; auto-burying to keep tube '{}' flowing",
+            job_id,
+            tube_name,
+        );
+    }
+
     fn do_reserve(&mut self, conn_id: u64, job_id: u64) -> Response {
-        // Materialise the body before dequeuing — if the body-store read
-        // fails the job must stay in the ready heap, not vanish.
+        // Materialise the body before dequeuing. A body-store read failure here
+        // (bit-rotted or unreadable TOAST body) would otherwise leave the job at
+        // the head of the ready heap and fail *every* subsequent reserve —
+        // wedging the whole tube. Auto-bury it instead: the tube keeps flowing,
+        // and the job is preserved for operator inspection (peek-buried / kick).
         let (tube_name, is_urgent, body) = match self.jobs.get(&job_id) {
             Some(j) => match self.fetch_body(j) {
                 Some(b) => (j.tube_name.clone(), j.priority < URGENT_THRESHOLD, b),
-                None => return Response::InternalError,
+                None => {
+                    self.bury_unreadable_ready(job_id);
+                    return Response::InternalError;
+                }
             },
             None => return Response::NotFound,
         };
@@ -1538,14 +1630,30 @@ impl ServerState {
         job_ids.extend(tube.delay.ids());
         job_ids.extend(tube.buried.iter());
 
-        // Find reserved jobs belonging to this tube
-        let reserved_ids: Vec<u64> = self
-            .jobs
-            .values()
-            .filter(|j| j.tube_name == tube_name && j.state == JobState::Reserved)
-            .map(|j| j.id)
-            .collect();
+        // Find reserved and held-after-group jobs belonging to this tube.
+        // Reserved jobs live in owning connections, and held after-jobs
+        // (Delayed with no deadline) live only in their group's waiting list —
+        // neither is reachable via the ready/delay/buried heaps above, so both
+        // must be swept explicitly. A missed held job survives the flush and is
+        // later promoted straight back into this "flushed" tube on group
+        // completion. Sweeping them here (plus reserved) also means every job
+        // state is now flushed, which is what makes the blanket
+        // `idempotency_keys.clear()` below correct — no live job is left behind
+        // to have its idempotency key wrongly discarded.
+        let mut reserved_ids: Vec<u64> = Vec::new();
+        let mut held_ids: Vec<u64> = Vec::new();
+        for j in self.jobs.values() {
+            if j.tube_name != tube_name {
+                continue;
+            }
+            match j.state {
+                JobState::Reserved => reserved_ids.push(j.id),
+                JobState::Delayed if j.deadline_at.is_none() => held_ids.push(j.id),
+                _ => {}
+            }
+        }
         job_ids.extend(&reserved_ids);
+        job_ids.extend(&held_ids);
 
         let count = job_ids.len() as u32;
         if count == 0 {
@@ -1858,6 +1966,7 @@ impl ServerState {
         }
 
         let tube_name = job.tube_name.clone();
+        let has_concurrency_key = job.concurrency_key.is_some();
         // See cmd_release: never let a missing tube strand the job.
         self.ensure_tube(&tube_name);
 
@@ -1904,6 +2013,12 @@ impl ServerState {
             0,
             StateChangeReason::Bury,
         );
+
+        // Freeing a concurrency slot can unblock a parked waiter; mirror
+        // cmd_delete/cmd_release so waiters wake now rather than on the next tick.
+        if has_concurrency_key && !self.waiters.is_empty() {
+            self.process_queue();
+        }
 
         Response::Buried
     }
@@ -2969,11 +3084,11 @@ impl ServerState {
                     } else {
                         Response::ReservedBatch(jobs)
                     };
-                    let _ = waiter.reply_tx.send(resp);
+                    self.reply_to_waiter(waiter.reply_tx, resp);
                 }
                 None => {
                     let resp = self.do_reserve(conn_id, job_id);
-                    let _ = waiter.reply_tx.send(resp);
+                    self.reply_to_waiter(waiter.reply_tx, resp);
                 }
             }
         }
@@ -3134,16 +3249,38 @@ impl ServerState {
             .is_some_and(|w| w.sync_interval().is_zero())
     }
 
+    /// Deliver a woken waiter's reply. In strict durability mode the ack is
+    /// parked in `deferred_replies` so the engine loop releases it only after
+    /// the fsync that persists the reserve — otherwise a crash could leave the
+    /// consumer holding a `RESERVED` job that never reached the WAL. In relaxed
+    /// mode the reply goes out immediately, as before.
+    fn reply_to_waiter(&mut self, reply_tx: oneshot::Sender<Response>, resp: Response) {
+        if self.wal_is_strict() {
+            self.deferred_replies.push((reply_tx, resp));
+        } else {
+            let _ = reply_tx.send(resp);
+        }
+    }
+
     /// fsync TOAST then WAL. Disables the WAL on error (logged) so the
     /// rest of the engine keeps serving in-memory state — same failure
     /// shape as the existing `wal_write_*` helpers.
-    fn sync_wal(&mut self) {
+    ///
+    /// Returns `false` iff the fsync failed. In strict mode the caller must not
+    /// ack the just-flushed writes as success on a `false` return: their
+    /// durability contract (ack ⇒ durable) was violated, so they get
+    /// `INTERNAL_ERROR` instead. A no-op sync on a clean or absent WAL returns
+    /// `true`.
+    #[must_use]
+    fn sync_wal(&mut self) -> bool {
         if let Some(wal) = self.wal.as_mut()
             && let Err(e) = wal.sync()
         {
             tracing::error!("WAL sync error: {}, disabling WAL", e);
             self.wal = None;
+            return false;
         }
+        true
     }
 
     /// True iff the WAL is dirty AND its sync-staleness SLA has elapsed.
@@ -3732,6 +3869,17 @@ fn drain_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
     }
 }
 
+/// Drain deferred acks after a *failed* strict-mode fsync: the writes they
+/// represent are not durable, so replacing each success ack with
+/// `INTERNAL_ERROR` keeps the ack ⇒ durable contract honest rather than lying
+/// to the client. The in-memory state stands; only the on-disk guarantee is
+/// gone (and the WAL is now disabled).
+fn fail_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
+    for (tx, _) in pending.drain(..) {
+        let _ = tx.send(Response::InternalError);
+    }
+}
+
 /// Run the engine task and accept loop with a fully-built [`ServerState`].
 async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32) -> io::Result<()> {
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
@@ -3858,13 +4006,25 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                                 process_message(&mut state, strict, next, &mut pending)
                                     == ProcessResult::Shutdown;
                         }
-                        // pending non-empty implies the WAL is dirty (we
-                        // only push Pending when it is). sync_wal() is also
-                        // a no-op on a clean WAL, so an extra check would
-                        // be redundant.
+                        // Move any waiter acks that process_queue deferred
+                        // during this batch (RESERVED for consumers woken by a
+                        // put/delete/release/bury) into `pending` so they are
+                        // released only after the fsync below — the woken
+                        // consumer must not hold a job whose reserve record
+                        // could still be lost to a crash.
+                        pending.append(&mut state.deferred_replies);
+                        // A non-empty `pending` implies a dirty WAL for the
+                        // command acks; the merged waiter acks may ride along
+                        // on an already-clean WAL, but sync_wal() is a no-op in
+                        // that case, so a single guarded fsync covers both.
                         if !pending.is_empty() {
-                            state.sync_wal();
-                            drain_pending(&mut pending);
+                            if state.sync_wal() {
+                                drain_pending(&mut pending);
+                            } else {
+                                // fsync failed: writes aren't durable, so in
+                                // strict mode we must not ack them as success.
+                                fail_pending(&mut pending);
+                            }
                         }
                     }
 
@@ -3881,8 +4041,21 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                     // SLA backstop. state.tick() can dirty the WAL via TTR
                     // expiry; pending is always empty here because the recv
                     // arm flushes its own before yielding.
-                    if state.wal_sync_due() {
-                        state.sync_wal();
+                    if !state.deferred_replies.is_empty() {
+                        // A tick-driven reserve (TTR expiry or delay promotion
+                        // woke a parked consumer) deferred its RESERVED ack in
+                        // strict mode; fsync before releasing it so the consumer
+                        // can't hold a job the WAL hasn't yet persisted. On fsync
+                        // failure send INTERNAL_ERROR rather than a RESERVED the
+                        // client can't durably rely on.
+                        let ok = state.sync_wal();
+                        for (tx, r) in state.deferred_replies.drain(..) {
+                            let _ = tx.send(if ok { r } else { Response::InternalError });
+                        }
+                    } else if state.wal_sync_due() {
+                        // Backstop fsync only; acks were already sent
+                        // (Immediate) in relaxed mode, so the return is moot.
+                        let _ = state.sync_wal();
                     }
                 }
                 _ = sigusr1.recv() => {
@@ -3972,7 +4145,11 @@ async fn handle_connection(
 
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line_buf = String::new();
+    // Read raw bytes, not a String: beanstalkd's protocol is byte-oriented, so
+    // a non-UTF-8 command line must be answered with UNKNOWN_COMMAND rather than
+    // dropping the connection (which a String read would do, since read_line
+    // errors on invalid UTF-8).
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut resp_buf = Vec::with_capacity(256);
 
     loop {
@@ -3981,12 +4158,12 @@ async fn handle_connection(
         // clients that send data without a newline. Matches beanstalkd behavior.
         let _n = match (&mut reader)
             .take(MAX_LINE_LEN)
-            .read_line(&mut line_buf)
+            .read_until(b'\n', &mut line_buf)
             .await
         {
             Ok(0) => break, // EOF
             Ok(n) => {
-                if !line_buf.ends_with('\n') {
+                if !line_buf.ends_with(b"\n") {
                     // Line exceeded MAX_LINE_LEN without a newline — bad client
                     let _ = writer.write_all(b"BAD_FORMAT\r\n").await;
                     break;
@@ -3999,8 +4176,23 @@ async fn handle_connection(
             }
         };
 
-        // Strip trailing \r\n
-        let cmd_str = line_buf.trim_end_matches('\n').trim_end_matches('\r');
+        // Strip trailing \r\n (byte-wise), then require valid UTF-8. A non-UTF-8
+        // command line is answered with UNKNOWN_COMMAND — byte-oriented
+        // beanstalkd responds rather than silently dropping the connection.
+        let mut line = &line_buf[..];
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        let cmd_str = match std::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = writer.write_all(b"UNKNOWN_COMMAND\r\n").await;
+                continue;
+            }
+        };
 
         // Parse command
         let cmd = match protocol::parse_command(cmd_str) {

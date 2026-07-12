@@ -2044,8 +2044,9 @@ fn test_reserve_batch_surfaces_body_store_error() {
 #[test]
 fn test_reserve_batch_partial_wins_over_body_store_error() {
     // A healthy job precedes the poison one (same pri ⇒ ordered by id). The
-    // batch returns the good job; the unreadable job stays ready (its body is
-    // materialised before dequeue) and the error is suppressed for this call.
+    // batch returns the good job; the unreadable job is auto-buried so it can't
+    // wedge the ready heap, and the error is suppressed for this partial-success
+    // call.
     let mut s = make_state();
     let c = register(&mut s);
 
@@ -2074,6 +2075,6 @@ fn test_reserve_batch_partial_wins_over_body_store_error() {
         }
         other => panic!("expected RESERVED_BATCH with one job, got {other:?}"),
     }
-    // The poison job is untouched and still ready.
-    assert_eq!(s.jobs.get(&2).unwrap().state, JobState::Ready);
+    // The unreadable job is auto-buried (not left ready to re-wedge the tube).
+    assert_eq!(s.jobs.get(&2).unwrap().state, JobState::Buried);
 }

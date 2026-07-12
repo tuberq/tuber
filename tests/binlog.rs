@@ -1702,12 +1702,12 @@ async fn test_group_commit_durability_clean_shutdown() {
     }
 }
 
-/// A TOAST read failure during reserve must surface INTERNAL_ERROR and
-/// leave the job in the ready queue. Regression test: the job was pulled
-/// out of the ready heap before the body fetch, so a failed read silently
-/// stranded it — invisible to every subsequent reserve.
+/// A TOAST read failure during a normal reserve must surface INTERNAL_ERROR and
+/// auto-bury the job, so a bit-rotted body can't sit at the head of the ready
+/// heap and wedge every subsequent reserve. The job is preserved (buried) for
+/// operator inspection rather than stranded invisibly or silently deleted.
 #[tokio::test]
-async fn test_reserve_toast_read_failure_keeps_job_ready() {
+async fn test_reserve_toast_read_failure_auto_buries_job() {
     let dir = tempfile::tempdir().unwrap();
     let srv = TestServer::start_with_wal(dir.path()).await;
     let mut c = srv.connect().await;
@@ -1727,28 +1727,34 @@ async fn test_reserve_toast_read_failure_keeps_job_ready() {
         f.set_len(16).unwrap();
     }
 
-    // The reserve fails, but must not consume the job
+    // The reserve fails and the unreadable job is moved out of the ready heap.
     c.mustsend("reserve-with-timeout 0\r\n").await;
     c.ckresp("INTERNAL_ERROR\r\n").await;
 
     c.mustsend("stats-tube default\r\n").await;
     let stats = c.read_ok_body().await;
     assert!(
-        stats.contains("current-jobs-ready: 1"),
-        "job must remain in the ready queue after a failed body read, got: {}",
+        stats.contains("current-jobs-ready: 0"),
+        "unreadable job must leave the ready queue (auto-buried), got: {}",
+        stats
+    );
+    assert!(
+        stats.contains("current-jobs-buried: 1"),
+        "unreadable job must be buried, got: {}",
         stats
     );
 
-    // Still there: a second reserve hits the same error rather than
-    // TIMED_OUT (which would mean the job vanished from the heap)
+    // The tube is no longer wedged: a second reserve sees an empty ready heap
+    // and times out instead of hitting the same error forever.
     c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("INTERNAL_ERROR\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
 
-    // reserve-job by id behaves the same way
+    // reserve-job by id still targets the (now buried) job and surfaces the
+    // read fault, since its body is still unreadable.
     c.mustsend("reserve-job 1\r\n").await;
     c.ckresp("INTERNAL_ERROR\r\n").await;
 
-    // The job is still deletable — it never left the job table
+    // The buried job is still deletable — it never left the job table.
     c.mustsend("delete 1\r\n").await;
     c.ckresp("DELETED\r\n").await;
 }
