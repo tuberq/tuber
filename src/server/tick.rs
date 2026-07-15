@@ -309,13 +309,7 @@ impl ServerState {
         // which at millions of jobs is hundreds of MB of avoidable peak
         // RSS during startup (when the process is most OOM-prone). The
         // index pass below only needs ids plus small cloned fields.
-        let ids: Vec<u64> = jobs.keys().copied().collect();
-        for job in jobs.values() {
-            self.total_job_bytes = self
-                .total_job_bytes
-                .saturating_add(Self::job_memory_cost(job));
-        }
-        self.jobs = jobs;
+        let ids = self.adopt_jobs(jobs);
 
         // Collect after_group job IDs for a second pass
         let mut after_group_jobs: Vec<u64> = Vec::new();
@@ -344,6 +338,7 @@ impl ServerState {
             let idempotency_key = job.idempotency_key().cloned();
             let group = job.group().cloned();
             let after_group = job.after_group().cloned();
+            let concurrency_key = job.concurrency_key().cloned();
 
             self.ensure_tube(&tube_name);
 
@@ -392,11 +387,9 @@ impl ServerState {
             }
 
             // Register concurrency limit
-            if let Some(job) = self.jobs.get(&id) {
-                if let Some((key, limit)) = job.concurrency_key() {
-                    let entry = self.concurrency_limits.entry(key.clone()).or_insert(0);
-                    *entry = (*entry).max(*limit);
-                }
+            if let Some((key, limit)) = concurrency_key {
+                let entry = self.concurrency_limits.entry(key).or_insert(0);
+                *entry = (*entry).max(limit);
             }
 
             // Register idempotency key in tube index

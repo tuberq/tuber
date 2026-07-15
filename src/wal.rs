@@ -1320,9 +1320,13 @@ impl Wal {
         // surviving job set holds one allocation per tube, not per job.
         let mut tube_names: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
         let mut last_log = Instant::now();
-        // Segments quarantined this replay (moved to `.corrupt`); dropped from
-        // `self.files` after the loop so GC can't chase the renamed path.
-        let mut quarantined_seqs: Vec<u64> = Vec::new();
+        // Segments no longer on disk under their original name after this
+        // replay — quarantined to `.corrupt` (unreadable/bad header) or
+        // deleted outright (headerless newest segment). Dropped from
+        // `self.files` after the loop so GC can't chase a missing path.
+        // Not a corruption signal: benign empty-segment removals land here
+        // too, so don't key alerts or metrics off this list.
+        let mut removed_seqs: Vec<u64> = Vec::new();
         // Only the newest segment can be a benign headerless artifact (a
         // crash between segment creation and the header fsync). Any older
         // sub-header segment was once a full segment with fsynced records
@@ -1348,7 +1352,7 @@ impl Wal {
                             re
                         ),
                     }
-                    quarantined_seqs.push(*seq);
+                    removed_seqs.push(*seq);
                     continue;
                 }
             };
@@ -1382,7 +1386,7 @@ impl Wal {
                                 re
                             ),
                         }
-                        quarantined_seqs.push(*seq);
+                        removed_seqs.push(*seq);
                         continue;
                     }
                     match quarantine_corrupt_segment(path) {
@@ -1399,7 +1403,7 @@ impl Wal {
                             re
                         ),
                     }
-                    quarantined_seqs.push(*seq);
+                    removed_seqs.push(*seq);
                     continue;
                 }
             };
@@ -1592,16 +1596,16 @@ impl Wal {
             }
         }
 
-        // Drop quarantined segments from tracking so GC never tries to unlink
+        // Drop quarantined/deleted segments from tracking so GC never tries to unlink
         // the (now renamed) path, and the byte accounting stays accurate.
-        if !quarantined_seqs.is_empty() {
+        if !removed_seqs.is_empty() {
             let removed_bytes: u64 = self
                 .files
                 .iter()
-                .filter(|f| quarantined_seqs.contains(&f.seq))
+                .filter(|f| removed_seqs.contains(&f.seq))
                 .map(|f| f.bytes_written as u64)
                 .sum();
-            self.files.retain(|f| !quarantined_seqs.contains(&f.seq));
+            self.files.retain(|f| !removed_seqs.contains(&f.seq));
             self.total_disk_bytes = self.total_disk_bytes.saturating_sub(removed_bytes);
         }
 

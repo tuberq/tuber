@@ -473,6 +473,29 @@ impl ServerState {
         Some(job)
     }
 
+    /// Adopt a whole replayed job table at once (WAL replay). The wholesale
+    /// assignment avoids re-inserting millions of jobs into a second table
+    /// at startup; routing it through this helper keeps the
+    /// `total_job_bytes` bookkeeping next to `insert_job`/`take_job` so a
+    /// future change to `job_memory_cost` can't miss the restore path.
+    /// Sums the cost in the same single pass that collects the ids the
+    /// caller needs for index rebuilding; returns those ids (map order).
+    fn adopt_jobs(&mut self, jobs: HashMap<u64, Job>) -> Vec<u64> {
+        debug_assert!(
+            self.jobs.is_empty(),
+            "adopt_jobs replaces the whole table; adopting over live jobs would corrupt accounting"
+        );
+        let mut ids = Vec::with_capacity(jobs.len());
+        for (id, job) in &jobs {
+            ids.push(*id);
+            self.total_job_bytes = self
+                .total_job_bytes
+                .saturating_add(Self::job_memory_cost(job));
+        }
+        self.jobs = jobs;
+        ids
+    }
+
     /// Permanently remove a job and reclaim its external body if any.
     /// The single correct entry point for delete/flush/expiry paths.
     fn delete_job(&mut self, id: u64) -> Option<Job> {
@@ -3514,45 +3537,37 @@ fn build_state(
         // `into_iter().collect()` here keeps two full job tables alive
         // at once, which at millions of replayed jobs is hundreds of MB
         // of avoidable peak RSS at the exact moment the process is most
-        // OOM-prone (startup, before it can serve anything).
-        let mut reap_ids: Vec<u64> = Vec::new();
-        for (id, job) in jobs.iter() {
-            if let BodyRef::External(body_id) = &job.body
-                && !body_store.contains_body(*body_id)
-            {
-                tracing::error!(
-                    job_id = id,
-                    tube = %job.tube_name,
-                    body_id = body_id.0,
-                    state = job.state.as_str(),
-                    "WAL references body missing from TOAST: reaping job (lost data)",
-                );
-                reap_ids.push(*id);
-            }
-        }
-        let recovered_missing_bodies = reap_ids.len() as u64;
-        for id in reap_ids {
-            let Some(mut job) = jobs.remove(&id) else {
-                continue;
+        // OOM-prone (startup, before it can serve anything). A single
+        // `retain` pass also avoids re-hashing every reaped id.
+        let mut recovered_missing_bodies = 0u64;
+        jobs.retain(|id, job| {
+            let missing_body_id = match &job.body {
+                BodyRef::External(body_id) if !body_store.contains_body(*body_id) => *body_id,
+                _ => return true,
             };
+            tracing::error!(
+                job_id = id,
+                tube = %job.tube_name,
+                body_id = missing_body_id.0,
+                state = job.state.as_str(),
+                "WAL references body missing from TOAST: reaping job (lost data)",
+            );
+            recovered_missing_bodies += 1;
             // Best-effort: journal the delete so the warning doesn't
             // re-fire on every restart. WAL errors here aren't fatal —
             // in-memory state is already correct (the job is gone), and
             // the next restart will just re-reap.
-            if let Err(e) = wal.write_state_change(
-                &mut job,
-                None,
-                0,
-                Duration::ZERO,
-                0,
-                StateChangeReason::None,
-            ) {
+            if let Err(e) =
+                wal.write_state_change(job, None, 0, Duration::ZERO, 0, StateChangeReason::None)
+            {
                 tracing::error!(
                     job_id = job.id,
-                    "WAL delete journal failed for reaped job: {}", e,
+                    "WAL delete journal failed for reaped job: {}",
+                    e,
                 );
             }
-        }
+            false
+        });
         state.stats.recovered_missing_bodies = recovered_missing_bodies;
 
         // Reclaim TOAST bodies left orphan by a put that wrote the body
