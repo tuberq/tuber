@@ -484,7 +484,7 @@ impl ServerState {
     /// future change to `job_memory_cost` can't miss the restore path.
     /// Sums the cost in the same single pass that collects the ids the
     /// caller needs for index rebuilding; returns those ids (map order).
-    fn adopt_jobs(&mut self, jobs: HashMap<u64, Job>) -> Vec<u64> {
+    fn adopt_jobs(&mut self, jobs: HashMap<u64, Box<Job>>) -> Vec<u64> {
         debug_assert!(
             self.jobs.is_empty(),
             "adopt_jobs replaces the whole table; adopting over live jobs would corrupt accounting"
