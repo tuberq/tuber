@@ -3504,29 +3504,31 @@ fn build_state(
         // WAL survives reaps every job. There's nothing to serve their
         // bodies from. Operators who want a clean restart should move
         // the WAL aside too.
-        let mut reaped: Vec<Job> = Vec::new();
-        let kept: HashMap<u64, Job> = jobs
-            .into_iter()
-            .filter_map(|(id, job)| {
-                if let BodyRef::External(body_id) = &job.body
-                    && !body_store.contains_body(*body_id)
-                {
-                    tracing::error!(
-                        job_id = id,
-                        tube = %job.tube_name,
-                        body_id = body_id.0,
-                        state = job.state.as_str(),
-                        "WAL references body missing from TOAST: reaping job (lost data)",
-                    );
-                    reaped.push(job);
-                    None
-                } else {
-                    Some((id, job))
-                }
-            })
-            .collect();
-        let recovered_missing_bodies = reaped.len() as u64;
-        for mut job in reaped {
+        // Reap in place rather than rebuilding the map — an
+        // `into_iter().collect()` here keeps two full job tables alive
+        // at once, which at millions of replayed jobs is hundreds of MB
+        // of avoidable peak RSS at the exact moment the process is most
+        // OOM-prone (startup, before it can serve anything).
+        let mut reap_ids: Vec<u64> = Vec::new();
+        for (id, job) in jobs.iter() {
+            if let BodyRef::External(body_id) = &job.body
+                && !body_store.contains_body(*body_id)
+            {
+                tracing::error!(
+                    job_id = id,
+                    tube = %job.tube_name,
+                    body_id = body_id.0,
+                    state = job.state.as_str(),
+                    "WAL references body missing from TOAST: reaping job (lost data)",
+                );
+                reap_ids.push(*id);
+            }
+        }
+        let recovered_missing_bodies = reap_ids.len() as u64;
+        for id in reap_ids {
+            let Some(mut job) = jobs.remove(&id) else {
+                continue;
+            };
             // Best-effort: journal the delete so the warning doesn't
             // re-fire on every restart. WAL errors here aren't fatal —
             // in-memory state is already correct (the job is gone), and
@@ -3552,7 +3554,7 @@ fn build_state(
         // in docs/wal-format.md for the full failure analysis. The
         // complementary direction (WAL FullJob with missing TOAST) is
         // handled by the recovered-missing-bodies pass above.
-        let live_body_ids = crate::job::live_external_body_ids(kept.values());
+        let live_body_ids = crate::job::live_external_body_ids(jobs.values());
         let stranded_count = body_store.reclaim_stranded(&live_body_ids);
         if stranded_count > 0 {
             tracing::warn!(
@@ -3563,7 +3565,7 @@ fn build_state(
             state.stats.reclaimed_stranded_bodies = stranded_count;
         }
 
-        state.restore_jobs(kept, next_id, tombstones);
+        state.restore_jobs(jobs, next_id, tombstones);
 
         // Enforce the in-memory budget after replay. The WAL on-disk size
         // is not a reliable proxy (tombstones, superseded records, and format

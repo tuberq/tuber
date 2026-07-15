@@ -1051,6 +1051,12 @@ impl Wal {
 
         let mut fd = BufWriter::with_capacity(BUF_CAPACITY, file);
         write_header(&mut fd)?;
+        // Make the header durable immediately. Without this, a crash any
+        // time before the first sync leaves a 0-byte or partial file that
+        // the next replay flags as corrupt ("bad header ... quarantined")
+        // even though it never held a record — a crash-looping server
+        // then mints one spurious .corrupt sidecar per restart.
+        Self::flush_and_fsync(&mut fd)?;
 
         self.files.push_back(WalFile {
             seq,
@@ -1329,6 +1335,29 @@ impl Wal {
             let version = match read_header(&data) {
                 Ok((v, _flags)) => v,
                 Err(e) => {
+                    // A file shorter than the segment header cannot hold
+                    // any record — it's the artifact of a crash between
+                    // segment creation and the header fsync, not data
+                    // corruption. Remove it quietly instead of minting a
+                    // .corrupt sidecar and an ERROR on every restart of a
+                    // crash-looping server.
+                    if data.len() < HEADER_SIZE {
+                        match fs::remove_file(path) {
+                            Ok(()) => tracing::info!(
+                                "WAL: removed empty segment {:?} ({} bytes, no header — \
+                                 created just before a crash, holds no records)",
+                                path,
+                                data.len(),
+                            ),
+                            Err(re) => tracing::warn!(
+                                "WAL: failed to remove empty segment {:?}: {}",
+                                path,
+                                re
+                            ),
+                        }
+                        quarantined_seqs.push(*seq);
+                        continue;
+                    }
                     match quarantine_corrupt_segment(path) {
                         Ok(dest) => tracing::error!(
                             "WAL: bad header in {:?} ({}); quarantined to {:?}",

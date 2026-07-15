@@ -300,13 +300,32 @@ impl ServerState {
     ) {
         self.next_job_id = next_job_id;
 
+        // Adopt the replayed map wholesale instead of re-inserting job by
+        // job — the per-job path keeps two full job tables alive at once,
+        // which at millions of jobs is hundreds of MB of avoidable peak
+        // RSS during startup (when the process is most OOM-prone). The
+        // index pass below only needs ids plus small cloned fields.
+        let ids: Vec<u64> = jobs.keys().copied().collect();
+        for job in jobs.values() {
+            self.total_job_bytes = self
+                .total_job_bytes
+                .saturating_add(Self::job_memory_cost(job));
+        }
+        self.jobs = jobs;
+
         // Collect after_group job IDs for a second pass
         let mut after_group_jobs: Vec<u64> = Vec::new();
 
-        for (id, job) in jobs {
+        for id in ids {
+            let Some(job) = self.jobs.get(&id) else {
+                continue;
+            };
             let tube_name = job.tube_name.clone();
             let state = job.state;
             let pri = job.priority;
+            let ready_key = job.ready_key();
+            let deadline_at = job.deadline_at;
+            let delay = job.delay;
             let idempotency_key = job.idempotency_key.clone();
             let group = job.group.clone();
             let after_group = job.after_group.clone();
@@ -315,10 +334,8 @@ impl ServerState {
 
             match state {
                 JobState::Ready => {
-                    let key = job.ready_key();
-                    self.insert_job(id, job);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
-                        tube.ready.insert(key, id);
+                        tube.ready.insert(ready_key, id);
                     }
                     self.ready_ct += 1;
                     if pri < URGENT_THRESHOLD {
@@ -333,10 +350,7 @@ impl ServerState {
                     }
                 }
                 JobState::Delayed => {
-                    let deadline = job
-                        .deadline_at
-                        .unwrap_or_else(|| Instant::now() + job.delay);
-                    self.insert_job(id, job);
+                    let deadline = deadline_at.unwrap_or_else(|| Instant::now() + delay);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.delay.insert((deadline, id), id);
                     }
@@ -346,7 +360,6 @@ impl ServerState {
                     }
                 }
                 JobState::Buried => {
-                    self.insert_job(id, job);
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
                         tube.buried.push_back(id);
                         tube.stat.buried_ct += 1;
