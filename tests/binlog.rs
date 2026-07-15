@@ -352,6 +352,56 @@ async fn test_binlog_bury() {
     c2.ckresp("hello\r\n").await;
 }
 
+/// Buried jobs keep their FIFO (oldest-bury-first) order across a
+/// restart: peek-buried/kick must walk the pre-restart bury order, not
+/// the hash order the replayed job table happens to iterate in.
+#[tokio::test]
+async fn test_binlog_buried_order_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // Six jobs, all reserved by this connection.
+    for _ in 0..6 {
+        c.mustsend("put 10 0 60 5\r\n").await;
+        c.mustsend("hello\r\n").await;
+    }
+    for id in 1..=6 {
+        c.ckresp(&format!("INSERTED {id}\r\n")).await;
+    }
+    for id in 1..=6 {
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp(&format!("RESERVED {id} 5\r\n")).await;
+        c.ckresp("hello\r\n").await;
+    }
+
+    // Bury in an order distinct from id order.
+    let bury_order = [5u64, 2, 6, 1, 4, 3];
+    for id in bury_order {
+        c.mustsend(&format!("bury {id} 10\r\n")).await;
+        c.ckresp("BURIED\r\n").await;
+    }
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    // Walk the buried FIFO: the front must always be the oldest bury.
+    for id in bury_order {
+        c2.mustsend("peek-buried\r\n").await;
+        c2.ckresp(&format!("FOUND {id} 5\r\n")).await;
+        c2.ckresp("hello\r\n").await;
+        c2.mustsend("kick 1\r\n").await;
+        c2.ckresp("KICKED 1\r\n").await;
+    }
+    c2.mustsend("peek-buried\r\n").await;
+    c2.ckresp("NOT_FOUND\r\n").await;
+}
+
 /// flush-buried deletes buried jobs durably: bury two jobs, flush-buried,
 /// restart, and confirm nothing comes back (and external bodies are reclaimed).
 #[tokio::test]

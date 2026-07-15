@@ -182,6 +182,16 @@ pub struct IdpTombstone {
     pub expires_at: SystemTime,
 }
 
+/// What [`Wal::replay`] returns: `(jobs, next_job_id, idempotency
+/// tombstones, orphaned body ids, buried order)`.
+pub type ReplayOutcome = (
+    HashMap<u64, Job>,
+    u64,
+    Vec<IdpTombstone>,
+    Vec<BodyId>,
+    Vec<u64>,
+);
+
 #[derive(Debug)]
 pub enum WalRecord {
     FullJob(Box<Job>),
@@ -1275,12 +1285,21 @@ impl Wal {
 
     // --- Replay ---
 
-    pub fn replay(
-        &mut self,
-    ) -> io::Result<(HashMap<u64, Job>, u64, Vec<IdpTombstone>, Vec<BodyId>)> {
+    /// Rebuild job state from the WAL. Returns `(jobs, next_job_id,
+    /// idempotency tombstones, orphaned body ids, buried order)`. The
+    /// buried order lists every job that ends replay in `Buried` state, in
+    /// the WAL order of its last bury event — callers use it to rebuild
+    /// each tube's buried FIFO oldest-first, which a bare iteration over
+    /// the returned map cannot (hash order loses bury order).
+    pub fn replay(&mut self) -> io::Result<ReplayOutcome> {
         let mut jobs: HashMap<u64, Job> = HashMap::new();
         let mut max_id: u64 = 0;
         let mut tombstones: Vec<IdpTombstone> = Vec::new();
+        // Every record that leaves a job buried, in WAL order. Stale
+        // entries (job later kicked, deleted, or re-buried) are filtered
+        // after the loop; keeping raw events avoids per-transition
+        // bookkeeping in the hot replay path.
+        let mut bury_events: Vec<u64> = Vec::new();
         // Bodies referenced by jobs that the WAL says are deleted. The
         // runtime delete path calls `BodyStore::delete` after the WAL
         // delete record lands, but a crash between the two leaves the
@@ -1307,6 +1326,11 @@ impl Wal {
         // Segments quarantined this replay (moved to `.corrupt`); dropped from
         // `self.files` after the loop so GC can't chase the renamed path.
         let mut quarantined_seqs: Vec<u64> = Vec::new();
+        // Only the newest segment can be a benign headerless artifact (a
+        // crash between segment creation and the header fsync). Any older
+        // sub-header segment was once a full segment with fsynced records
+        // and must be treated as corruption, not cleaned up.
+        let newest_seq: u64 = file_infos.iter().map(|(s, _)| *s).max().unwrap_or(0);
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
         for (idx, (seq, path)) in file_infos.iter().enumerate() {
@@ -1335,13 +1359,19 @@ impl Wal {
             let version = match read_header(&data) {
                 Ok((v, _flags)) => v,
                 Err(e) => {
-                    // A file shorter than the segment header cannot hold
-                    // any record — it's the artifact of a crash between
-                    // segment creation and the header fsync, not data
-                    // corruption. Remove it quietly instead of minting a
-                    // .corrupt sidecar and an ERROR on every restart of a
-                    // crash-looping server.
-                    if data.len() < HEADER_SIZE {
+                    // A *newest* file shorter than the segment header is
+                    // the artifact of a crash between segment creation and
+                    // the header fsync — it never held a record. Remove it
+                    // quietly instead of minting a .corrupt sidecar and an
+                    // ERROR on every restart of a crash-looping server.
+                    // An older sub-header segment is different: it was
+                    // written and fsynced past its header once (later
+                    // segments exist), so a short read means it was
+                    // truncated by a filesystem fault. That is data loss —
+                    // records it held (including deletes) are gone — so it
+                    // takes the quarantine path below, preserving the
+                    // evidence and logging at ERROR.
+                    if data.len() < HEADER_SIZE && *seq == newest_seq {
                         match fs::remove_file(path) {
                             Ok(()) => tracing::info!(
                                 "WAL: removed empty segment {:?} ({} bytes, no header — \
@@ -1399,6 +1429,9 @@ impl Wal {
                                 }
 
                                 self.incref_file(*seq, record_size);
+                                if job.state == JobState::Buried {
+                                    bury_events.push(job.id);
+                                }
                                 jobs.insert(job.id, *job);
                             }
                             WalRecord::StateChange {
@@ -1450,6 +1483,9 @@ impl Wal {
                                                 other => other,
                                             };
                                             job.state = replay_state;
+                                            if replay_state == JobState::Buried {
+                                                bury_events.push(job_id);
+                                            }
                                             job.priority = new_priority;
                                             job.delay = Duration::from_nanos(new_delay_nanos);
                                             if replay_state == JobState::Delayed {
@@ -1578,7 +1614,20 @@ impl Wal {
         let live_body_ids = crate::job::live_external_body_ids(jobs.values());
         orphan_bodies.retain(|id| !live_body_ids.contains(id));
 
-        Ok((jobs, max_id + 1, tombstones, orphan_bodies))
+        // Reduce raw bury events to the final order: keep only the last
+        // event of each job that is still buried, preserving WAL
+        // (chronological) order across the survivors.
+        let mut seen_buried: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut buried_order: Vec<u64> = Vec::new();
+        for &id in bury_events.iter().rev() {
+            if jobs.get(&id).is_some_and(|j| j.state == JobState::Buried) && seen_buried.insert(id)
+            {
+                buried_order.push(id);
+            }
+        }
+        buried_order.reverse();
+
+        Ok((jobs, max_id + 1, tombstones, orphan_bodies, buried_order))
     }
 
     // --- GC and compaction ---
@@ -2123,7 +2172,7 @@ mod tests {
 
         // Replay should recover both valid jobs, skip the garbage
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, next_id, _, _) = wal.replay().unwrap();
+        let (jobs, next_id, _, _, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 2);
         assert!(jobs.contains_key(&1));
         assert!(jobs.contains_key(&2));
@@ -2166,7 +2215,7 @@ mod tests {
 
         // Replay must quarantine the segment (preserve it), not skip-then-GC it.
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, _, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
         assert!(jobs.is_empty(), "corrupt segment's jobs are not loaded");
         assert!(!seg.exists(), "corrupt segment must be renamed away");
         assert!(
@@ -2176,6 +2225,149 @@ mod tests {
 
         // GC must not choke on the (now untracked) quarantined file.
         wal.gc();
+    }
+
+    #[test]
+    fn test_replay_removes_headerless_newest_segment_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // One durable job in segment 1.
+        {
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+            let mut job = Job::new(
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body".to_vec(),
+                "default".to_string(),
+            );
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+        }
+
+        // Simulate a crash between segment creation and the header fsync:
+        // the newest segment exists but is shorter than the header.
+        let stub = dir_path.join(format!("{}{:06}", FILE_PREFIX, 2));
+        fs::write(&stub, b"TB").unwrap();
+
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
+        assert_eq!(jobs.len(), 1, "jobs from older segments are unaffected");
+        assert!(!stub.exists(), "headerless newest segment is removed");
+        assert!(
+            !corrupt_sidecar_path(&stub).exists(),
+            "a benign creation-crash artifact must not mint a .corrupt sidecar"
+        );
+    }
+
+    #[test]
+    fn test_replay_quarantines_truncated_older_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // One durable job in segment 1.
+        {
+            let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+            let mut job = Job::new(
+                1,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body".to_vec(),
+                "default".to_string(),
+            );
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+        }
+
+        let seg1 = dir_path.join(format!("{}{:06}", FILE_PREFIX, 1));
+        assert!(seg1.exists());
+
+        // A newer segment exists, so segment 1 was once fsynced past its
+        // header. Truncate it below HEADER_SIZE to simulate a filesystem
+        // fault eating its records.
+        let seg2 = dir_path.join(format!("{}{:06}", FILE_PREFIX, 2));
+        let mut seg2_header = Vec::new();
+        write_header(&mut seg2_header).unwrap();
+        fs::write(&seg2, seg2_header).unwrap();
+        {
+            let f = OpenOptions::new().write(true).open(&seg1).unwrap();
+            f.set_len(3).unwrap();
+        }
+
+        // The truncated middle segment is data loss: it must be preserved
+        // as .corrupt evidence, never silently deleted.
+        let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
+        assert!(jobs.is_empty());
+        assert!(!seg1.exists(), "truncated segment must be renamed away");
+        assert!(
+            corrupt_sidecar_path(&seg1).exists(),
+            "truncated older segment must be quarantined, not deleted"
+        );
+    }
+
+    #[test]
+    fn test_replay_returns_bury_order_not_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+
+        // Five ready jobs.
+        let mut jobs_by_id: HashMap<u64, Job> = HashMap::new();
+        for id in 1u64..=5 {
+            let mut job = Job::new(
+                id,
+                10,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"body".to_vec(),
+                "default".to_string(),
+            );
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+            jobs_by_id.insert(id, job);
+        }
+
+        let bury = |wal: &mut Wal, jobs_by_id: &mut HashMap<u64, Job>, id: u64| {
+            wal.write_state_change(
+                jobs_by_id.get_mut(&id).unwrap(),
+                Some(JobState::Buried),
+                10,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Bury,
+            )
+            .unwrap();
+        };
+
+        // Bury in an order distinct from id order: 4, 2, 5, 1. Then kick
+        // job 2 back to ready and re-bury it — its final position must be
+        // its *last* bury, not its first. Job 3 stays ready.
+        for id in [4u64, 2, 5, 1] {
+            bury(&mut wal, &mut jobs_by_id, id);
+        }
+        wal.write_state_change(
+            jobs_by_id.get_mut(&2).unwrap(),
+            Some(JobState::Ready),
+            10,
+            Duration::ZERO,
+            0,
+            StateChangeReason::Kick,
+        )
+        .unwrap();
+        bury(&mut wal, &mut jobs_by_id, 2);
+        drop(wal);
+
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+        let (jobs, _, _, _, buried_order) = wal.replay().unwrap();
+        assert_eq!(jobs.len(), 5);
+        assert_eq!(
+            buried_order,
+            vec![4, 5, 1, 2],
+            "buried order must follow the last bury event of each job, in WAL order"
+        );
     }
 
     #[test]
@@ -2240,7 +2432,7 @@ mod tests {
         }
 
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, _, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
 
         let j1 = jobs.get(&1).unwrap();
         assert_eq!(j1.state, JobState::Delayed);
@@ -2291,7 +2483,7 @@ mod tests {
 
         // Replay should skip the bad file, recover nothing
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, _, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
         assert!(jobs.is_empty());
     }
 
@@ -2340,7 +2532,7 @@ mod tests {
 
         // Should recover job 1 only
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, next_id, _, _) = wal.replay().unwrap();
+        let (jobs, next_id, _, _, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs.contains_key(&1));
         assert!(next_id >= 2);
@@ -2483,7 +2675,7 @@ mod tests {
         // Replay
         {
             let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-            let (jobs, next_id, _, _) = wal.replay().unwrap();
+            let (jobs, next_id, _, _, _) = wal.replay().unwrap();
 
             // Job 1 was deleted
             assert!(!jobs.contains_key(&1));
@@ -2841,7 +3033,7 @@ mod tests {
         // Reopen and replay — job must survive
         {
             let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(64)).unwrap();
-            let (jobs, _next_id, _tombstones, _orphans) = wal.replay().unwrap();
+            let (jobs, _next_id, _tombstones, _orphans, _) = wal.replay().unwrap();
 
             assert!(jobs.contains_key(&1), "job 1 must survive replay after GC");
             let job = jobs.get(&1).unwrap();
@@ -3037,7 +3229,7 @@ mod tests {
         // Replay and verify all counters
         {
             let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-            let (jobs, _, _, _) = wal.replay().unwrap();
+            let (jobs, _, _, _, _) = wal.replay().unwrap();
 
             let job = jobs.get(&1).expect("job 1 should exist after replay");
             assert_eq!(job.state, JobState::Buried);
@@ -3238,7 +3430,7 @@ mod tests {
             config_with_interval(1024 * 1024, Duration::from_secs(3600)),
         )
         .unwrap();
-        let (jobs, _, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1), "job should survive buffered replay");
         assert!(matches!(&jobs[&1].body, BodyRef::External(_)));
     }
@@ -3273,7 +3465,7 @@ mod tests {
             config_with_interval(1024 * 1024, Duration::from_secs(3600)),
         )
         .unwrap();
-        let (jobs, _, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1));
     }
 
@@ -3309,7 +3501,7 @@ mod tests {
         }
 
         let mut wal = Wal::open(dir.path(), config_with_interval(1024 * 1024, Duration::from_secs(3600))).unwrap();
-        let (jobs, _, _, orphans) = wal.replay().unwrap();
+        let (jobs, _, _, orphans, _) = wal.replay().unwrap();
         assert!(jobs.is_empty(), "deleted job must not survive replay");
         assert_eq!(orphans, vec![BodyId(42)]);
     }
@@ -3347,7 +3539,7 @@ mod tests {
         }
 
         let mut wal = Wal::open(dir.path(), config_with_interval(1024 * 1024, Duration::from_secs(3600))).unwrap();
-        let (jobs, _, _, orphans) = wal.replay().unwrap();
+        let (jobs, _, _, orphans, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&7), "re-put job must survive replay");
         assert!(
             orphans.is_empty(),

@@ -3453,7 +3453,7 @@ fn build_state(
             crate::wal::format_bytes(on_disk),
             dir,
         );
-        let (mut jobs, next_id, tombstones, orphan_bodies) = wal.replay()?;
+        let (mut jobs, next_id, tombstones, orphan_bodies, buried_order) = wal.replay()?;
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
 
@@ -3565,7 +3565,7 @@ fn build_state(
             state.stats.reclaimed_stranded_bodies = stranded_count;
         }
 
-        state.restore_jobs(jobs, next_id, tombstones);
+        state.restore_jobs(jobs, next_id, tombstones, buried_order);
 
         // Enforce the in-memory budget after replay. The WAL on-disk size
         // is not a reliable proxy (tombstones, superseded records, and format

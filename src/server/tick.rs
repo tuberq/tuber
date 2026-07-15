@@ -291,12 +291,15 @@ impl ServerState {
             .retain(|name, tube| name == "default" || !tube.is_idle() || held_tubes.contains(name));
     }
 
-    /// Restore jobs from WAL replay into server state.
+    /// Restore jobs from WAL replay into server state. `buried_order` is
+    /// the replay's bury-event order; buried jobs enter their tube's FIFO
+    /// in that order so `kick` stays oldest-first across restarts.
     pub(super) fn restore_jobs(
         &mut self,
         jobs: HashMap<u64, Job>,
         next_job_id: u64,
         tombstones: Vec<IdpTombstone>,
+        buried_order: Vec<u64>,
     ) {
         self.next_job_id = next_job_id;
 
@@ -315,6 +318,17 @@ impl ServerState {
 
         // Collect after_group job IDs for a second pass
         let mut after_group_jobs: Vec<u64> = Vec::new();
+
+        // `ids` is in hash order, but tube.buried is a FIFO whose front
+        // must stay the oldest bury (kick semantics). Buried jobs are
+        // collected during the loop and queued afterwards in the replay's
+        // bury order.
+        let buried_rank: HashMap<u64, usize> = buried_order
+            .iter()
+            .enumerate()
+            .map(|(rank, &id)| (id, rank))
+            .collect();
+        let mut buried_pending: Vec<(usize, u64, String)> = Vec::new();
 
         for id in ids {
             let Some(job) = self.jobs.get(&id) else {
@@ -360,8 +374,9 @@ impl ServerState {
                     }
                 }
                 JobState::Buried => {
+                    let rank = buried_rank.get(&id).copied().unwrap_or(usize::MAX);
+                    buried_pending.push((rank, id, tube_name.clone()));
                     if let Some(tube) = self.tubes.get_mut(&tube_name) {
-                        tube.buried.push_back(id);
                         tube.stat.buried_ct += 1;
                     }
                     self.stats.buried_ct += 1;
@@ -404,6 +419,16 @@ impl ServerState {
 
             if after_group.is_some() {
                 after_group_jobs.push(id);
+            }
+        }
+
+        // Rebuild each tube's buried FIFO oldest-bury-first. Buried jobs
+        // absent from `buried_order` (defensive — e.g. reaped between
+        // replay and restore) sort last, ties broken by id.
+        buried_pending.sort_unstable_by_key(|entry| (entry.0, entry.1));
+        for (_, id, tube_name) in buried_pending {
+            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                tube.buried.push_back(id);
             }
         }
 
