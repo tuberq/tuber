@@ -584,7 +584,7 @@ impl ServerState {
     fn is_concurrency_blocked(&self, job_id: u64) -> bool {
         self.jobs
             .get(&job_id)
-            .and_then(|j| j.concurrency_key.as_ref())
+            .and_then(|j| j.concurrency_key())
             .map(|(key, _limit)| {
                 let count = self.concurrency_keys.get(key).copied().unwrap_or(0);
                 let limit = self.concurrency_limits.get(key).copied().unwrap_or(1);
@@ -598,7 +598,7 @@ impl ServerState {
         if let Some((key, limit)) = self
             .jobs
             .get(&job_id)
-            .and_then(|j| j.concurrency_key.clone())
+            .and_then(|j| j.concurrency_key().cloned())
         {
             *self.concurrency_keys.entry(key.clone()).or_insert(0) += 1;
             // Use max of existing and new limit (safest — never blocks more than intended)
@@ -612,7 +612,7 @@ impl ServerState {
         if let Some((key, _limit)) = self
             .jobs
             .get(&job_id)
-            .and_then(|j| j.concurrency_key.clone())
+            .and_then(|j| j.concurrency_key().cloned())
             && let Some(count) = self.concurrency_keys.get_mut(&key)
         {
             *count = count.saturating_sub(1);
@@ -1028,11 +1028,14 @@ impl ServerState {
         );
         job.body = body_ref;
 
-        // Set extension fields before inserting
-        job.idempotency_key = idempotency_key;
-        job.group = group;
-        job.after_group = after_group;
-        job.concurrency_key = concurrency_key;
+        // Set extension fields before inserting (no allocation when the
+        // put carried no tags — the common case)
+        job.set_ext(crate::job::JobExt {
+            idempotency_key,
+            group,
+            after_group,
+            concurrency_key,
+        });
 
         // Concurrency limit is registered lazily in `acquire_concurrency_key`
         // (on reserve), not here. Registering eagerly at put time leaked the
@@ -1043,14 +1046,14 @@ impl ServerState {
         // rule, let a stale high limit widen concurrency for later jobs.
 
         // Register idempotency key in tube index
-        if let Some(ref key_tuple) = job.idempotency_key {
+        if let Some(key_tuple) = job.idempotency_key() {
             if let Some(tube) = self.tubes.get_mut(&tube_name) {
                 tube.idempotency_keys.insert(key_tuple.0.clone(), id);
             }
         }
 
         // Track group membership
-        if let Some(ref grp) = job.group {
+        if let Some(grp) = job.group() {
             let gs = self
                 .groups
                 .entry(grp.clone())
@@ -1059,7 +1062,7 @@ impl ServerState {
         }
 
         // Check if this is an after-group job that should be held
-        let hold_for_group = if let Some(ref ag) = job.after_group {
+        let hold_for_group = if let Some(ag) = job.after_group() {
             let gs = self
                 .groups
                 .entry(ag.clone())
@@ -1082,7 +1085,7 @@ impl ServerState {
             // Hold this after-job: mark as delayed with no deadline (held indefinitely)
             job.state = JobState::Delayed;
             job.deadline_at = None;
-            let after_group_name = job.after_group.clone();
+            let after_group_name = job.after_group().cloned();
             self.insert_job(id, job);
             // Add to group's waiting list (will be promoted when group completes)
             if let Some(ref ag) = after_group_name
@@ -1201,8 +1204,7 @@ impl ServerState {
 
         // Check after_group dependency
         let hold_for_group = job
-            .after_group
-            .as_ref()
+            .after_group()
             .and_then(|ag| self.groups.get(ag))
             .map(|gs| !gs.is_complete())
             .unwrap_or(false);
@@ -1246,7 +1248,7 @@ impl ServerState {
                 // in kick — otherwise the group can never complete and its
                 // aft: jobs are held forever.
                 if let Some(job) = self.jobs.get(&id)
-                    && let Some(ref grp) = job.group
+                    && let Some(grp) = job.group()
                     && let Some(gs) = self.groups.get_mut(grp)
                 {
                     gs.buried = gs.buried.saturating_sub(1);
@@ -1303,7 +1305,7 @@ impl ServerState {
 
         // A buried group member blocks its group's completion, same as cmd_bury.
         if let Some(job) = self.jobs.get(&job_id)
-            && let Some(ref grp) = job.group
+            && let Some(grp) = job.group()
             && let Some(gs) = self.groups.get_mut(grp)
         {
             gs.buried += 1;
@@ -1461,10 +1463,10 @@ impl ServerState {
         let tube_name = job.tube_name.clone();
         let pri = job.priority;
         let reserved_at = job.reserved_at;
-        let idempotency_key = job.idempotency_key.clone();
-        let group_name = job.group.clone();
-        let after_group_name = job.after_group.clone();
-        let has_concurrency_key = job.concurrency_key.is_some();
+        let idempotency_key = job.idempotency_key().cloned();
+        let group_name = job.group().cloned();
+        let after_group_name = job.after_group().cloned();
+        let has_concurrency_key = job.concurrency_key().is_some();
 
         match state {
             JobState::Reserved => {
@@ -1720,7 +1722,7 @@ impl ServerState {
         let mut affected_groups: Vec<String> = Vec::new();
         for &id in &job_ids {
             if let Some(job) = self.jobs.get(&id) {
-                if let Some(ref grp) = job.group
+                if let Some(grp) = job.group()
                     && let Some(gs) = self.groups.get_mut(grp)
                 {
                     gs.pending = gs.pending.saturating_sub(1);
@@ -1731,7 +1733,7 @@ impl ServerState {
                         affected_groups.push(grp.clone());
                     }
                 }
-                if let Some(ref ag) = job.after_group
+                if let Some(ag) = job.after_group()
                     && let Some(gs) = self.groups.get_mut(ag)
                 {
                     gs.remove_waiting_job(id);
@@ -1798,9 +1800,9 @@ impl ServerState {
         for id in ids {
             let (idempotency_key, group_name, after_group_name) = match self.jobs.get(&id) {
                 Some(job) => (
-                    job.idempotency_key.clone(),
-                    job.group.clone(),
-                    job.after_group.clone(),
+                    job.idempotency_key().cloned(),
+                    job.group().cloned(),
+                    job.after_group().cloned(),
                 ),
                 None => continue,
             };
@@ -1966,7 +1968,7 @@ impl ServerState {
         }
 
         let tube_name = job.tube_name.clone();
-        let has_concurrency_key = job.concurrency_key.is_some();
+        let has_concurrency_key = job.concurrency_key().is_some();
         // See cmd_release: never let a missing tube strand the job.
         self.ensure_tube(&tube_name);
 
@@ -1998,7 +2000,7 @@ impl ServerState {
 
         // Group tracking: buried jobs block group completion
         if let Some(job) = self.jobs.get(&id)
-            && let Some(ref grp) = job.group
+            && let Some(grp) = job.group()
             && let Some(gs) = self.groups.get_mut(grp)
         {
             gs.buried += 1;
@@ -2179,7 +2181,7 @@ impl ServerState {
 
                 // Group tracking: un-bury decrements buried count
                 if let Some(job) = self.jobs.get(&job_id)
-                    && let Some(ref grp) = job.group
+                    && let Some(grp) = job.group()
                     && let Some(gs) = self.groups.get_mut(grp)
                 {
                     gs.buried = gs.buried.saturating_sub(1);
@@ -2283,7 +2285,7 @@ impl ServerState {
 
                 // Group tracking: un-bury decrements buried count
                 if let Some(job) = self.jobs.get(&id)
-                    && let Some(ref grp) = job.group
+                    && let Some(grp) = job.group()
                     && let Some(gs) = self.groups.get_mut(grp)
                 {
                     gs.buried = gs.buried.saturating_sub(1);
@@ -2405,27 +2407,24 @@ impl ServerState {
             job.ttr.as_secs(),
             time_left,
             time_reserved,
-            job.wal_file_seq.unwrap_or(0),
+            job.wal_seq().unwrap_or(0),
             job.reserve_ct,
             job.timeout_ct,
             job.release_ct,
             job.bury_ct,
             job.kick_ct,
-            job.idempotency_key
-                .as_ref()
+            job.idempotency_key()
                 .map(|(k, _)| k.as_str())
                 .unwrap_or(""),
-            job.idempotency_key
-                .as_ref()
+            job.idempotency_key()
                 .map(|(_, ttl)| *ttl)
                 .unwrap_or(0),
-            job.group.as_deref().unwrap_or(""),
-            job.after_group.as_deref().unwrap_or(""),
-            job.concurrency_key
-                .as_ref()
+            job.group().map(|s| s.as_str()).unwrap_or(""),
+            job.after_group().map(|s| s.as_str()).unwrap_or(""),
+            job.concurrency_key()
                 .map(|(k, _)| k.as_str())
                 .unwrap_or(""),
-            job.concurrency_key.as_ref().map(|(_, l)| *l).unwrap_or(0),
+            job.concurrency_key().map(|(_, l)| *l).unwrap_or(0),
         );
         Response::Ok(yaml.into_bytes())
     }
@@ -2566,7 +2565,7 @@ impl ServerState {
 
         let (mut ready, mut reserved, mut delayed, mut buried) = (0u64, 0u64, 0u64, 0u64);
         for job in self.jobs.values() {
-            if job.group.as_deref() != Some(group_name) {
+            if job.group().map(|s| s.as_str()) != Some(group_name) {
                 continue;
             }
             match job.state {

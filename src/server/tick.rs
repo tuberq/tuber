@@ -29,7 +29,7 @@ impl ServerState {
                     let hold_for_group = self
                         .jobs
                         .get(&job_id)
-                        .and_then(|j| j.after_group.as_ref())
+                        .and_then(|j| j.after_group())
                         .and_then(|ag| self.groups.get(ag))
                         .map(|gs| !gs.is_complete())
                         .unwrap_or(false);
@@ -39,7 +39,7 @@ impl ServerState {
                         if let Some(job) = self.jobs.get_mut(&job_id) {
                             job.deadline_at = None;
                         }
-                        if let Some(ag) = self.jobs.get(&job_id).and_then(|j| j.after_group.clone())
+                        if let Some(ag) = self.jobs.get(&job_id).and_then(|j| j.after_group().cloned())
                             && let Some(gs) = self.groups.get_mut(&ag)
                         {
                             gs.waiting_jobs.push(job_id);
@@ -229,7 +229,7 @@ impl ServerState {
             let migrate_ids: Vec<u64> = self
                 .jobs
                 .iter()
-                .filter(|(_, job)| job.wal_file_seq == Some(target_seq))
+                .filter(|(_, job)| job.wal_seq() == Some(target_seq))
                 .map(|(id, _)| *id)
                 .take(count)
                 .collect();
@@ -326,9 +326,9 @@ impl ServerState {
             let ready_key = job.ready_key();
             let deadline_at = job.deadline_at;
             let delay = job.delay;
-            let idempotency_key = job.idempotency_key.clone();
-            let group = job.group.clone();
-            let after_group = job.after_group.clone();
+            let idempotency_key = job.idempotency_key().cloned();
+            let group = job.group().cloned();
+            let after_group = job.after_group().cloned();
 
             self.ensure_tube(&tube_name);
 
@@ -377,9 +377,9 @@ impl ServerState {
 
             // Register concurrency limit
             if let Some(job) = self.jobs.get(&id) {
-                if let Some((ref key, limit)) = job.concurrency_key {
+                if let Some((key, limit)) = job.concurrency_key() {
                     let entry = self.concurrency_limits.entry(key.clone()).or_insert(0);
-                    *entry = (*entry).max(limit);
+                    *entry = (*entry).max(*limit);
                 }
             }
 
@@ -409,7 +409,7 @@ impl ServerState {
 
         // Second pass: check after-group jobs and hold if group is not complete
         for job_id in after_group_jobs {
-            let ag = self.jobs.get(&job_id).and_then(|j| j.after_group.clone());
+            let ag = self.jobs.get(&job_id).and_then(|j| j.after_group().cloned());
             if let Some(ag) = ag {
                 let group_incomplete = self
                     .groups
