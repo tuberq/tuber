@@ -1,5 +1,43 @@
 # Changes
 
+## v0.11.0
+
+**Replay memory and crash-recovery pass** — peak RSS during WAL replay drops 77%, and two replay bugs that could resurrect or reorder jobs are fixed. WAL format is unchanged from v0.10.0: upgrade in place, no migration, no `--migrate-wal`.
+
+Replay was the worst possible place to be memory-hungry — it runs at startup, exactly when a crash-looping server is most likely to be OOM-killed. Observed in production: a 1.68M-job WAL that fit in ~2.5 GB steady-state could not replay inside a 4 GB container.
+
+Peak RSS restoring an identical 500,000-job WAL, across the series:
+
+| Change | Peak RSS |
+| --- | --- |
+| v0.10.0 baseline | 990 MB |
+| Replay stops holding three copies of the job table | 599 MB |
+| `Job` slimmed 336 → 216 bytes | 410 MB |
+| Tube names interned as `Arc<str>` | 394 MB |
+| Job table stores `Box<Job>` | 229 MB |
+
+Memory:
+
+- **Replay no longer holds up to three full copies of the job table at once.** Missing-body jobs are reaped in place rather than rebuilt via `into_iter().collect()` (which kept two full tables alive simultaneously), and `restore_jobs` adopts the replayed map wholesale, building tube indexes from an id list instead of re-inserting every job into a second table.
+- **`Job` shrank from 336 to 208 bytes.** The four extension keys (`idp:`/`grp:`/`aft:`/`con:` put tags) inlined 112 bytes of `Option`s that are almost always all `None`; they now live behind an `Option<Box<JobExt>>`, so tagged jobs allocate the box and plain jobs pay only the 8-byte pointer. Access moves to accessors (`job.group()` etc.), and `set_ext()` never stores an all-None box, so untagged jobs allocate nothing on replay. WAL tracking fields (`wal_file_seq`/`wal_used`) shrank 24 → 8 bytes; they are never serialized and are rebuilt on every replay.
+- **Tube names are interned.** Every job owned a private `String` copy of its tube's name — 1.68M copies of `"detailer"` in the production backlog, each a separate heap allocation, re-allocated on every `tube_name.clone()` in the put/TTR/restore paths. `Tube.name` is now the canonical `Arc<str>` and jobs share it, so hot-path clones are refcount bumps rather than mallocs. Replay interns through a small cache, so a replayed job set holds one allocation per tube rather than per job.
+- **The job table stores `Box<Job>`.** Slots are now a 16-byte `(u64, Box<Job>)` pair, so the 12–50% of slots a hash table keeps empty and the transient double-table spike during a rehash both shrink ~13x — a spike of hundreds of MB at millions of jobs, hit exactly when the queue is growing fastest. Replay moves the deserializer's existing `Box<Job>` straight into the table instead of copying the struct out of it. Cost is one pointer deref per lookup and one alloc per put; measured put throughput is unchanged (25.2k vs 25.5k puts/sec).
+
+Crash recovery:
+
+- **Truncated older WAL segments are quarantined again, not deleted.** Replay had been deleting *any* sub-header segment with an INFO log. Only the newest segment can be a benign creation-crash artifact; an older sub-header segment was once fsynced past its header, so a short read means a filesystem fault truncated records — and a lost delete record resurrects jobs. Older segments now take the quarantine path (`.corrupt` sidecar preserved, ERROR logged), while the newest keeps the quiet removal that fixes the crash-loop artifact below.
+- **Buried job order survives a restart.** `restore_jobs` rebuilt each tube's buried FIFO in `HashMap` iteration order, so after a restart `kick` returned arbitrary jobs instead of the oldest buries, breaking beanstalkd FIFO semantics. Replay now returns bury order (last bury event per still-buried job, in WAL order) and `restore_jobs` queues buried jobs in it.
+- **No more one `.corrupt` file per restart under a crash loop.** The segment created at the end of replay had an unflushed header, so any kill before the first sync tick left a 0-byte file that the next start quarantined with an ERROR. Headers are now fsynced at creation, and recordless newest segments are removed with an INFO line instead.
+
+Observability:
+
+- **Panics are reported through `tracing`.** A panic inside a per-connection tokio task unwinds that task alone: the server keeps serving, `JoinHandle` swallows the error, and the default hook's unstructured stderr line was the only trace it left — easy for a log pipeline to miss. A global panic hook now emits the payload, location, and thread as a `tracing::error!` before chaining to the default hook, covering connection tasks, the WAL/TOAST background tasks, and the metrics server without any of them opting in. Alerting can key on it like any other server error.
+
+Internal:
+
+- `adopt_jobs()` joins `insert_job`/`take_job` as the documented accounting boundary, so a future `job_memory_cost` change can't silently skip the restore path and drift `total_job_bytes` — which would surface as spurious `OUT_OF_MEMORY` after a restart.
+- Sentry was evaluated and rejected: its HTTP transport pulls 86–116 crates (47 → 133/163 built), out of proportion for this tree — the same reasoning that has `metrics.rs` hand-rolling an HTTP server rather than depending on hyper. Rationale recorded in CLAUDE.md.
+
 ## v0.10.0
 
 **Durability & protocol correctness pass (WAL v7)** — from a three-part server/protocol/persistence review.
