@@ -1,5 +1,21 @@
 # Changes
 
+## v0.11.1
+
+**Live memory stats.** `stats` gains five fields reporting real allocator memory, so you can watch actual footprint instead of inferring it. The two memory numbers that already existed are both misleading for this: `rusage-maxrss` is a peak high-water mark that never falls, and `current-jobs-size` is a backpressure estimate (`512 B/job + body`) that can't reflect the real struct footprint — deleting a million jobs moves neither in a way that tracks RSS.
+
+The new fields, read live via `tikv-jemalloc-ctl` (the jemalloc epoch is advanced per `stats` call to refresh them):
+
+- **`mem-allocated-bytes`** — live bytes in use; what the job set actually costs, and the number that drops when you delete jobs.
+- **`mem-resident-bytes`** — physical pages jemalloc holds (≈ its share of RSS).
+- **`mem-retained-bytes`** — address space held back from the OS but unused: freed-then-kept pages plus fragmentation. This is the memory a delete run frees on paper but doesn't return; `resident − allocated` is the slack.
+- **`mem-active-bytes`** — bytes in active pages.
+- **`current-rss-bytes`** — live process RSS (`/proc/self/statm` on Linux; falls back to jemalloc's resident estimate elsewhere), complementing the peak-only `rusage-maxrss`.
+
+Surfaced in the `stats` protocol response — so `tuber stats`, a raw `stats` command, and the Prometheus endpoint (new `tuber_mem_*` / `tuber_rss_bytes` gauges, since the metrics server parses the same response) all report them. The standalone `tuber-cli` binary has a fixed field schema and needs its own update to display them.
+
+Adds two crates (`tikv-jemalloc-ctl` + `paste`), pairing with the `tikv-jemallocator` allocator already in use. WAL/protocol formats unchanged.
+
 ## v0.11.0
 
 **Replay memory and crash-recovery pass** — peak RSS during WAL replay drops 77%, and two replay bugs that could resurrect or reorder jobs are fixed. WAL format is unchanged from v0.10.0: upgrade in place, no migration, no `--migrate-wal`.
