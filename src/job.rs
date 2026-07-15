@@ -134,6 +134,27 @@ impl JobState {
     }
 }
 
+/// Extension keys carried by `idp:`/`grp:`/`aft:`/`con:` put tags. Most
+/// jobs have none, so `Job` holds these behind `Option<Box<JobExt>>` —
+/// see the field comment there. Allocate only when a tag is present.
+#[derive(Debug, Clone, Default)]
+pub struct JobExt {
+    pub idempotency_key: Option<(String, u32)>,
+    pub group: Option<String>,
+    pub after_group: Option<String>,
+    pub concurrency_key: Option<(String, u32)>,
+}
+
+impl JobExt {
+    /// True when every key is absent — such an ext should not be stored.
+    pub fn is_empty(&self) -> bool {
+        self.idempotency_key.is_none()
+            && self.group.is_none()
+            && self.after_group.is_none()
+            && self.concurrency_key.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: u64,
@@ -145,10 +166,12 @@ pub struct Job {
     pub tube_name: String,
 
     // Future feature extension fields
-    pub idempotency_key: Option<(String, u32)>,
-    pub group: Option<String>,
-    pub after_group: Option<String>,
-    pub concurrency_key: Option<(String, u32)>,
+    /// Rarely-used extension keys (`idp:`/`grp:`/`aft:`/`con:` put tags),
+    /// boxed so the common untagged job pays 8 bytes instead of 112.
+    /// `Job` lives by value in the server's job table, so its inline size
+    /// multiplies across every slot (including empty ones); keep cold,
+    /// mostly-absent fields behind a pointer.
+    pub ext: Option<Box<JobExt>>,
 
     pub created_at: Instant,
     /// For delayed jobs: when it becomes ready.
@@ -168,9 +191,14 @@ pub struct Job {
     pub bury_ct: u32,
     pub kick_ct: u32,
 
-    // WAL persistence fields
-    pub wal_file_seq: Option<u64>,
-    pub wal_used: usize,
+    // WAL persistence fields. Never serialized — rebuilt on every
+    // replay — so these can be as narrow as the values demand: segment
+    // seqs start at 1 (NonZeroU32 keeps Option free), and the largest
+    // possible record is a legacy v3/v4 FullJob inlining a body capped
+    // at JOB_DATA_SIZE_LIMIT_MAX (1 GiB) — v7 bodies over 256 B live in
+    // TOAST, referenced by id — so u32 is ample for both.
+    pub wal_file_seq: Option<std::num::NonZeroU32>,
+    pub wal_used: u32,
     pub created_at_epoch: u64,
 }
 
@@ -198,10 +226,7 @@ impl Job {
             body: BodyRef::new_inline(body),
             state,
             tube_name,
-            idempotency_key: None,
-            group: None,
-            after_group: None,
-            concurrency_key: None,
+            ext: None,
             created_at: now,
             deadline_at,
             reserver_id: None,
@@ -224,6 +249,60 @@ impl Job {
     /// Lower priority number = higher urgency. Ties broken by lower id (FIFO).
     pub fn ready_key(&self) -> (u32, u64) {
         (self.priority, self.id)
+    }
+
+    // --- extension-key accessors (see the `ext` field comment) ---
+
+    pub fn idempotency_key(&self) -> Option<&(String, u32)> {
+        self.ext.as_ref().and_then(|e| e.idempotency_key.as_ref())
+    }
+
+    pub fn group(&self) -> Option<&String> {
+        self.ext.as_ref().and_then(|e| e.group.as_ref())
+    }
+
+    pub fn after_group(&self) -> Option<&String> {
+        self.ext.as_ref().and_then(|e| e.after_group.as_ref())
+    }
+
+    pub fn concurrency_key(&self) -> Option<&(String, u32)> {
+        self.ext.as_ref().and_then(|e| e.concurrency_key.as_ref())
+    }
+
+    /// Mutable access to the extension keys, allocating the box on first
+    /// use. Callers that may end up storing nothing should prefer
+    /// `set_ext`, which never leaves an all-`None` allocation behind.
+    pub fn ext_mut(&mut self) -> &mut JobExt {
+        self.ext.get_or_insert_with(Default::default)
+    }
+
+    /// Store `ext` unless it is empty (all keys `None`).
+    pub fn set_ext(&mut self, ext: JobExt) {
+        self.ext = if ext.is_empty() {
+            None
+        } else {
+            Some(Box::new(ext))
+        };
+    }
+
+    // --- WAL tracking accessors (see the field comment) ---
+
+    /// Record where this job's FullJob record lives in the WAL.
+    pub fn set_wal_ref(&mut self, seq: u64, used: usize) {
+        debug_assert!(seq <= u32::MAX as u64, "WAL segment seq overflows u32");
+        debug_assert!(used <= u32::MAX as usize, "WAL record size overflows u32");
+        self.wal_file_seq = std::num::NonZeroU32::new(seq as u32);
+        self.wal_used = used as u32;
+    }
+
+    pub fn clear_wal_ref(&mut self) {
+        self.wal_file_seq = None;
+        self.wal_used = 0;
+    }
+
+    /// Segment seq as the WAL's native width.
+    pub fn wal_seq(&self) -> Option<u64> {
+        self.wal_file_seq.map(|s| s.get() as u64)
     }
 
     pub fn is_urgent(&self) -> bool {

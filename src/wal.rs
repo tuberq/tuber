@@ -109,7 +109,7 @@ fn u8_to_state(v: u8) -> Option<JobState> {
 
 // --- Serialization helpers ---
 
-fn write_option_string(buf: &mut Vec<u8>, s: &Option<String>) {
+fn write_option_string(buf: &mut Vec<u8>, s: Option<&str>) {
     match s {
         None => buf.extend_from_slice(&0u16.to_le_bytes()),
         Some(s) => {
@@ -238,29 +238,21 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
 
     // extension fields (grouped: key + its associated value)
     // idempotency_key + ttl
-    write_option_string(
-        &mut payload,
-        &job.idempotency_key.as_ref().map(|(k, _)| k.clone()),
-    );
+    write_option_string(&mut payload, job.idempotency_key().map(|(k, _)| k.as_str()));
     payload.extend_from_slice(
-        &job.idempotency_key
-            .as_ref()
+        &job.idempotency_key()
             .map_or(0u32, |(_, ttl)| *ttl)
             .to_le_bytes(),
     );
 
     // group, after_group
-    write_option_string(&mut payload, &job.group);
-    write_option_string(&mut payload, &job.after_group);
+    write_option_string(&mut payload, job.group().map(String::as_str));
+    write_option_string(&mut payload, job.after_group().map(String::as_str));
 
     // concurrency_key + limit
-    write_option_string(
-        &mut payload,
-        &job.concurrency_key.as_ref().map(|(k, _)| k.clone()),
-    );
+    write_option_string(&mut payload, job.concurrency_key().map(|(k, _)| k.as_str()));
     payload.extend_from_slice(
-        &job.concurrency_key
-            .as_ref()
+        &job.concurrency_key()
             .map_or(0u32, |(_, l)| *l)
             .to_le_bytes(),
     );
@@ -341,10 +333,10 @@ pub fn estimate_full_job_size(job: &Job) -> usize {
     let body_external = matches!(job.body, BodyRef::External(_));
     estimate_full_job_size_raw(
         &job.tube_name,
-        job.idempotency_key.as_ref().map(|(k, _)| k.as_str()),
-        job.group.as_deref(),
-        job.after_group.as_deref(),
-        job.concurrency_key.as_ref().map(|(k, _)| k.as_str()),
+        job.idempotency_key().map(|(k, _)| k.as_str()),
+        job.group().map(|s| s.as_str()),
+        job.after_group().map(|s| s.as_str()),
+        job.concurrency_key().map(|(k, _)| k.as_str()),
         job.body.len(),
         body_external,
     )
@@ -588,10 +580,14 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
     job.release_ct = release_ct;
     job.bury_ct = bury_ct;
     job.kick_ct = kick_ct;
-    job.idempotency_key = idempotency_key;
-    job.group = group;
-    job.after_group = after_group;
-    job.concurrency_key = concurrency_key;
+    // set_ext skips the allocation when every key is None — the common
+    // case, and the one that matters at replay scale.
+    job.set_ext(crate::job::JobExt {
+        idempotency_key,
+        group,
+        after_group,
+        concurrency_key,
+    });
     job.reserver_id = None;
 
     Ok((WalRecord::FullJob(Box::new(job)), total_len))
@@ -1165,19 +1161,17 @@ impl Wal {
         self.ops_written += 1;
 
         // Update job's WAL tracking
-        let old_seq = job.wal_file_seq;
+        let old_seq = job.wal_seq();
         let old_used = job.wal_used;
-        job.wal_file_seq = Some(file_seq);
-        job.wal_used = record_len;
+        job.set_wal_ref(file_seq, record_len);
 
         // Decref old file
         if let Some(old) = old_seq {
-            self.decref_file(old, old_used);
+            self.decref_file(old, old_used as usize);
         }
 
         // Incref new file
-        let seq = job.wal_file_seq.unwrap();
-        self.incref_file(seq, record_len);
+        self.incref_file(file_seq, record_len);
 
         // Reserve space for future state change (delete).
         // Only add a reservation for NEW jobs (old_seq is None).
@@ -1242,11 +1236,10 @@ impl Wal {
 
         // For deletes, decref old file and reduce alive bytes
         if new_state.is_none() {
-            if let Some(old_seq) = job.wal_file_seq {
-                self.decref_file(old_seq, job.wal_used);
+            if let Some(old_seq) = job.wal_seq() {
+                self.decref_file(old_seq, job.wal_used as usize);
             }
-            job.wal_file_seq = None;
-            job.wal_used = 0;
+            job.clear_wal_ref();
         } else {
             // For non-delete state changes (bury, release, kick), do NOT move
             // the job's WAL ref. The wal_file_seq must keep pointing at the file
@@ -1418,14 +1411,13 @@ impl Wal {
                                 }
                                 // Track WAL position
                                 let record_size = consumed;
-                                job.wal_file_seq = Some(*seq);
-                                job.wal_used = record_size;
+                                job.set_wal_ref(*seq, record_size);
 
                                 // Remove old ref if replacing
                                 if let Some(old_job) = jobs.get(&job.id)
-                                    && let Some(old_seq) = old_job.wal_file_seq
+                                    && let Some(old_seq) = old_job.wal_seq()
                                 {
-                                    self.decref_file(old_seq, old_job.wal_used);
+                                    self.decref_file(old_seq, old_job.wal_used as usize);
                                 }
 
                                 self.incref_file(*seq, record_size);
@@ -1455,7 +1447,7 @@ impl Wal {
                                             if expires_at > replay_time {
                                                 // Tombstone still active — extract idp info from job before removing
                                                 if let Some(job) = jobs.get(&job_id)
-                                                    && let Some((ref key, _)) = job.idempotency_key
+                                                    && let Some((key, _)) = job.idempotency_key()
                                                 {
                                                     tombstones.push(IdpTombstone {
                                                         tube_name: job.tube_name.clone(),
@@ -1467,8 +1459,8 @@ impl Wal {
                                             }
                                         }
                                         if let Some(old_job) = jobs.remove(&job_id) {
-                                            if let Some(old_seq) = old_job.wal_file_seq {
-                                                self.decref_file(old_seq, old_job.wal_used);
+                                            if let Some(old_seq) = old_job.wal_seq() {
+                                                self.decref_file(old_seq, old_job.wal_used as usize);
                                             }
                                             if let BodyRef::External(body_id) = old_job.body {
                                                 orphan_bodies.push(body_id);
@@ -1731,10 +1723,9 @@ mod tests {
         job.release_ct = 2;
         job.bury_ct = 0;
         job.kick_ct = 1;
-        job.idempotency_key = Some(("idem-key".to_string(), 60));
-        job.group = Some("group1".to_string());
-        job.after_group = None;
-        job.concurrency_key = Some(("conc".to_string(), 3));
+        job.ext_mut().idempotency_key = Some(("idem-key".to_string(), 60));
+        job.ext_mut().group = Some("group1".to_string());
+        job.ext_mut().concurrency_key = Some(("conc".to_string(), 3));
         external_body(&mut job);
         job
     }
@@ -1758,10 +1749,13 @@ mod tests {
             assert_eq!(j.release_ct, 2);
             assert_eq!(j.bury_ct, 0);
             assert_eq!(j.kick_ct, 1);
-            assert_eq!(j.idempotency_key, Some(("idem-key".to_string(), 60)));
-            assert_eq!(j.group.as_deref(), Some("group1"));
-            assert!(j.after_group.is_none());
-            assert_eq!(j.concurrency_key, Some(("conc".to_string(), 3)));
+            assert_eq!(
+                j.idempotency_key().cloned(),
+                Some(("idem-key".to_string(), 60))
+            );
+            assert_eq!(j.group().map(|s| s.as_str()), Some("group1"));
+            assert!(j.after_group().is_none());
+            assert_eq!(j.concurrency_key().cloned(), Some(("conc".to_string(), 3)));
             // Reserved replays as Ready
             assert_eq!(j.state, JobState::Delayed); // original was delayed (delay > 0)
             // v5 round-trip preserves the BodyId reference, not the bytes.
@@ -1954,19 +1948,19 @@ mod tests {
         let mut buf = Vec::new();
 
         // None
-        write_option_string(&mut buf, &None);
+        write_option_string(&mut buf, None);
         let mut off = 0;
         assert_eq!(read_option_string(&buf, &mut off).unwrap(), None);
 
         // Some("")
         buf.clear();
-        write_option_string(&mut buf, &Some("".to_string()));
+        write_option_string(&mut buf, Some(""));
         off = 0;
         assert_eq!(read_option_string(&buf, &mut off).unwrap(), None); // empty = len 0 = None
 
         // Some("abc")
         buf.clear();
-        write_option_string(&mut buf, &Some("abc".to_string()));
+        write_option_string(&mut buf, Some("abc"));
         off = 0;
         assert_eq!(
             read_option_string(&buf, &mut off).unwrap(),
@@ -2968,7 +2962,7 @@ mod tests {
         // The remaining live job (20) may still pin one old file.
         // Simulate compaction: re-write job 20 to move it to the current file.
         let job20 = &mut jobs[19];
-        if let Some(old_seq) = job20.wal_file_seq {
+        if let Some(old_seq) = job20.wal_seq() {
             let current_seq = wal.current_seq();
             if old_seq != current_seq {
                 // Re-write to current file (this is what the server does)
