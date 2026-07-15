@@ -220,6 +220,41 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     );
     prom_gauge(
         &mut out,
+        "tuber_rss_bytes",
+        "Live resident set size in bytes",
+        &stats,
+        "current-rss-bytes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_mem_allocated_bytes",
+        "jemalloc bytes allocated and in use (live)",
+        &stats,
+        "mem-allocated-bytes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_mem_active_bytes",
+        "jemalloc bytes in active pages",
+        &stats,
+        "mem-active-bytes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_mem_resident_bytes",
+        "jemalloc resident physical bytes",
+        &stats,
+        "mem-resident-bytes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_mem_retained_bytes",
+        "jemalloc bytes retained from the OS but unused (reclaimable slack)",
+        &stats,
+        "mem-retained-bytes",
+    );
+    prom_gauge(
+        &mut out,
         "tuber_binlog_file_count",
         "Number of WAL files on disk",
         &stats,

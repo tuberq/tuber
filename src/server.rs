@@ -2649,6 +2649,29 @@ impl ServerState {
             (utime, stime, maxrss)
         };
 
+        // jemalloc allocator stats. Advancing the epoch refreshes jemalloc's
+        // cached counters; without it every read returns the values from the
+        // last advance. `allocated` is live bytes in use (what the job set
+        // actually costs), `resident` is physical pages jemalloc holds
+        // (≈ its share of RSS), and `retained` is address space held back from
+        // the OS but unused — freed-then-kept pages plus fragmentation, i.e.
+        // the memory a delete run frees on paper but doesn't return. A ctl
+        // error reports 0 for that field rather than failing the whole command.
+        let (mem_allocated, mem_active, mem_resident, mem_retained) = {
+            let _ = tikv_jemalloc_ctl::epoch::advance();
+            (
+                tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0),
+                tikv_jemalloc_ctl::stats::active::read().unwrap_or(0),
+                tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0),
+                tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0),
+            )
+        };
+
+        // Live process RSS, to complement the peak-only `rusage-maxrss` (a
+        // high-water mark that never falls). Falls back to jemalloc's resident
+        // estimate where `/proc` isn't available.
+        let current_rss = current_rss_bytes().unwrap_or(mem_resident as u64);
+
         // WAL stats
         let (binlog_oldest, binlog_current, binlog_max_size, binlog_file_count, binlog_total_bytes) =
             match &self.wal {
@@ -2731,6 +2754,11 @@ impl ServerState {
              rusage-utime: {}\n\
              rusage-stime: {}\n\
              rusage-maxrss: {}\n\
+             current-rss-bytes: {}\n\
+             mem-allocated-bytes: {}\n\
+             mem-active-bytes: {}\n\
+             mem-resident-bytes: {}\n\
+             mem-retained-bytes: {}\n\
              uptime: {}\n\
              binlog-oldest-index: {}\n\
              binlog-current-index: {}\n\
@@ -2803,6 +2831,11 @@ impl ServerState {
             rusage_utime,
             rusage_stime,
             rusage_maxrss,
+            current_rss,
+            mem_allocated,
+            mem_active,
+            mem_resident,
+            mem_retained,
             uptime,
             binlog_oldest,
             binlog_current,
@@ -3375,6 +3408,22 @@ impl ServerState {
 
 /// Parse a human-readable byte count (`1g`, `500M`, `100k`, or raw bytes) into u64.
 /// Case-insensitive. Trailing `B` accepted (`2GB`, `500MB`). No decimals.
+/// Live resident set size of this process, in bytes. Linux exposes resident
+/// pages as field 2 of `/proc/self/statm`; on other platforms we have no cheap
+/// live RSS, so the caller falls back to jemalloc's resident estimate.
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (page_size > 0).then(|| resident_pages * page_size as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes() -> Option<u64> {
+    None
+}
+
 pub fn parse_bytes(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {

@@ -12,6 +12,7 @@ tracing-subscriber = "0.3"
 crc32fast = "1"
 libc = "0.2"
 tikv-jemallocator = "0.6.1"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [dev-dependencies]
 tempfile = "3"
