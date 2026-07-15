@@ -297,7 +297,7 @@ impl ServerState {
     /// in that order so `kick` stays oldest-first across restarts.
     pub(super) fn restore_jobs(
         &mut self,
-        jobs: HashMap<u64, Job>,
+        jobs: HashMap<u64, Box<Job>>,
         next_job_id: u64,
         tombstones: Vec<IdpTombstone>,
         buried_order: Vec<u64>,

@@ -185,7 +185,7 @@ pub struct IdpTombstone {
 /// What [`Wal::replay`] returns: `(jobs, next_job_id, idempotency
 /// tombstones, orphaned body ids, buried order)`.
 pub type ReplayOutcome = (
-    HashMap<u64, Job>,
+    HashMap<u64, Box<Job>>,
     u64,
     Vec<IdpTombstone>,
     Vec<BodyId>,
@@ -1285,7 +1285,7 @@ impl Wal {
     /// each tube's buried FIFO oldest-first, which a bare iteration over
     /// the returned map cannot (hash order loses bury order).
     pub fn replay(&mut self) -> io::Result<ReplayOutcome> {
-        let mut jobs: HashMap<u64, Job> = HashMap::new();
+        let mut jobs: HashMap<u64, Box<Job>> = HashMap::new();
         let mut max_id: u64 = 0;
         let mut tombstones: Vec<IdpTombstone> = Vec::new();
         // Every record that leaves a job buried, in WAL order. Stale
@@ -1439,7 +1439,9 @@ impl Wal {
                                 if job.state == JobState::Buried {
                                     bury_events.push(job.id);
                                 }
-                                jobs.insert(job.id, *job);
+                                // The record already owns a Box<Job>; move it in
+                                // whole — no unbox-and-copy into the table slot.
+                                jobs.insert(job.id, job);
                             }
                             WalRecord::StateChange {
                                 job_id,
@@ -1618,7 +1620,7 @@ impl Wal {
         // Filter orphans against the final job set: a job may have been
         // recreated under the same id within the same WAL, in which case
         // the "orphan" is now live again and must not be deleted.
-        let live_body_ids = crate::job::live_external_body_ids(jobs.values());
+        let live_body_ids = crate::job::live_external_body_ids(jobs.values().map(Box::as_ref));
         orphan_bodies.retain(|id| !live_body_ids.contains(id));
 
         // Reduce raw bury events to the final order: keep only the last
