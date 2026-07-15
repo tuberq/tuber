@@ -37,6 +37,7 @@ The codebase mirrors the original C beanstalkd structure:
 - **`src/cmd_work.rs`** - CLI `work` command: reserves and executes jobs as shell commands with parallel workers.
 - **`src/body_store.rs`** - External body store ("TOAST"). Append-only segment files (`body.NNNNNN`) under `<binlog_dir>/toast/` hold raw job payloads addressed by `BodyId`. Used when persistence is enabled so the WAL only references bodies by id rather than carrying their bytes. Background tokio task compacts sealed segments whose live ratio drops below `COMPACTION_LIVE_RATIO_THRESHOLD` (0.5).
 - **`src/metrics.rs`** - Prometheus metrics HTTP server (optional, enabled with `--metrics-port`). Exposes WAL, TOAST, jobs, and per-tube gauges/counters.
+- **`src/telemetry.rs`** - Installs the tracing subscriber (level from `-V`) and a global panic hook that reports panics via `tracing::error!` before chaining to the default hook. Without it, a panic in a per-connection tokio task unwinds that task alone and leaves only an unstructured stderr line.
 
 ## Persistence model (when `-b` is set)
 
@@ -50,6 +51,14 @@ Two on-disk stores side by side:
 **Disk budget:** `--max-storage-bytes` caps WAL + TOAST combined. Puts return `OUT_OF_STORAGE` once the budget minus a one-WAL-segment reserve (≤10 MiB) would be exceeded; state changes (delete/release/bury/kick/touch) always succeed.
 
 **Sync interval:** `--sync-interval` (env `TUBER_SYNC_INTERVAL`, default 100 ms) drives both stores. `--wal-sync-interval` is accepted as a hidden alias for backwards compatibility.
+
+## Error reporting
+
+No external error-reporting SDK, deliberately. Sentry was evaluated and rejected:
+its HTTP transport pulls ~90-120 crates (47 → 133/163 built), which is out of
+proportion for this tree — the same reasoning that has `metrics.rs` hand-rolling
+an HTTP server instead of depending on hyper. Errors and panics go out as
+structured `tracing` events on stderr; alerting belongs in the log pipeline.
 
 ## Key Constants from Original C (dat.h)
 

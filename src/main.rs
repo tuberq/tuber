@@ -275,7 +275,7 @@ async fn run() {
                 1 => tracing::Level::INFO,
                 _ => tracing::Level::DEBUG,
             };
-            tracing_subscriber::fmt().with_max_level(level).init();
+            tuber::telemetry::init(level);
 
             // Persistence-only flags are harmlessly ignored in-memory. Warn —
             // don't refuse — when one was set without --binlog-dir, so a
