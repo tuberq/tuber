@@ -556,7 +556,7 @@ impl ServerState {
                 }
                 if let Some((tube_name, key)) = requeue {
                     self.ensure_tube(&tube_name);
-                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                         tube.ready.insert(key, job_id);
                         self.ready_ct += 1;
                         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
@@ -914,7 +914,7 @@ impl ServerState {
                 let delay = existing_job.delay;
                 existing_job.priority = pri;
 
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     // If job is Ready, re-sort the ready heap
                     if state == JobState::Ready {
                         tube.ready.remove_by_id(existing_id);
@@ -1018,13 +1018,20 @@ impl ServerState {
             _ => BodyRef::new_inline(body),
         };
 
+        // Share the tube's name allocation with the job — one Arc per
+        // tube, not one per put.
+        let shared_tube_name = self
+            .tubes
+            .get(&tube_name)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| std::sync::Arc::from(tube_name.as_str()));
         let mut job = Job::new(
             id,
             pri,
             Duration::from_secs(delay as u64),
             Duration::from_secs(ttr as u64),
             Vec::new(),
-            tube_name.clone(),
+            shared_tube_name,
         );
         job.body = body_ref;
 
@@ -1047,7 +1054,7 @@ impl ServerState {
 
         // Register idempotency key in tube index
         if let Some(key_tuple) = job.idempotency_key() {
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.idempotency_keys.insert(key_tuple.0.clone(), id);
             }
         }
@@ -1078,7 +1085,7 @@ impl ServerState {
             job.state = JobState::Delayed;
             job.deadline_at = Some(deadline);
             self.insert_job(id, job);
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.delay.insert((deadline, id), id);
             }
         } else if hold_for_group {
@@ -1096,20 +1103,20 @@ impl ServerState {
         } else {
             let key = job.ready_key();
             self.insert_job(id, job);
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.ready.insert(key, id);
             }
             self.ready_ct += 1;
             if pri < URGENT_THRESHOLD {
                 self.stats.urgent_ct += 1;
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.stat.urgent_ct += 1;
                 }
             }
         }
 
         self.stats.total_jobs_ct += 1;
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.total_jobs_ct += 1;
         }
 
@@ -1225,7 +1232,7 @@ impl ServerState {
         // Remove from current state
         match state {
             JobState::Ready => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.ready.remove_by_id(id);
                 }
                 self.ready_ct = self.ready_ct.saturating_sub(1);
@@ -1233,13 +1240,13 @@ impl ServerState {
                     && j.priority < URGENT_THRESHOLD
                 {
                     self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
-                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                         tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
                     }
                 }
             }
             JobState::Buried => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.buried.retain(|&jid| jid != id);
                     self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
@@ -1255,7 +1262,7 @@ impl ServerState {
                 }
             }
             JobState::Delayed => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.delay.remove_by_id(id);
                 }
             }
@@ -1277,7 +1284,7 @@ impl ServerState {
         };
 
         // Remove from the ready heap + ready/urgent stats.
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.ready.remove_by_id(job_id);
             if is_urgent {
                 tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
@@ -1296,7 +1303,7 @@ impl ServerState {
             job.deadline_at = None;
             job.bury_ct += 1;
         }
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.buried.push_back(job_id);
             tube.stat.buried_ct += 1;
             tube.stat.total_bury_ct += 1;
@@ -1344,7 +1351,7 @@ impl ServerState {
             None => return Response::NotFound,
         };
         // Remove from ready heap
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.ready.remove_by_id(job_id);
             if is_urgent {
                 tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
@@ -1378,7 +1385,7 @@ impl ServerState {
             None => return Response::NotFound,
         };
         self.acquire_concurrency_key(job_id);
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.reserved_ct += 1;
             tube.stat.total_reserve_ct += 1;
 
@@ -1483,37 +1490,37 @@ impl ServerState {
                     }
                 }
                 self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
                 }
             }
             JobState::Ready => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.ready.remove_by_id(id);
                 }
                 self.ready_ct = self.ready_ct.saturating_sub(1);
                 if pri < URGENT_THRESHOLD {
                     self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
-                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                         tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
                     }
                 }
             }
             JobState::Buried => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.buried.retain(|&jid| jid != id);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
                 self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
             }
             JobState::Delayed => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.delay.remove_by_id(id);
                 }
             }
         }
 
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.total_delete_ct += 1;
 
             if state == JobState::Reserved
@@ -1554,7 +1561,7 @@ impl ServerState {
         // Remove idempotency key from tube index (with optional cooldown)
         let mut expiry_epoch_secs: u64 = 0;
         if let Some(ref key_tuple) = idempotency_key {
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.idempotency_keys.remove(&key_tuple.0);
             }
             if key_tuple.1 > 0 {
@@ -1645,7 +1652,7 @@ impl ServerState {
         let mut reserved_ids: Vec<u64> = Vec::new();
         let mut held_ids: Vec<u64> = Vec::new();
         for j in self.jobs.values() {
-            if j.tube_name != tube_name {
+            if j.tube_name.as_ref() != tube_name {
                 continue;
             }
             match j.state {
@@ -1897,7 +1904,7 @@ impl ServerState {
             conn.reserved_jobs.retain(|&jid| jid != id);
         }
         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
         }
 
@@ -1917,7 +1924,7 @@ impl ServerState {
                 job.state = JobState::Delayed;
                 job.deadline_at = Some(deadline);
             }
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.delay.insert((deadline, id), id);
             }
         } else {
@@ -1925,14 +1932,14 @@ impl ServerState {
                 job.state = JobState::Ready;
                 job.deadline_at = None;
                 let key = job.ready_key();
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.ready.insert(key, id);
                 }
             }
             self.ready_ct += 1;
             if pri < URGENT_THRESHOLD {
                 self.stats.urgent_ct += 1;
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.stat.urgent_ct += 1;
                 }
             }
@@ -1978,7 +1985,7 @@ impl ServerState {
             conn.reserved_jobs.retain(|&jid| jid != id);
         }
         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
         }
 
@@ -1991,7 +1998,7 @@ impl ServerState {
             job.bury_ct += 1;
         }
 
-        if let Some(tube) = self.tubes.get_mut(&tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.buried.push_back(id);
             tube.stat.buried_ct += 1;
             tube.stat.total_bury_ct += 1;
@@ -2138,7 +2145,7 @@ impl ServerState {
         let found = self
             .jobs
             .values()
-            .filter(|j| j.state == JobState::Reserved && j.tube_name == tube_name)
+            .filter(|j| j.state == JobState::Reserved && j.tube_name.as_ref() == tube_name)
             .min_by_key(|j| j.id);
         match found {
             Some(job) => self.found_or_error(job),
@@ -2165,7 +2172,7 @@ impl ServerState {
         if has_buried {
             for _ in 0..bound {
                 let job_id = {
-                    let tube = match self.tubes.get_mut(&tube_name) {
+                    let tube = match self.tubes.get_mut(&*tube_name) {
                         Some(t) => t,
                         None => break,
                     };
@@ -2194,13 +2201,13 @@ impl ServerState {
                     job.kick_ct += 1;
                     let key = job.ready_key();
                     let tn = job.tube_name.clone();
-                    if let Some(tube) = self.tubes.get_mut(&tn) {
+                    if let Some(tube) = self.tubes.get_mut(&*tn) {
                         tube.ready.insert(key, job_id);
                     }
                     self.ready_ct += 1;
                     if key.0 < URGENT_THRESHOLD {
                         self.stats.urgent_ct += 1;
-                        if let Some(tube) = self.tubes.get_mut(&tn) {
+                        if let Some(tube) = self.tubes.get_mut(&*tn) {
                             tube.stat.urgent_ct += 1;
                         }
                     }
@@ -2221,7 +2228,7 @@ impl ServerState {
             // Kick delayed
             for _ in 0..bound {
                 let job_id = {
-                    let tube = match self.tubes.get_mut(&tube_name) {
+                    let tube = match self.tubes.get_mut(&*tube_name) {
                         Some(t) => t,
                         None => break,
                     };
@@ -2237,13 +2244,13 @@ impl ServerState {
                     job.kick_ct += 1;
                     let key = job.ready_key();
                     let tn = job.tube_name.clone();
-                    if let Some(tube) = self.tubes.get_mut(&tn) {
+                    if let Some(tube) = self.tubes.get_mut(&*tn) {
                         tube.ready.insert(key, job_id);
                     }
                     self.ready_ct += 1;
                     if key.0 < URGENT_THRESHOLD {
                         self.stats.urgent_ct += 1;
-                        if let Some(tube) = self.tubes.get_mut(&tn) {
+                        if let Some(tube) = self.tubes.get_mut(&*tn) {
                             tube.stat.urgent_ct += 1;
                         }
                     }
@@ -2277,7 +2284,7 @@ impl ServerState {
 
         match state {
             JobState::Buried => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.buried.retain(|&jid| jid != id);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
@@ -2292,7 +2299,7 @@ impl ServerState {
                 }
             }
             JobState::Delayed => {
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.delay.remove_by_id(id);
                 }
             }
@@ -2304,13 +2311,13 @@ impl ServerState {
             job.deadline_at = None;
             job.kick_ct += 1;
             let key = job.ready_key();
-            if let Some(tube) = self.tubes.get_mut(&tube_name) {
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.ready.insert(key, id);
             }
             self.ready_ct += 1;
             if key.0 < URGENT_THRESHOLD {
                 self.stats.urgent_ct += 1;
-                if let Some(tube) = self.tubes.get_mut(&tube_name) {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.stat.urgent_ct += 1;
                 }
             }
@@ -2988,13 +2995,13 @@ impl ServerState {
             }
             if let Some((tn, key)) = promoted {
                 self.ensure_tube(&tn);
-                if let Some(tube) = self.tubes.get_mut(&tn) {
+                if let Some(tube) = self.tubes.get_mut(&*tn) {
                     tube.ready.insert(key, *job_id);
                 }
                 self.ready_ct += 1;
                 if key.0 < URGENT_THRESHOLD {
                     self.stats.urgent_ct += 1;
-                    if let Some(tube) = self.tubes.get_mut(&tn) {
+                    if let Some(tube) = self.tubes.get_mut(&*tn) {
                         tube.stat.urgent_ct += 1;
                     }
                 }

@@ -399,7 +399,7 @@ fn test_weighted_fair_favors_fast_tubes() {
         let resp = s.handle_command(c, Command::Reserve, None);
         if let Response::Reserved { id, .. } = resp {
             let job = s.jobs.get(&id).unwrap();
-            if job.tube_name == "fast" {
+            if job.tube_name.as_ref() == "fast" {
                 fast_count += 1;
             } else {
                 slow_count += 1;

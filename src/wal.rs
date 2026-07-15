@@ -176,7 +176,7 @@ impl std::fmt::Display for WalError {
 /// An idempotency tombstone recovered from WAL replay.
 #[derive(Debug)]
 pub struct IdpTombstone {
-    pub tube_name: String,
+    pub tube_name: std::sync::Arc<str>,
     pub key: String,
     pub job_id: u64,
     pub expires_at: SystemTime,
@@ -1296,6 +1296,10 @@ impl Wal {
         let total_segments = file_infos.len();
         let total_bytes = self.total_disk_bytes;
         let mut bytes_done: u64 = 0;
+        // Tube-name intern cache: deserialization allocates a fresh
+        // Arc<str> per FullJob record; swap it for a shared one so the
+        // surviving job set holds one allocation per tube, not per job.
+        let mut tube_names: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
         let mut last_log = Instant::now();
         // Segments quarantined this replay (moved to `.corrupt`); dropped from
         // `self.files` after the loop so GC can't chase the renamed path.
@@ -1382,6 +1386,13 @@ impl Wal {
                                 // Track WAL position
                                 let record_size = consumed;
                                 job.set_wal_ref(*seq, record_size);
+
+                                match tube_names.get(job.tube_name.as_ref()) {
+                                    Some(interned) => job.tube_name = Arc::clone(interned),
+                                    None => {
+                                        tube_names.insert(Arc::clone(&job.tube_name));
+                                    }
+                                }
 
                                 // Remove old ref if replacing
                                 if let Some(old_job) = jobs.get(&job.id)
@@ -1694,7 +1705,7 @@ mod tests {
             assert_eq!(j.delay, Duration::from_secs(5));
             assert_eq!(j.ttr, Duration::from_secs(30));
             assert!(matches!(&j.body, BodyRef::External(_)));
-            assert_eq!(j.tube_name, "test-tube");
+            assert_eq!(j.tube_name.as_ref(), "test-tube");
             assert_eq!(j.reserve_ct, 3);
             assert_eq!(j.timeout_ct, 1);
             assert_eq!(j.release_ct, 2);
@@ -2486,7 +2497,7 @@ mod tests {
             let j2 = &jobs[&2];
             assert_eq!(j2.priority, 20);
             assert!(matches!(&j2.body, BodyRef::External(_)));
-            assert_eq!(j2.tube_name, "other");
+            assert_eq!(j2.tube_name.as_ref(), "other");
             assert_eq!(j2.state, JobState::Delayed);
             assert!(next_id >= 3);
         }

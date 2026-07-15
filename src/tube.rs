@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::heap::IndexHeap;
@@ -117,7 +118,9 @@ impl TubeStats {
 
 #[derive(Debug)]
 pub struct Tube {
-    pub name: String,
+    /// Shared with every job in the tube via `Job.tube_name` — the
+    /// single allocation behind all those `Arc<str>` clones.
+    pub name: Arc<str>,
     pub ready: IndexHeap<ReadyKey>,
     pub delay: IndexHeap<DelayKey>,
     pub buried: VecDeque<u64>,
@@ -133,7 +136,7 @@ pub struct Tube {
 impl Tube {
     pub fn new(name: &str) -> Self {
         Tube {
-            name: name.to_string(),
+            name: Arc::from(name),
             ready: IndexHeap::new(),
             delay: IndexHeap::new(),
             buried: VecDeque::new(),
@@ -193,7 +196,7 @@ mod tests {
     #[test]
     fn test_tube_new() {
         let t = Tube::new("default");
-        assert_eq!(t.name, "default");
+        assert_eq!(t.name.as_ref(), "default");
         assert!(t.ready.is_empty());
         assert!(t.delay.is_empty());
         assert!(t.buried.is_empty());

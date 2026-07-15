@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -163,7 +164,11 @@ pub struct Job {
     pub ttr: Duration,
     pub body: BodyRef,
     pub state: JobState,
-    pub tube_name: String,
+    /// Shared with the owning `Tube` (and every sibling job): one
+    /// allocation per tube name, not per job. Clones are a refcount
+    /// bump. Derefs to `&str`, so reads look like the `String` it
+    /// replaced.
+    pub tube_name: Arc<str>,
 
     // Future feature extension fields
     /// Rarely-used extension keys (`idp:`/`grp:`/`aft:`/`con:` put tags),
@@ -209,7 +214,7 @@ impl Job {
         delay: Duration,
         ttr: Duration,
         body: Vec<u8>,
-        tube_name: String,
+        tube_name: impl Into<Arc<str>>,
     ) -> Self {
         let now = Instant::now();
         let (state, deadline_at) = if delay.is_zero() {
@@ -225,7 +230,7 @@ impl Job {
             ttr,
             body: BodyRef::new_inline(body),
             state,
-            tube_name,
+            tube_name: tube_name.into(),
             ext: None,
             created_at: now,
             deadline_at,
@@ -343,7 +348,7 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(1),
             vec![],
-            "default".into(),
+            "default",
         )
     }
 
@@ -354,7 +359,7 @@ mod tests {
         assert_eq!(j.id, 1);
         assert_eq!(j.priority, 10);
         assert_eq!(j.state, JobState::Ready);
-        assert_eq!(j.tube_name, "default");
+        assert_eq!(j.tube_name.as_ref(), "default");
     }
 
     // Mirrors cttest_job_cmp_pris
@@ -486,7 +491,7 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(1),
             b"hello-toast".to_vec(),
-            "default".into(),
+            "default",
         );
         assert!(matches!(job.body, BodyRef::Tiny { len: 11, .. }));
         assert_eq!(job.body_size(), 11);
@@ -499,7 +504,7 @@ mod tests {
             Duration::ZERO,
             Duration::from_secs(1),
             vec![1u8; 64],
-            "default".into(),
+            "default",
         );
         assert!(matches!(big.body, BodyRef::Heap(_)));
         assert_eq!(big.body_size(), 64);
