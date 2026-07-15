@@ -177,7 +177,11 @@ impl GroupState {
 
 /// All server state, owned by the engine task.
 struct ServerState {
-    jobs: HashMap<u64, Job>,
+    // Box<Job> keeps table slots at 16 bytes: empty-slot slack and the
+    // rehash-growth spike (old + new table live simultaneously) scale
+    // with slot size, and at millions of jobs a by-value Job (208 B)
+    // made both material. Cost: one deref per lookup, one alloc per put.
+    jobs: HashMap<u64, Box<Job>>,
     tubes: HashMap<String, Tube>,
     conns: HashMap<u64, ConnState>,
     next_job_id: u64,
@@ -455,7 +459,7 @@ impl ServerState {
         projected > limit
     }
 
-    fn insert_job(&mut self, id: u64, job: Job) {
+    fn insert_job(&mut self, id: u64, job: Box<Job>) {
         self.total_job_bytes = self
             .total_job_bytes
             .saturating_add(Self::job_memory_cost(&job));
@@ -465,7 +469,7 @@ impl ServerState {
     /// Take a job out of the map for short-lived bookkeeping (the caller
     /// re-inserts it before yielding control). Does NOT drop the external
     /// body — see `delete_job` for permanent removal.
-    fn take_job(&mut self, id: u64) -> Option<Job> {
+    fn take_job(&mut self, id: u64) -> Option<Box<Job>> {
         let job = self.jobs.remove(&id)?;
         self.total_job_bytes = self
             .total_job_bytes
@@ -475,7 +479,7 @@ impl ServerState {
 
     /// Permanently remove a job and reclaim its external body if any.
     /// The single correct entry point for delete/flush/expiry paths.
-    fn delete_job(&mut self, id: u64) -> Option<Job> {
+    fn delete_job(&mut self, id: u64) -> Option<Box<Job>> {
         let job = self.take_job(id)?;
         if let (BodyRef::External(body_id), Some(bs)) = (&job.body, self.body_store.as_ref()) {
             bs.delete(*body_id);
@@ -1025,14 +1029,16 @@ impl ServerState {
             .get(&tube_name)
             .map(|t| t.name.clone())
             .unwrap_or_else(|| std::sync::Arc::from(tube_name.as_str()));
-        let mut job = Job::new(
+        // Boxed at construction so later mutations happen in place and the
+        // insert moves a pointer, not the struct.
+        let mut job = Box::new(Job::new(
             id,
             pri,
             Duration::from_secs(delay as u64),
             Duration::from_secs(ttr as u64),
             Vec::new(),
             shared_tube_name,
-        );
+        ));
         job.body = body_ref;
 
         // Set extension fields before inserting (no allocation when the
@@ -3560,7 +3566,7 @@ fn build_state(
         // in docs/wal-format.md for the full failure analysis. The
         // complementary direction (WAL FullJob with missing TOAST) is
         // handled by the recovered-missing-bodies pass above.
-        let live_body_ids = crate::job::live_external_body_ids(jobs.values());
+        let live_body_ids = crate::job::live_external_body_ids(jobs.values().map(Box::as_ref));
         let stranded_count = body_store.reclaim_stranded(&live_body_ids);
         if stranded_count > 0 {
             tracing::warn!(

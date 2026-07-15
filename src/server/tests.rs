@@ -1577,7 +1577,7 @@ fn test_delete_batch_other_conn_reserved() {
 /// Sum the live memory cost of every job and tombstone from scratch.
 /// Must match `state.total_job_bytes` at all times.
 fn recompute_total_job_bytes(state: &ServerState) -> u64 {
-    let jobs: u64 = state.jobs.values().map(ServerState::job_memory_cost).sum();
+    let jobs: u64 = state.jobs.values().map(|j| ServerState::job_memory_cost(j)).sum();
     let tombs: u64 = state
         .tubes
         .values()
