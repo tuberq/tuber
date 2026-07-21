@@ -3210,6 +3210,177 @@ async fn test_touch_ready_job() {
     c.ckresp("NOT_FOUND\r\n").await;
 }
 
+// --- touch-all ---
+
+#[tokio::test]
+async fn test_touch_all_no_reserved_jobs() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("touch-all\r\n").await;
+    c.ckresp("TOUCHED_ALL 0\r\n").await;
+}
+
+#[tokio::test]
+async fn test_touch_all_touches_whole_batch() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    for i in 0..5u32 {
+        c.put_job(0, 0, 60, &format!("j{i}")).await;
+    }
+    c.mustsend("reserve-batch 5\r\n").await;
+    assert_eq!(c.read_reserve_batch().await.len(), 5);
+
+    c.mustsend("touch-all\r\n").await;
+    c.ckresp("TOUCHED_ALL 5\r\n").await;
+}
+
+/// The property that makes touch-all safe: jobs the worker has already
+/// returned are gone from its reserved set, so they can't be re-extended.
+#[tokio::test]
+async fn test_touch_all_skips_returned_jobs() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    for i in 0..4u32 {
+        c.put_job(0, 0, 60, &format!("j{i}")).await;
+    }
+    c.mustsend("reserve-batch 4\r\n").await;
+    let jobs = c.read_reserve_batch().await;
+    assert_eq!(jobs.len(), 4);
+
+    // Return three jobs by three different routes; each should leave the set.
+    c.mustsend(&format!("delete {}\r\n", jobs[0].0)).await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend(&format!("release {} 0 0\r\n", jobs[1].0)).await;
+    c.ckresp("RELEASED\r\n").await;
+    c.mustsend(&format!("bury {} 0\r\n", jobs[2].0)).await;
+    c.ckresp("BURIED\r\n").await;
+
+    c.mustsend("touch-all\r\n").await;
+    c.ckresp("TOUCHED_ALL 1\r\n").await;
+}
+
+#[tokio::test]
+async fn test_touch_all_only_own_jobs() {
+    let srv = TestServer::start().await;
+    let mut c1 = srv.connect().await;
+    let mut c2 = srv.connect().await;
+
+    c1.put_and_reserve(0, 0, 60, "a").await;
+    c1.put_and_reserve(0, 0, 60, "b").await;
+    c2.put_and_reserve(0, 0, 60, "c").await;
+
+    c2.mustsend("touch-all\r\n").await;
+    c2.ckresp("TOUCHED_ALL 1\r\n").await;
+    c1.mustsend("touch-all\r\n").await;
+    c1.ckresp("TOUCHED_ALL 2\r\n").await;
+}
+
+/// touch-all must actually move the deadline, not just count jobs. ttr is 1s
+/// (the floor — `put ... 0` is clamped to 1), so without the heartbeat at
+/// 700ms the job would have expired by 1400ms and `touch` would 404.
+#[tokio::test]
+async fn test_touch_all_prevents_ttr_expiry() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let id = c.put_and_reserve(0, 0, 1, "keepalive").await;
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    c.mustsend("touch-all\r\n").await;
+    c.ckresp("TOUCHED_ALL 1\r\n").await;
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    c.mustsend(&format!("touch {}\r\n", id)).await;
+    c.ckresp("TOUCHED\r\n").await;
+}
+
+/// Control for the test above: same timings, no heartbeat.
+#[tokio::test]
+async fn test_reserved_job_expires_without_touch_all() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let id = c.put_and_reserve(0, 0, 1, "expires").await;
+
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    c.mustsend(&format!("touch {}\r\n", id)).await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+/// Regression test for the per-connection `min_deadline` bound. A connection
+/// already holding a long-TTR job has a bound far in the future; reserving a
+/// short-TTR job must lower it, or `tick` would skip this connection for the
+/// full 60s and the short job would never expire.
+#[tokio::test]
+async fn test_short_ttr_job_expires_behind_long_ttr_job() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let long = c.put_and_reserve(0, 0, 60, "long").await;
+    // Let a tick (100ms) establish the bound from the long job alone —
+    // otherwise both reserves land before the first tick and the bound is
+    // computed over both, masking a missing update in do_reserve_inner.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let short = c.put_and_reserve(0, 0, 1, "short").await;
+
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    // The short job must have timed out and returned to the queue...
+    c.mustsend(&format!("touch {}\r\n", short)).await;
+    c.ckresp("NOT_FOUND\r\n").await;
+    // ...while the long one is untouched.
+    c.mustsend(&format!("touch {}\r\n", long)).await;
+    c.ckresp("TOUCHED\r\n").await;
+}
+
+/// Expiry must still fire after a touch-all has pushed the bound forward.
+#[tokio::test]
+async fn test_expiry_still_fires_after_touch_all() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let id = c.put_and_reserve(0, 0, 1, "j").await;
+
+    c.mustsend("touch-all\r\n").await;
+    c.ckresp("TOUCHED_ALL 1\r\n").await;
+
+    // Heartbeat extended it by 1s; stop heartbeating and it must still expire.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    c.mustsend(&format!("touch {}\r\n", id)).await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+/// A job returned by the worker leaves the reserved set without invalidating
+/// the cached bound (removal can only raise the true minimum). The remaining
+/// jobs must still expire on schedule.
+#[tokio::test]
+async fn test_expiry_correct_after_partial_return() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    let keep = c.put_and_reserve(0, 0, 1, "keep").await;
+    let drop_id = c.put_and_reserve(0, 0, 60, "drop").await;
+
+    c.mustsend(&format!("delete {}\r\n", drop_id)).await;
+    c.ckresp("DELETED\r\n").await;
+
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    c.mustsend(&format!("touch {}\r\n", keep)).await;
+    c.ckresp("NOT_FOUND\r\n").await;
+}
+
+#[tokio::test]
+async fn test_touch_all_rejects_arguments() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("touch-all 1\r\n").await;
+    c.ckresp("UNKNOWN_COMMAND\r\n").await;
+}
+
 // --- bury ---
 
 #[tokio::test]

@@ -650,6 +650,23 @@ impl ServerState {
         }
     }
 
+    /// Drop `job_id` from `conn_id`'s reserved set. The single choke point for
+    /// a job leaving a connection — delete, release, bury, TTR timeout and
+    /// flush-tube all route through here so per-connection reserved-set
+    /// bookkeeping can't drift from the six call sites that used to hand-roll
+    /// it. Connection teardown is the one exception: it drops the whole
+    /// ConnState, so there is no surviving state to maintain.
+    ///
+    /// Order is not preserved (swap_remove); nothing depends on it —
+    /// peek-reserved scans `self.jobs` by id rather than this list.
+    fn unreserve(&mut self, conn_id: u64, job_id: u64) {
+        if let Some(conn) = self.conns.get_mut(&conn_id)
+            && let Some(pos) = conn.reserved_jobs.iter().position(|&jid| jid == job_id)
+        {
+            conn.reserved_jobs.swap_remove(pos);
+        }
+    }
+
     /// Find the best unblocked ready job from a tube. The slow-path walk is
     /// capped at FIND_UNBLOCKED_MAX_VISITS so a heavily con-key-blocked heap
     /// doesn't melt CPU; a real unblocked job deeper than the cap is picked
@@ -765,6 +782,13 @@ impl ServerState {
             Command::Touch { id } => {
                 self.stats.op_ct[OP_TOUCH] += 1;
                 self.cmd_touch(conn_id, id)
+            }
+            Command::TouchAll => {
+                let resp = self.cmd_touch_all(conn_id);
+                if let Response::TouchedAll(n) = resp {
+                    self.stats.op_ct[OP_TOUCH] += n as u64;
+                }
+                resp
             }
             Command::Watch { tube, weight } => {
                 self.stats.op_ct[OP_WATCH] += 1;
@@ -1400,7 +1424,7 @@ impl ServerState {
     /// reservable.
     fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64, body: Vec<u8>) -> Response {
         let now = Instant::now();
-        let (tube_name, created_at) = match self.jobs.get_mut(&job_id) {
+        let (tube_name, created_at, ttr) = match self.jobs.get_mut(&job_id) {
             Some(job) => {
                 let tube_name = job.tube_name.clone();
                 let created_at = job.created_at;
@@ -1409,7 +1433,7 @@ impl ServerState {
                 job.reserved_at = Some(now);
                 job.deadline_at = Some(now + job.ttr);
                 job.reserve_ct += 1;
-                (tube_name, created_at)
+                (tube_name, created_at, job.ttr)
             }
             None => return Response::NotFound,
         };
@@ -1442,6 +1466,11 @@ impl ServerState {
 
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.reserved_jobs.push(job_id);
+            // The only event that can lower the connection's minimum deadline.
+            // Left as None if already unknown — a bound we can't justify is
+            // worse than no bound. See ConnState::min_deadline.
+            let deadline = now + ttr;
+            conn.min_deadline = conn.min_deadline.map(|m| m.min(deadline));
         }
 
         Response::Reserved { id: job_id, body }
@@ -1513,11 +1542,7 @@ impl ServerState {
                 if has_concurrency_key {
                     self.release_concurrency_key(id);
                 }
-                if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    if let Some(pos) = conn.reserved_jobs.iter().position(|&jid| jid == id) {
-                        conn.reserved_jobs.swap_remove(pos);
-                    }
-                }
+                self.unreserve(conn_id, id);
                 self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -1725,11 +1750,8 @@ impl ServerState {
         // Remove reserved jobs from owning connections and release concurrency keys
         for &id in &reserved_ids {
             self.release_concurrency_key(id);
-            if let Some(job) = self.jobs.get(&id)
-                && let Some(reserver_id) = job.reserver_id
-                && let Some(conn) = self.conns.get_mut(&reserver_id)
-            {
-                conn.reserved_jobs.retain(|&jid| jid != id);
+            if let Some(reserver_id) = self.jobs.get(&id).and_then(|j| j.reserver_id) {
+                self.unreserve(reserver_id, id);
             }
         }
 
@@ -1929,9 +1951,7 @@ impl ServerState {
 
         // Remove from reserved
         self.release_concurrency_key(id);
-        if let Some(conn) = self.conns.get_mut(&conn_id) {
-            conn.reserved_jobs.retain(|&jid| jid != id);
-        }
+        self.unreserve(conn_id, id);
         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
         if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -2010,9 +2030,7 @@ impl ServerState {
 
         // Remove from reserved
         self.release_concurrency_key(id);
-        if let Some(conn) = self.conns.get_mut(&conn_id) {
-            conn.reserved_jobs.retain(|&jid| jid != id);
-        }
+        self.unreserve(conn_id, id);
         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
         if let Some(tube) = self.tubes.get_mut(&*tube_name) {
             tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -2073,6 +2091,40 @@ impl ServerState {
 
         job.deadline_at = Some(Instant::now() + job.ttr);
         Response::Touched
+    }
+
+    /// Heartbeat every job this connection holds. `reserved_jobs` is
+    /// maintained by `do_reserve_inner`/`unreserve`, so a job the worker has
+    /// already deleted, released, buried or lost to TTR is simply not in the
+    /// list — there are no stale ids to reject and no ownership check to make.
+    ///
+    /// Each job keeps its own ttr; this extends every deadline individually,
+    /// it does not level them onto a common value.
+    fn cmd_touch_all(&mut self, conn_id: u64) -> Response {
+        let now = Instant::now();
+        let job_ids = match self.conns.get(&conn_id) {
+            Some(conn) => conn.reserved_jobs.clone(),
+            None => return Response::TouchedAll(0),
+        };
+        let mut touched = 0u32;
+        let mut min_deadline: Option<Instant> = None;
+        for id in job_ids {
+            if let Some(job) = self.jobs.get_mut(&id)
+                && job.state == JobState::Reserved
+                && job.reserver_id == Some(conn_id)
+            {
+                let deadline = now + job.ttr;
+                job.deadline_at = Some(deadline);
+                touched += 1;
+                min_deadline = Some(min_deadline.map_or(deadline, |m: Instant| m.min(deadline)));
+            }
+        }
+        // We just walked the whole set, so the exact minimum is free — refresh
+        // the bound rather than leaving it stale-low.
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.min_deadline = min_deadline;
+        }
+        Response::TouchedAll(touched)
     }
 
     fn cmd_watch(&mut self, conn_id: u64, tube: &str, weight: u32) -> Response {
@@ -2903,6 +2955,16 @@ impl ServerState {
             return false;
         }
         let margin = Duration::from_secs(1);
+        // Fast path: the bound is a lower bound on every held deadline, so if
+        // it is beyond the margin then nothing is near expiry and the walk can
+        // be skipped entirely. The converse doesn't hold — a stale-low bound
+        // still needs the scan to confirm — so this only short-circuits the
+        // negative answer, which is the common one.
+        if let Some(m) = conn.min_deadline
+            && m > now + margin
+        {
+            return false;
+        }
         for &job_id in &conn.reserved_jobs {
             if let Some(job) = self.jobs.get(&job_id)
                 && let Some(deadline) = job.deadline_at

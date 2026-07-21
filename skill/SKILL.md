@@ -199,6 +199,14 @@ echo -e "reserve-batch 5\r\n" | nc localhost 11300
 # timeout, or DEADLINE_SOON if one of your reserved jobs is about to hit its TTR.
 echo -e "reserve-batch 5 30\r\n" | nc localhost 11300
 echo -e "delete-batch 1 2 3 4 5\r\n" | nc localhost 11300
+
+# Heartbeat every job this connection holds (the reserve-batch keep-alive).
+# reserve-batch starts the TTR clock on all N jobs at once but you process them
+# serially, so long batches need this or the tail expires. Takes no ids --
+# jobs you already deleted/released/buried aren't in your reserved set.
+# Returns TOUCHED_ALL <n>; n lower than you expect means jobs timed out and
+# went back to the queue.
+echo -e "touch-all\r\n" | nc localhost 11300
 ```
 
 ## Tips

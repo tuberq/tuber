@@ -195,6 +195,21 @@ impl TuberClient {
         self.read_line().await
     }
 
+    /// Extend the TTR of every job this connection holds. Returns the count
+    /// that were still held. Cheaper than one `touch` per job for a worker
+    /// draining a `reserve-batch` window, and needs no id bookkeeping.
+    pub async fn touch_all(&mut self) -> io::Result<u32> {
+        self.send_line("touch-all").await?;
+        let line = self.read_line().await?;
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() != 2 || parts[0] != "TOUCHED_ALL" {
+            return Err(io::Error::other(line));
+        }
+        parts[1]
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
     pub async fn stats_job(&mut self, id: u64) -> io::Result<String> {
         self.send_line(&format!("stats-job {id}")).await?;
         self.read_ok_body().await

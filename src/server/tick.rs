@@ -73,33 +73,47 @@ impl ServerState {
             }
         }
 
-        // Expire reserved jobs past TTR
+        // Expire reserved jobs past TTR. Connections whose cached lower-bound
+        // deadline is still in the future are skipped on one comparison — this
+        // loop is otherwise O(total reserved jobs) of scattered hash lookups
+        // every tick, which `reserve-batch` made the dominant cost.
         let conn_ids: Vec<u64> = self.conns.keys().cloned().collect();
         for conn_id in conn_ids {
-            let expired_jobs: Vec<u64> = {
+            let (expired_jobs, scanned_min): (Vec<u64>, Option<Instant>) = {
                 let conn = match self.conns.get(&conn_id) {
                     Some(c) => c,
                     None => continue,
                 };
-                conn.reserved_jobs
-                    .iter()
-                    .filter(|&&jid| {
-                        self.jobs
-                            .get(&jid)
-                            .and_then(|j| j.deadline_at)
-                            .map(|d| now >= d)
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect()
+                if let Some(m) = conn.min_deadline
+                    && now < m
+                {
+                    continue;
+                }
+                let mut expired = Vec::new();
+                let mut min: Option<Instant> = None;
+                for &jid in &conn.reserved_jobs {
+                    let Some(deadline) = self.jobs.get(&jid).and_then(|j| j.deadline_at) else {
+                        continue;
+                    };
+                    if now >= deadline {
+                        expired.push(jid);
+                    } else {
+                        min = Some(min.map_or(deadline, |m: Instant| m.min(deadline)));
+                    }
+                }
+                (expired, min)
             };
+
+            // We walked the set, so re-establish the exact bound over whatever
+            // survives. Expired jobs are excluded — they leave the set below.
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.min_deadline = scanned_min;
+            }
 
             for job_id in expired_jobs {
                 // Remove from connection's reserved list
                 self.release_concurrency_key(job_id);
-                if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    conn.reserved_jobs.retain(|&jid| jid != job_id);
-                }
+                self.unreserve(conn_id, job_id);
                 self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                 self.stats.timeout_ct += 1;
 

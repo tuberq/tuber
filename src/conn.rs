@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 /// Connection type bitmask flags.
 pub const CONN_TYPE_PRODUCER: u8 = 1;
 pub const CONN_TYPE_WORKER: u8 = 2;
@@ -29,6 +31,21 @@ pub struct ConnState {
     pub reserve_mode: ReserveMode,
     pub conn_type: u8,
     pub reserved_jobs: Vec<u64>,
+    /// Cached *lower bound* on the deadline of every job in `reserved_jobs`.
+    ///
+    /// Invariant: `Some(m)` implies `m <= job.deadline_at` for all held jobs.
+    /// `None` means "unknown". It is deliberately a bound and not an exact
+    /// minimum, which is what makes it cheap to maintain: the only event that
+    /// can lower a held job's deadline is reserving a *new* job, so that is the
+    /// single site obliged to update it (`do_reserve_inner`). Removing a job or
+    /// touching one can only raise the true minimum, leaving the bound merely
+    /// stale-low — which costs an unnecessary scan, never a missed expiry, and
+    /// self-heals the next time `tick` rescans.
+    ///
+    /// Lets `tick` skip an idle connection and `conn_deadline_soon` answer in
+    /// O(1) instead of walking every reserved job; both were O(n) per call,
+    /// which `reserve-batch` turned from trivial into the dominant cost.
+    pub min_deadline: Option<Instant>,
 }
 
 impl ConnState {
@@ -43,6 +60,7 @@ impl ConnState {
             reserve_mode: ReserveMode::Fifo,
             conn_type: 0,
             reserved_jobs: Vec::new(),
+            min_deadline: None,
         }
     }
 

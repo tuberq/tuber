@@ -41,6 +41,11 @@ pub enum Command {
     Touch {
         id: u64,
     },
+    /// Extend the TTR deadline of every job this connection currently holds.
+    /// Takes no id list: the engine already tracks the reserved set per
+    /// connection, and a batch worker's reserved set is exactly what it wants
+    /// to heartbeat. See `ServerState::cmd_touch_all`.
+    TouchAll,
     Watch {
         tube: String,
         weight: u32,
@@ -114,6 +119,11 @@ pub enum Response {
     Deleted,
     Released,
     Touched,
+    /// Reply to `touch-all`: how many held jobs had their deadline extended.
+    /// A distinct verb from `TOUCHED` rather than `TOUCHED <n>` so a pipelining
+    /// client can frame the response stream without lookahead — same reason
+    /// `delete-batch` answers `DELETED_BATCH` and not `DELETED <n>`.
+    TouchedAll(u32),
     Kicked(u32),
     KickedOne,
     Found { id: u64, body: Vec<u8> },
@@ -157,6 +167,7 @@ impl Response {
             Response::Deleted => buf.extend_from_slice(b"DELETED\r\n"),
             Response::Released => buf.extend_from_slice(b"RELEASED\r\n"),
             Response::Touched => buf.extend_from_slice(b"TOUCHED\r\n"),
+            Response::TouchedAll(n) => { let _ = write!(buf, "TOUCHED_ALL {n}\r\n"); }
             Response::Kicked(n) => { let _ = write!(buf, "KICKED {n}\r\n"); }
             Response::KickedOne => buf.extend_from_slice(b"KICKED\r\n"),
             Response::Found { id, body } => {
@@ -266,6 +277,8 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_uint(rest).map(|id| Command::KickJob { id })
     } else if let Some(rest) = line.strip_prefix("kick ") {
         parse_uint(rest).map(|bound| Command::Kick { bound })
+    } else if line == "touch-all" {
+        Ok(Command::TouchAll)
     } else if let Some(rest) = line.strip_prefix("touch ") {
         parse_uint(rest).map(|id| Command::Touch { id })
     } else if let Some(rest) = line.strip_prefix("stats-job ") {
@@ -755,6 +768,20 @@ mod tests {
             parse_command("touch 123").unwrap(),
             Command::Touch { id: 123 }
         );
+    }
+
+    #[test]
+    fn test_parse_touch_all() {
+        assert_eq!(parse_command("touch-all").unwrap(), Command::TouchAll);
+        // Takes no arguments, and must not be swallowed by the `touch ` arm.
+        assert!(parse_command("touch-all 1").is_err());
+        assert!(parse_command("touch-all extra").is_err());
+    }
+
+    #[test]
+    fn test_touched_all_response_encoding() {
+        assert_eq!(Response::TouchedAll(0).serialize(), b"TOUCHED_ALL 0\r\n");
+        assert_eq!(Response::TouchedAll(42).serialize(), b"TOUCHED_ALL 42\r\n");
     }
 
     #[test]
