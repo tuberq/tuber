@@ -1,5 +1,31 @@
 # Changes
 
+## v0.12.0
+
+**`touch-all`** — a one-command heartbeat for the jobs a connection holds, and the missing middle of the batch lifecycle. `reserve-batch` and `delete-batch` already existed; keeping a batch alive was still one `touch` per job.
+
+The need is structural rather than cosmetic. `reserve-batch` starts the TTR clock on all N jobs at the same instant, but a worker processes them serially — so the tail of a large batch expires and silently returns to the queue unless the worker heartbeats. That was N round-trips for something the server can answer in one.
+
+```
+touch-all
+TOUCHED_ALL 600
+```
+
+It takes no id list, because it doesn't need one. The engine already tracks the reserved set per connection, and every exit path — `delete`, `release`, `bury`, TTR timeout, `flush-tube`, disconnect — removes the job from it. A job the worker has already returned is simply absent, so there are no stale ids to reject, no ownership check, and no partial-failure reply to design. Each job keeps its own ttr: deadlines are extended individually, never levelled onto a common value.
+
+The count is the useful part. A worker knows how many jobs it thinks it holds; `TOUCHED_ALL <n>` tells it how many it *actually* holds. A drop means jobs hit their TTR and went back to the queue while it was working — possibly already running elsewhere — which is otherwise invisible, since nothing pushes a "you lost job X" notification. A batch worker heartbeating `600 … 600 … 598` has just learned its TTR is too tight, for free.
+
+`TOUCHED_ALL` is a distinct verb rather than an overloaded `TOUCHED <n>`, so a pipelining client can frame the response stream without lookahead — matching `RESERVED_BATCH` and `DELETED_BATCH`.
+
+**TTR bookkeeping is now O(1) per connection.** Two scans that were trivial when a connection held one job became the dominant cost once `reserve-batch` let it hold a thousand:
+
+- `tick` walked every reserved job of every connection, as scattered hash lookups, every 100 ms.
+- `conn_deadline_soon` walked every reserved job on *every* reserve.
+
+Both are now a single comparison against a cached per-connection minimum deadline. Unlike the ready and delay queues this needs no heap: the cache is deliberately a *lower bound* rather than an exact minimum, which is what makes it cheap to maintain. The only event that can lower a held job's deadline is reserving a new job, so that is the single site obliged to update it. Removing a job or touching one can only raise the true minimum, leaving the bound merely stale-low — costing an unnecessary scan, never a missed expiry — and it self-heals the next time `tick` rescans.
+
+No WAL or on-disk format change; `touch` is in-memory and journals nothing. Existing clients are unaffected.
+
 ## v0.11.1
 
 **Live memory stats.** `stats` gains five fields reporting real allocator memory, so you can watch actual footprint instead of inferring it. The two memory numbers that already existed are both misleading for this: `rusage-maxrss` is a peak high-water mark that never falls, and `current-jobs-size` is a backpressure estimate (`512 B/job + body`) that can't reflect the real struct footprint — deleting a million jobs moves neither in a way that tracks RSS.
