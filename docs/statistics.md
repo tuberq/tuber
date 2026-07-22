@@ -35,11 +35,15 @@ Each is the cumulative count since server start:
 
 `cmd-put`, `cmd-reserve`, `cmd-reserve-with-timeout`, `cmd-reserve-mode`,
 `cmd-delete`, `cmd-release`, `cmd-bury`, `cmd-kick`, `cmd-touch`,
-`cmd-use`, `cmd-watch`, `cmd-ignore`,
+`cmd-touch-all`, `cmd-use`, `cmd-watch`, `cmd-ignore`,
 `cmd-stats`, `cmd-stats-job`, `cmd-stats-tube`,
 `cmd-peek`, `cmd-peek-ready`, `cmd-peek-delayed`, `cmd-peek-buried`,
 `cmd-list-tubes`, `cmd-list-tube-used`, `cmd-list-tubes-watched`,
 `cmd-pause-tube`.
+
+Each counts commands received, not jobs affected: one `touch-all` heartbeat
+adds 1 to `cmd-touch-all` whether it extended 1000 jobs or none, and never
+touches `cmd-touch`.
 
 ### Server info
 

@@ -3278,34 +3278,38 @@ async fn test_touch_all_only_own_jobs() {
     c1.ckresp("TOUCHED_ALL 2\r\n").await;
 }
 
-/// touch-all must actually move the deadline, not just count jobs. ttr is 1s
-/// (the floor — `put ... 0` is clamped to 1), so without the heartbeat at
-/// 700ms the job would have expired by 1400ms and `touch` would 404.
+/// touch-all must actually move the deadline, not just count jobs. ttr is 3s,
+/// so without the heartbeat at 1s the job would have expired by 3.5s and the
+/// final `touch` would 404 — see the paired control test below.
 #[tokio::test]
 async fn test_touch_all_prevents_ttr_expiry() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    let id = c.put_and_reserve(0, 0, 1, "keepalive").await;
+    let id = c.put_and_reserve(0, 0, 3, "keepalive").await;
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // 3s ttr heartbeated at 1s: ~2s of slack for process startup, the 100ms
+    // tick granularity and the round trip. A tighter margin (1s ttr touched at
+    // 700ms) turns a loaded CI box into a spurious TOUCHED_ALL 0 / NOT_FOUND.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     c.mustsend("touch-all\r\n").await;
     c.ckresp("TOUCHED_ALL 1\r\n").await;
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // 3.5s after the reserve, so only the heartbeat can be keeping it alive.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     c.mustsend(&format!("touch {}\r\n", id)).await;
     c.ckresp("TOUCHED\r\n").await;
 }
 
-/// Control for the test above: same timings, no heartbeat.
+/// Control for the test above: same ttr and total elapsed, no heartbeat.
 #[tokio::test]
 async fn test_reserved_job_expires_without_touch_all() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    let id = c.put_and_reserve(0, 0, 1, "expires").await;
+    let id = c.put_and_reserve(0, 0, 3, "expires").await;
 
-    tokio::time::sleep(Duration::from_millis(1400)).await;
+    tokio::time::sleep(Duration::from_millis(3500)).await;
     c.mustsend(&format!("touch {}\r\n", id)).await;
     c.ckresp("NOT_FOUND\r\n").await;
 }
@@ -6224,4 +6228,37 @@ async fn test_urgent_ct_stable_on_reserved_reput_upgrade() {
         body.contains("current-jobs-urgent: 0"),
         "reserved job must not be counted urgent, got:\n{body}"
     );
+}
+
+// --- TuberClient::touch_all (library client, not raw protocol) ---
+
+/// The `touch_all` client method parses `TOUCHED_ALL <n>` into a count. Covered
+/// here rather than via `cmd_work`, whose worker holds exactly one job at a time
+/// and is correctly served by `touch <id>` (which can report a *lost*
+/// reservation; `touch-all` would just return 0).
+#[tokio::test]
+async fn test_client_touch_all_returns_held_count() {
+    use tuber::client::TuberClient;
+
+    let srv = TestServer::start().await;
+    let addr = format!("127.0.0.1:{}", srv.port);
+    let mut client = TuberClient::connect(&addr).await.unwrap();
+
+    // Nothing held yet.
+    assert_eq!(client.touch_all().await.unwrap(), 0);
+
+    for _ in 0..3 {
+        client
+            .put(0, 0, 60, b"j", None, None, None, None)
+            .await
+            .unwrap();
+    }
+    let batch = client.reserve_batch(3).await.unwrap();
+    assert_eq!(batch.len(), 3);
+
+    assert_eq!(client.touch_all().await.unwrap(), 3);
+
+    // Returning one job drops it out of the heartbeat set.
+    client.delete(batch[0].0).await.unwrap();
+    assert_eq!(client.touch_all().await.unwrap(), 2);
 }

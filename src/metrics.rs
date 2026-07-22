@@ -412,6 +412,7 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         "cmd-bury",
         "cmd-kick",
         "cmd-touch",
+        "cmd-touch-all",
         "cmd-use",
         "cmd-watch",
         "cmd-ignore",

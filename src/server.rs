@@ -84,6 +84,7 @@ const OP_TOUCH: usize = 21;
 const OP_PAUSE_TUBE: usize = 23;
 const OP_RESERVE_MODE: usize = 26;
 const OP_PEEK_RESERVED: usize = 27;
+const OP_TOUCH_ALL: usize = 28;
 
 /// Message from a connection task to the engine.
 struct EngineMsg {
@@ -122,7 +123,7 @@ struct GlobalStats {
     total_jobs_ct: u64,
     total_delete_ct: u64,
     timeout_ct: u64,
-    op_ct: [u64; 28],
+    op_ct: [u64; 29],
     total_connections: u64,
     /// Number of times the tick-time drift detector observed a non-zero
     /// `total_job_bytes` while the live set (jobs + tombstones) was empty.
@@ -784,11 +785,12 @@ impl ServerState {
                 self.cmd_touch(conn_id, id)
             }
             Command::TouchAll => {
-                let resp = self.cmd_touch_all(conn_id);
-                if let Response::TouchedAll(n) = resp {
-                    self.stats.op_ct[OP_TOUCH] += n as u64;
-                }
-                resp
+                // Counted as one command, under its own key: `cmd-touch` means
+                // "touch commands received", and folding a 1000-job heartbeat
+                // into it would both inflate that rate and make a `touch-all`
+                // that touched nothing invisible.
+                self.stats.op_ct[OP_TOUCH_ALL] += 1;
+                self.cmd_touch_all(conn_id)
             }
             Command::Watch { tube, weight } => {
                 self.stats.op_ct[OP_WATCH] += 1;
@@ -2079,18 +2081,35 @@ impl ServerState {
         Response::Buried
     }
 
-    fn cmd_touch(&mut self, conn_id: u64, id: u64) -> Response {
-        let job = match self.jobs.get_mut(&id) {
-            Some(j) => j,
-            None => return Response::NotFound,
-        };
+    /// Extend one job's TTR deadline, if `conn_id` still holds it.
+    ///
+    /// Returns the new deadline, or `None` if the job is gone, is no longer
+    /// `Reserved`, or belongs to another connection. Single definition of "touch
+    /// a job", shared by `touch` and `touch-all` so their semantics cannot drift.
+    /// Takes the jobs map rather than `&mut self` so `cmd_touch_all` can call it
+    /// while holding a borrow of the connection.
+    fn touch_job(
+        jobs: &mut HashMap<u64, Box<Job>>,
+        conn_id: u64,
+        id: u64,
+        now: Instant,
+    ) -> Option<Instant> {
+        let job = jobs.get_mut(&id)?;
 
         if job.state != JobState::Reserved || job.reserver_id != Some(conn_id) {
-            return Response::NotFound;
+            return None;
         }
 
-        job.deadline_at = Some(Instant::now() + job.ttr);
-        Response::Touched
+        let deadline = now + job.ttr;
+        job.deadline_at = Some(deadline);
+        Some(deadline)
+    }
+
+    fn cmd_touch(&mut self, conn_id: u64, id: u64) -> Response {
+        match Self::touch_job(&mut self.jobs, conn_id, id, Instant::now()) {
+            Some(_) => Response::Touched,
+            None => Response::NotFound,
+        }
     }
 
     /// Heartbeat every job this connection holds. `reserved_jobs` is
@@ -2102,28 +2121,30 @@ impl ServerState {
     /// it does not level them onto a common value.
     fn cmd_touch_all(&mut self, conn_id: u64) -> Response {
         let now = Instant::now();
-        let job_ids = match self.conns.get(&conn_id) {
-            Some(conn) => conn.reserved_jobs.clone(),
+        let conn = match self.conns.get_mut(&conn_id) {
+            Some(conn) => conn,
             None => return Response::TouchedAll(0),
         };
         let mut touched = 0u32;
         let mut min_deadline: Option<Instant> = None;
-        for id in job_ids {
-            if let Some(job) = self.jobs.get_mut(&id)
-                && job.state == JobState::Reserved
-                && job.reserver_id == Some(conn_id)
-            {
-                let deadline = now + job.ttr;
-                job.deadline_at = Some(deadline);
+        for &id in &conn.reserved_jobs {
+            if let Some(deadline) = Self::touch_job(&mut self.jobs, conn_id, id, now) {
                 touched += 1;
                 min_deadline = Some(min_deadline.map_or(deadline, |m: Instant| m.min(deadline)));
             }
         }
-        // We just walked the whole set, so the exact minimum is free — refresh
-        // the bound rather than leaving it stale-low.
-        if let Some(conn) = self.conns.get_mut(&conn_id) {
-            conn.min_deadline = min_deadline;
-        }
+        // Only publish the bound if every held id was touched. `min_deadline`
+        // must stay a *lower* bound over all held jobs (see
+        // ConnState::min_deadline); an id that failed the touch still carries
+        // whatever deadline it has, so minimising over just the touched subset
+        // could push the bound above it and make `tick` skip this connection
+        // forever. Stale-low is free, stale-high strands a job — so fall back
+        // to "unknown" and let `tick` rescan.
+        conn.min_deadline = if touched as usize == conn.reserved_jobs.len() {
+            min_deadline
+        } else {
+            None
+        };
         Response::TouchedAll(touched)
     }
 
@@ -2781,6 +2802,7 @@ impl ServerState {
              cmd-bury: {}\n\
              cmd-kick: {}\n\
              cmd-touch: {}\n\
+             cmd-touch-all: {}\n\
              cmd-stats: {}\n\
              cmd-stats-job: {}\n\
              cmd-stats-tube: {}\n\
@@ -2858,6 +2880,7 @@ impl ServerState {
             self.stats.op_ct[OP_BURY],
             self.stats.op_ct[OP_KICK],
             self.stats.op_ct[OP_TOUCH],
+            self.stats.op_ct[OP_TOUCH_ALL],
             self.stats.op_ct[OP_STATS],
             self.stats.op_ct[OP_STATSJOB],
             self.stats.op_ct[OP_STATS_TUBE],
