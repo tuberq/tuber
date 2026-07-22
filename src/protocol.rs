@@ -439,6 +439,9 @@ fn parse_peek(rest: &str) -> Result<Command, Response> {
     parse_uint(rest).map(|id| Command::Peek { id })
 }
 
+/// Before raising, read docs/batch-limits.md — this cap bounds the worst-case
+/// in-memory response (count × max job size), a different failure mode than
+/// `MAX_DELETE_BATCH`'s.
 const MAX_RESERVE_BATCH: u32 = 1000;
 
 fn parse_reserve_batch(rest: &str) -> Result<Command, Response> {
@@ -461,6 +464,9 @@ fn parse_reserve_batch(rest: &str) -> Result<Command, Response> {
     Ok(Command::ReserveBatch { count, timeout })
 }
 
+/// Before raising, read docs/batch-limits.md — this cap bounds engine-loop
+/// time per command (fsync policy dependent) and sizes `MAX_LINE_LEN` in
+/// server.rs.
 pub const MAX_DELETE_BATCH: usize = 1000;
 
 fn parse_delete_batch(rest: &str) -> Result<Command, Response> {

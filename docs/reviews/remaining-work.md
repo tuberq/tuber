@@ -119,11 +119,12 @@ Line numbers below are approximate — re-grep before editing.
 
 ## Docs / housekeeping
 
-- CLAUDE.md says "WAL version: 5" but code writes v6 (`src/wal.rs:31`).
+- ~~CLAUDE.md says "WAL version: 5" but code writes v6~~ — fixed; CLAUDE.md
+  and `src/wal.rs` both say v7 now. Keep them in sync when the version bumps.
 - Test-coverage gaps worth closing: kill-9 test around WAL compaction+GC,
   TTR expiry waking a blocked reserve on another connection, end-to-end
   background TOAST compaction (live ratio < 0.5 → compacts → survives
   restart), CLI layer (`client.rs`, `cmd_*.rs`) has zero tests.
-- Untracked files in the repo predating this work: `autoresearch-throughput.md`,
-  `docs/batch-limits.md`, `docs/reviews/`, `review_options.md` — decide
-  whether to commit or ignore.
+- Untracked files predating this work: `autoresearch-throughput.md` and
+  `review_options.md` — decide whether to commit or ignore.
+  (`docs/batch-limits.md` and `docs/reviews/` have since been committed.)

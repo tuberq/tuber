@@ -5,7 +5,7 @@ Four independent reviews of the `feature/body-wal-split` branch:
 - **[C]** `claude.md` — Claude Opus 4.7 (1M context)
 - **[D]** `dsv4.md` — DeepSeek v4
 - **[G]** `glm.md` — GLM-5.1
-- **[K]** `kk.md` — fourth reviewer (Codex/other)
+- **[K]** `kimi.md` — Kimi (OpenCode)
 
 All four agree the implementation is faithful to the design doc, well-commented, and ready to merge after addressing the items below. Tests pass (432/0/1). The bugs are small; the operational and observability gaps are the bigger story.
 

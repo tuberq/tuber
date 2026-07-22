@@ -785,10 +785,7 @@ impl ServerState {
                 self.cmd_touch(conn_id, id)
             }
             Command::TouchAll => {
-                // Counted as one command, under its own key: `cmd-touch` means
-                // "touch commands received", and folding a 1000-job heartbeat
-                // into it would both inflate that rate and make a `touch-all`
-                // that touched nothing invisible.
+                // One command = one count, never per-job; see docs/statistics.md.
                 self.stats.op_ct[OP_TOUCH_ALL] += 1;
                 self.cmd_touch_all(conn_id)
             }
@@ -2115,7 +2112,8 @@ impl ServerState {
     /// Heartbeat every job this connection holds. `reserved_jobs` is
     /// maintained by `do_reserve_inner`/`unreserve`, so a job the worker has
     /// already deleted, released, buried or lost to TTR is simply not in the
-    /// list — there are no stale ids to reject and no ownership check to make.
+    /// list — every id should pass `touch_job`'s ownership check, and a miss
+    /// means bookkeeping drift (handled by the `min_deadline` fallback below).
     ///
     /// Each job keeps its own ttr; this extends every deadline individually,
     /// it does not level them onto a common value.
