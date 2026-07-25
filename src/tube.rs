@@ -244,9 +244,7 @@ mod tests {
     // Adapted from cttest_ms_append -- tests watch set add
     #[test]
     fn test_watch_set_add() {
-        let mut watch: Vec<String> = Vec::new();
-        watch.push("tube1".into());
-        watch.push("tube2".into());
+        let watch: Vec<String> = vec!["tube1".into(), "tube2".into()];
         assert_eq!(watch.len(), 2);
         assert!(watch.contains(&"tube1".to_string()));
         assert!(watch.contains(&"tube2".to_string()));
@@ -268,8 +266,7 @@ mod tests {
     // Adapted from cttest_ms_contains
     #[test]
     fn test_watch_set_contains() {
-        let mut watch: Vec<String> = Vec::new();
-        watch.push("tube1".into());
+        let watch: Vec<String> = vec!["tube1".into()];
         assert!(watch.contains(&"tube1".to_string()));
         assert!(!watch.contains(&"tube2".to_string()));
     }

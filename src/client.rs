@@ -61,6 +61,10 @@ impl TuberClient {
         self.read_line().await
     }
 
+    // One parameter per field of the wire command: `put <pri> <delay> <ttr>
+    // <bytes>` plus the four optional tuber tags. Grouping them would only
+    // move the same list behind a struct the protocol doesn't have.
+    #[allow(clippy::too_many_arguments)]
     pub async fn put(
         &mut self,
         pri: u32,

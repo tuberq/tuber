@@ -21,17 +21,17 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 /// - v3: original format.
 /// - v4: state-change records gained a `reason` byte.
 /// - v5: `FullJob` records carry a `BodyId` instead of inline body bytes.
-///       Bodies live in the external body store ("TOAST").
+///   Bodies live in the external body store ("TOAST").
 /// - v6: `FullJob` body field is a per-record `body_kind` discriminant
-///       followed by either inline bytes (kind=0) or a `BodyId` (kind=1).
-///       Small bodies stay inline in the WAL record; only larger ones
-///       are pushed to the body store. The discriminant decouples the
-///       on-disk format from the runtime threshold choice — changing
-///       `HEAP_INLINE_MAX` doesn't require a format bump.
+///   followed by either inline bytes (kind=0) or a `BodyId` (kind=1).
+///   Small bodies stay inline in the WAL record; only larger ones
+///   are pushed to the body store. The discriminant decouples the
+///   on-disk format from the runtime threshold choice — changing
+///   `HEAP_INLINE_MAX` doesn't require a format bump.
 /// - v7: state-change records gained a `change_epoch_secs` (wall-clock
-///       second the change was applied). A release/kick-to-delayed job
-///       replays with its remaining delay instead of resetting to the
-///       full delay on every restart. Pre-v7 records replay full-delay.
+///   second the change was applied). A release/kick-to-delayed job
+///   replays with its remaining delay instead of resetting to the
+///   full delay on every restart. Pre-v7 records replay full-delay.
 pub const WAL_VERSION: u32 = 7;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 
@@ -1565,11 +1565,10 @@ impl Wal {
                                 ce
                             );
                         }
-                        if let Ok(f) = OpenOptions::new().write(true).open(path) {
-                            if let Err(te) = f.set_len(offset as u64) {
+                        if let Ok(f) = OpenOptions::new().write(true).open(path)
+                            && let Err(te) = f.set_len(offset as u64) {
                                 tracing::warn!("WAL: failed to truncate {:?}: {}", path, te);
                             }
-                        }
                         break;
                     }
                 }
@@ -2130,7 +2129,7 @@ mod tests {
     #[test]
     fn test_truncated_header() {
         assert!(matches!(
-            read_header(&[b'T', b'W']),
+            read_header(b"TW"),
             Err(WalError::Truncated)
         ));
     }

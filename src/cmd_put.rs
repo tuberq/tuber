@@ -2,6 +2,8 @@ use crate::client::TuberClient;
 use std::io;
 use tokio::io::AsyncBufReadExt;
 
+// One parameter per CLI flag of `tuber put`; clap already owns the grouping.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     addr: &str,
     tube: &str,

@@ -169,7 +169,7 @@ pub(crate) fn fd_soft_limit() -> Option<u64> {
     };
     // SAFETY: getrlimit fills `lim`; RLIMIT_NOFILE is always a valid resource.
     let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
-    (rc == 0).then_some(u64::from(lim.rlim_cur))
+    (rc == 0).then_some(lim.rlim_cur)
 }
 
 /// Emit a one-shot warning when the number of open segment files (one fd each)
@@ -1434,9 +1434,9 @@ mod tests {
         // Segment size 80 means each ~40-byte body gets its own segment.
         let bs = BodyStore::open(tmp.path(), 80).unwrap();
 
-        let _empty = bs.write_body(&vec![0xAA; 40]).unwrap(); // seg 0
-        let alive = bs.write_body(&vec![0xBB; 40]).unwrap(); // seg 1
-        let _filler = bs.write_body(&vec![0xCC; 40]).unwrap(); // seg 2 (current)
+        let _empty = bs.write_body(&[0xAA; 40]).unwrap(); // seg 0
+        let alive = bs.write_body(&[0xBB; 40]).unwrap(); // seg 1
+        let _filler = bs.write_body(&[0xCC; 40]).unwrap(); // seg 2 (current)
 
         // Delete the body in segment 0 — it goes to 0% live and qualifies.
         bs.delete(_empty);
@@ -1465,9 +1465,9 @@ mod tests {
         let bs = BodyStore::open(tmp.path(), 120).unwrap();
 
         // Fill three segments with one body each.
-        let id0 = bs.write_body(&vec![1u8; 64]).unwrap(); // seg 0
-        let id1 = bs.write_body(&vec![2u8; 64]).unwrap(); // seg 1
-        let _id2 = bs.write_body(&vec![3u8; 64]).unwrap(); // seg 2 (current)
+        let id0 = bs.write_body(&[1u8; 64]).unwrap(); // seg 0
+        let id1 = bs.write_body(&[2u8; 64]).unwrap(); // seg 1
+        let _id2 = bs.write_body(&[3u8; 64]).unwrap(); // seg 2 (current)
         assert_eq!(bs.segment_count(), 3);
 
         // Compacting segment 0 (1 live body) migrates it. With segment size 120,
@@ -1496,8 +1496,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bs = BodyStore::open(tmp.path(), 200).unwrap();
 
-        let id_a = bs.write_body(&vec![1u8; 40]).unwrap(); // seg 0
-        let _id_b = bs.write_body(&vec![2u8; 40]).unwrap(); // seg 1 (current)
+        let id_a = bs.write_body(&[1u8; 40]).unwrap(); // seg 0
+        let _id_b = bs.write_body(&[2u8; 40]).unwrap(); // seg 1 (current)
 
         // Delete `id_a` before compaction starts, then run compaction.
         // The pre-snapshot index lookup finds nothing; nothing migrates.
@@ -1531,9 +1531,9 @@ mod tests {
         // forces rotation into seg 1, which becomes the current segment.
         let bs = BodyStore::open(tmp.path(), 140).unwrap();
 
-        let id_corrupt = bs.write_body(&vec![0xAA; 40]).unwrap(); // seg 0
-        let id_healthy = bs.write_body(&vec![0xBB; 40]).unwrap(); // seg 0
-        let _id_filler = bs.write_body(&vec![0xCC; 40]).unwrap(); // seg 1 (current)
+        let id_corrupt = bs.write_body(&[0xAA; 40]).unwrap(); // seg 0
+        let id_healthy = bs.write_body(&[0xBB; 40]).unwrap(); // seg 0
+        let _id_filler = bs.write_body(&[0xCC; 40]).unwrap(); // seg 1 (current)
         bs.fsync().unwrap();
 
         // Snapshot the corrupt body's location, then flip a byte in its
