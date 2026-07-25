@@ -2444,7 +2444,26 @@ impl ServerState {
             None => return Response::NotFound,
         };
 
-        let delay_dur = Duration::from_secs(delay.max(1) as u64);
+        // `pause-tube <t> 0` is the documented unpause idiom, so a zero delay
+        // resumes the tube now rather than being floored to a whole second.
+        // beanstalkd floors zero to 1 (prot.c: "Always pause for a positive
+        // amount of time, to make sure that waiting clients wake up when the
+        // deadline arrives"), but its `delay` is already in *nanoseconds* by
+        // then — that floor is 1ns, i.e. resume now with the deadline still
+        // armed. Its purpose there is to keep the tube on the unpause sweep,
+        // which tuber doesn't need: the 100 ms tick sweeps unconditionally and
+        // `is_paused()` reads the clock live.
+        if delay == 0 {
+            tube.pause = Duration::ZERO;
+            tube.unpause_at = None;
+            tube.stat.pause_ct += 1;
+            // Waiters parked while the tube was paused are servable now; the
+            // tick would get to them, but only up to 100 ms late.
+            self.process_queue();
+            return Response::Paused;
+        }
+
+        let delay_dur = Duration::from_secs(delay as u64);
         tube.pause = delay_dur;
         tube.unpause_at = Some(Instant::now() + delay_dur);
         tube.stat.pause_ct += 1;

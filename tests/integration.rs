@@ -1045,12 +1045,26 @@ async fn test_unpause_tube() {
 
     c1.mustsend("reserve\r\n").await;
 
+    let unpaused_at = std::time::Instant::now();
     c0.mustsend("pause-tube default 0\r\n").await;
     c0.ckresp("PAUSED\r\n").await;
 
-    // c1 should get the job quickly after unpause
+    // c1 should get the job immediately after unpause. `delay 0` used to be
+    // floored to one second, which this test tolerated because it only
+    // required "eventually" — hence the wall-clock bound.
     c1.ckresp("RESERVED 1 0\r\n").await;
     c1.ckresp("\r\n").await;
+    let elapsed = unpaused_at.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "unpause should be immediate, took {elapsed:?}"
+    );
+
+    // ...and the tube must read as fully unpaused, not paused for 1s.
+    c0.mustsend("stats-tube default\r\n").await;
+    let body = c0.read_ok_body().await;
+    assert!(body.contains("pause: 0\n"), "expected pause: 0 in {body}");
+    assert!(body.contains("pause-time-left: 0\n"));
 }
 
 #[tokio::test]

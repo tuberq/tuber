@@ -142,7 +142,9 @@ Response: `OK <bytes>\r\n<yaml>\r\n` or `USING <tube>\r\n`
 
 ### pause-tube \<tube> \<delay\>\r\n
 
-Pause a tube for `<delay>` seconds.
+Pause a tube for `<delay>` seconds. A `<delay>` of `0` unpauses the tube
+immediately: `stats-tube` reports `pause: 0` / `pause-time-left: 0` and any
+client blocked in `reserve` is served at once.
 
 Response: `PAUSED\r\n` or `NOT_FOUND\r\n`
 

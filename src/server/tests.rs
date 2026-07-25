@@ -529,6 +529,47 @@ fn test_pause_tube() {
 }
 
 #[test]
+fn test_pause_tube_zero_unpauses_immediately() {
+    let mut s = make_state();
+    let c = register(&mut s);
+
+    s.handle_command(c, put_cmd(0, 0, 120, 1), Some(b"a".to_vec()));
+
+    s.handle_command(
+        c,
+        Command::PauseTube {
+            tube: "default".into(),
+            delay: 60,
+        },
+        None,
+    );
+    assert!(s.tubes.get("default").unwrap().is_paused());
+
+    // `pause-tube <t> 0` means resume now, not "pause for one second".
+    let resp = s.handle_command(
+        c,
+        Command::PauseTube {
+            tube: "default".into(),
+            delay: 0,
+        },
+        None,
+    );
+    assert!(matches!(resp, Response::Paused));
+
+    let tube = s.tubes.get("default").unwrap();
+    assert!(!tube.is_paused());
+    assert_eq!(tube.pause, Duration::ZERO, "stats-tube pause must read 0");
+    assert!(tube.unpause_at.is_none());
+
+    // And the job is reservable straight away, with no wait for the deadline.
+    let resp = s.handle_command(c, Command::Reserve, None);
+    assert!(
+        matches!(resp, Response::Reserved { .. }),
+        "expected immediate RESERVED, got {resp:?}"
+    );
+}
+
+#[test]
 fn test_stats_job() {
     let mut s = make_state();
     let c = register(&mut s);

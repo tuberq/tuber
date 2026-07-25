@@ -1,5 +1,19 @@
 # Changes
 
+## v0.12.1
+
+**`pause-tube <tube> 0` now unpauses immediately.** It is the documented unpause idiom — what `tuber-cli pause <t> --delay 0` and tuber-tui's `u` key both send — but a zero delay was floored to a full second, so the tube stayed genuinely paused for that second and `stats-tube` reported `pause: 1`.
+
+The floor was a porting slip rather than a deliberate guard. beanstalkd does floor zero to 1 ("Always pause for a positive amount of time, to make sure that waiting clients wake up when the deadline arrives"), but at that point its delay is already in *nanoseconds* — the floor is 1 ns, i.e. resume now. tuber applied the same `max(1)` in seconds, 10⁹× too coarse.
+
+That also explains the mismatched pair reported by clients: `pause` is the stored duration (1 s) while `pause-time-left` computes `unpause_at − now` ≈ 999 ms and truncates to 0. One bug, two readings.
+
+Zero now clears the pause outright instead of using a sentinel — tuber doesn't need beanstalkd's nonzero trick, since its 100 ms tick sweeps unpauses unconditionally and the paused check reads the clock live. `pause-tube` also now runs the ready queue on that path, which it never did: without it a blocked `reserve` waited for the next tick, trading 1000 ms for up to 100 ms rather than being served at once.
+
+`put` and `release` with `delay 0` were never affected — both skip the delay heap entirely on zero. The TTR floor (`ttr 0` → 1 s) is real beanstalkd behaviour and is unchanged.
+
+Note for consumers: `pause` still lags a pause *expiring* by up to one tick, since the tick is what clears it. `pause-time-left` is computed live and remains the only field that answers "paused right now".
+
 ## v0.12.0
 
 **`touch-all`** — a one-command heartbeat for the jobs a connection holds, and the missing middle of the batch lifecycle. `reserve-batch` and `delete-batch` already existed; keeping a batch alive was still one `touch` per job.
