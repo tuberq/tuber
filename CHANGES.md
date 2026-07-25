@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## v0.13.0
 
 **A paused tube no longer loses its pause when it drains.** `pause-tube maint 300` followed by the tube emptying discarded the pause within one 100 ms tick, and work arriving afterwards was reservable immediately — with nothing logged and nothing in `stats-tube` to show it had happened, because the tube itself was gone.
 
