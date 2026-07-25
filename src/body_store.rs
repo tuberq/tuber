@@ -162,7 +162,7 @@ pub struct BodyStore {
 }
 
 /// Process soft limit on open file descriptors (`RLIMIT_NOFILE`), if readable.
-fn fd_soft_limit() -> Option<u64> {
+pub(crate) fn fd_soft_limit() -> Option<u64> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

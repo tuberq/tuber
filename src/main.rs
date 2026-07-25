@@ -93,8 +93,17 @@ enum Commands {
         sync_interval: Duration,
 
         /// Maximum size of a single job's body.
-        /// Accepts suffixes: k, m, g, t (e.g. 64k, 1m). Default: 65535.
-        #[arg(short = 'z', long, default_value = "65535", value_parser = parse_max_job_size, env = "TUBER_MAX_JOB_SIZE")]
+        ///
+        /// Note that a body passes through RAM in full on both put and
+        /// reserve, so this bounds transient memory per in-flight command,
+        /// not just stored size. Accepts suffixes: k, m, g, t (e.g. 64k, 1m).
+        #[arg(
+            short = 'z',
+            long,
+            default_value_t = tuber::job::JOB_DATA_SIZE_LIMIT_DEFAULT,
+            value_parser = parse_max_job_size,
+            env = "TUBER_MAX_JOB_SIZE"
+        )]
         max_job_size: u32,
 
         /// Maximum total in-memory size of all jobs (bodies + per-job overhead
@@ -104,9 +113,25 @@ enum Commands {
         /// reserve/release/bury/kick/delete always succeed. Also enforced at
         /// startup: replay aborts if the binlog would exceed the budget in
         /// memory. Accepts suffixes: k, m, g, t (e.g. 2g, 500M, 100k).
-        /// Default: unlimited.
-        #[arg(long, value_parser = tuber::server::parse_bytes, env = "TUBER_MAX_JOBS_SIZE")]
-        max_jobs_size: Option<u64>,
+        /// Pass 0 for unlimited.
+        #[arg(
+            long,
+            default_value_t = tuber::job::JOBS_SIZE_LIMIT_DEFAULT,
+            value_parser = tuber::server::parse_bytes,
+            env = "TUBER_MAX_JOBS_SIZE"
+        )]
+        max_jobs_size: u64,
+
+        /// Maximum concurrent client connections.
+        ///
+        /// Defaults to a value derived from the file-descriptor soft limit
+        /// (`ulimit -n`) minus the descriptors TOAST and the WAL are currently
+        /// holding, so storage always keeps the fds it needs and connections
+        /// yield to it — a refused connection is a client retry, whereas a
+        /// segment that cannot be opened is failed puts. Recomputed as the body
+        /// store grows. Pass 0 for unlimited.
+        #[arg(long, env = "TUBER_MAX_CONNECTIONS")]
+        max_connections: Option<usize>,
 
         /// Maximum total on-disk size for the WAL + body store combined.
         /// PUT returns OUT_OF_STORAGE once exceeded; reserve / release /
@@ -264,6 +289,7 @@ async fn run() {
             sync_interval,
             max_job_size,
             max_jobs_size,
+            max_connections,
             max_storage_bytes,
             migrate_wal,
             verbose,
@@ -300,6 +326,10 @@ async fn run() {
                 }
             }
 
+            // 0 means unlimited, matching the `max-jobs-size: 0` sentinel
+            // that `stats` has always reported for an unset budget.
+            let max_jobs_size = (max_jobs_size != 0).then_some(max_jobs_size);
+
             if let Err(e) = tuber::server::run(
                 &listen,
                 port,
@@ -311,6 +341,7 @@ async fn run() {
                 migrate_wal,
                 metrics_port,
                 name,
+                max_connections,
             )
             .await
             {

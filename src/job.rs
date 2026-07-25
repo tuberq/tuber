@@ -5,8 +5,34 @@ use std::time::SystemTime;
 
 pub const MAX_TUBE_NAME_LEN: usize = 200;
 pub const URGENT_THRESHOLD: u32 = 1024;
-pub const JOB_DATA_SIZE_LIMIT_DEFAULT: u32 = 65535;
+/// Default per-job body cap. Raised from beanstalkd's 65535 once bodies
+/// moved out to TOAST: with persistence on, a resident job costs ~512 B of
+/// metadata regardless of body size, so the old 64 KiB ceiling no longer
+/// tracks anything real.
+///
+/// The value is set by the *peak* cost, not the steady-state one. A body is
+/// fully materialised in RAM on both put (read off the socket before the
+/// engine sees it) and reserve/peek (`ServerState::fetch_body` reads TOAST
+/// into a `Vec`), so the transient exposure is this value times the number
+/// of concurrent puts and reserves in flight — and a client can force a
+/// put-side allocation with nothing but a header line. 1 MiB matches Kafka's
+/// `message.max.bytes` and NATS' `max_payload`, and stays well under
+/// `body_store::DEFAULT_SEGMENT_SIZE` so TOAST compaction has something to
+/// amortise over.
+pub const JOB_DATA_SIZE_LIMIT_DEFAULT: u32 = 1_048_576;
 pub const JOB_DATA_SIZE_LIMIT_MAX: u32 = 1_073_741_824;
+
+/// Default total in-memory job budget. Backpressure (`OUT_OF_MEMORY`) rather
+/// than a silent OOM kill. `0` on the command line means unlimited.
+pub const JOBS_SIZE_LIMIT_DEFAULT: u64 = 1024 * 1024 * 1024;
+
+const _: () = assert!(JOB_DATA_SIZE_LIMIT_DEFAULT <= JOB_DATA_SIZE_LIMIT_MAX);
+// The per-job default must leave TOAST room to amortise: a body approaching
+// the segment size makes the live-ratio compaction heuristic useless.
+const _: () = assert!(
+    (JOB_DATA_SIZE_LIMIT_DEFAULT as u64) < crate::body_store::DEFAULT_SEGMENT_SIZE / 8,
+    "default job size should stay well under a TOAST segment"
+);
 
 /// Logical identifier for a body stored in the external body store
 /// (`BodyStore`). Monotonic and never reused.
@@ -545,5 +571,17 @@ mod tests {
 
         let not_urgent = make_test_job(3, 1024);
         assert!(!not_urgent.is_urgent());
+    }
+
+    /// Pin the shipped defaults. `main.rs` wires both into clap via
+    /// `default_value_t`, so these constants *are* the CLI defaults — a change
+    /// here changes what every operator gets on upgrade, and should be
+    /// deliberate enough to update this test. The invariants that relate them
+    /// to other constants are enforced at compile time instead; see the
+    /// `const _` blocks above.
+    #[test]
+    fn default_size_limits_are_pinned() {
+        assert_eq!(JOB_DATA_SIZE_LIMIT_DEFAULT, 1024 * 1024);
+        assert_eq!(JOBS_SIZE_LIMIT_DEFAULT, 1024 * 1024 * 1024);
     }
 }

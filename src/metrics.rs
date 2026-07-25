@@ -176,6 +176,47 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "current-connections",
     );
+    // File-descriptor budget. The alertable signal is
+    // tuber_fd_connections_used / tuber_fd_max_connections approaching 1, or any
+    // rise in tuber_connections_refused_total. Because the ceiling is derived
+    // from the soft limit minus what TOAST and the WAL hold, a growing body
+    // store lowers tuber_fd_max_connections on its own — watch the ratio rather
+    // than the raw connection count.
+    prom_gauge(
+        &mut out,
+        "tuber_fd_soft_limit",
+        "RLIMIT_NOFILE soft limit (0 if unknown)",
+        &stats,
+        "fd-soft-limit",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_fd_storage_used",
+        "File descriptors held by TOAST segments and WAL files",
+        &stats,
+        "fd-storage-used",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_fd_connections_used",
+        "File descriptors held by client connections",
+        &stats,
+        "fd-connections-used",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_fd_max_connections",
+        "Current connection ceiling (0 if unlimited)",
+        &stats,
+        "max-connections",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_connections_refused_total",
+        "Connections refused because the ceiling was reached",
+        &stats,
+        "connections-refused",
+    );
     prom_gauge(
         &mut out,
         "tuber_producers_current",

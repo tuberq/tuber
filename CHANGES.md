@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+**Connection ceiling derived from the file-descriptor budget**, with `--max-connections` to override.
+
+There was no cap on concurrent connections, so a flood could take every descriptor in the process. That matters beyond connection availability: TOAST holds one open fd per ~64 MiB segment for the life of the process, so connections and job storage draw on the same pool, and connections winning means failed puts and unreadable bodies.
+
+The ceiling is therefore derived rather than configured — `fd_soft_limit − (toast_segments + wal_files) − 64` — and the storage term is republished every engine tick, so it tracks storage growth instead of being a guess frozen at startup. Verified: writing ~260 MiB of 1 MiB bodies grew TOAST from 0 to 5 segments and lowered the ceiling by exactly 5. Connections yield 1:1 to storage, which is the right priority — a refused connection is a client retry.
+
+Over the ceiling, the socket is accepted (the kernel gives no way to decline) and closed immediately with no reply. No reply is deliberate: the client has sent nothing yet, so an unsolicited line would be read as the response to whatever command it sends next. `--max-connections 0` disables the cap, as does an unreadable `getrlimit`.
+
+New in `stats` and `/metrics`: `fd-soft-limit`, `fd-storage-used`, `fd-connections-used`, `max-connections`, `connections-refused` (`tuber_fd_*` and `tuber_connections_refused_total`). Alert on the *ratio* of used to max, not the raw connection count — the ceiling moves as the body store grows, so a comfortable count can reach the limit without the client population changing.
+
+Full details, including `ulimit -n` sizing that accounts for TOAST, in [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md).
+
+**Running out of file descriptors no longer kills the server.** `accept()` errors were propagated out of the accept loop with `?`, so a single `EMFILE` ended `serve()`, returned to `main`, and exited the process. Reproduced with `ulimit -n 64`: 55 connections were enough to take the server down with `server error: Too many open files (os error 24)`, requiring a restart and a WAL replay.
+
+Accept failures are now non-fatal. `EMFILE`/`ENFILE` back off for 50 ms before retrying — the pending connection keeps the listener readable, so an immediate retry would spin at 100% CPU for the duration of the pressure — and the warning is rate-limited to once every 5 s so a sustained outage doesn't flood the log at the retry rate. Other accept errors, which are properties of a single connection attempt, are logged and skipped.
+
+Verified after the change: the server stays up under a sustained flood, sits at 0.3% CPU while fully exhausted, and recovers on its own once descriptors free up.
+
+This is the backstop rather than the first line of defence — with the connection ceiling above, the cap normally refuses connections long before the process reaches EMFILE. It still matters when the ceiling is disabled (`--max-connections 0`), when `getrlimit` is unreadable, or when the soft limit is lowered at runtime.
+
+**A `put` whose declared `<bytes>` is shorter than the body sent now closes the connection** after replying `EXPECTED_CRLF`, instead of resuming the command loop.
+
+A short declared length desynchronises the stream. The server reads exactly `<bytes>` + 2 and finds no trailer; the excess is an unknown length by definition, so there is no way to locate the next command boundary. beanstalkd replies and keeps parsing, which means the remainder of the *body* gets interpreted as commands — verified before the fix, where `put 0 0 60 2\r\nAAAAA\r\ndelete 999\r\n` executed the delete, and the same shape ran `list-tubes`.
+
+That is a command-injection path for any client that miscounts bytes: JavaScript `.length` counts UTF-16 code units, Ruby `String#length` is not `#bytesize`, Python `str` is not `bytes`. Multi-byte UTF-8 in an attacker-supplied payload makes declared < actual, and everything after an embedded `\r\n` becomes the command stream — `delete <id>`, `flush-tube`, `pause-tube`. The excess cannot be drained (its length is exactly what the client got wrong), so closing is the only safe recovery. It matches what the same code path already did for an over-long command line, and HTTP/1.1 practice on framing errors.
+
+Unchanged, and verified: the stored body is always exactly `<bytes>` long, excess data never enters a job body, and a put that fails the trailer check stores nothing. Over-declaring is also unaffected — the server blocks for the remaining bytes and consumes whatever arrives as body, never executing it.
+
+Client authors should treat `EXPECTED_CRLF` as fatal and reconnect rather than retrying on the same connection. Documented under [`put`](docs/protocol.md) in the protocol reference.
+
+**Default `--max-job-size` raised to 1 MiB** (from beanstalkd's 65535), and **`--max-jobs-size` now defaults to 1 GiB** instead of unlimited.
+
+The per-job bump is overdue: since bodies moved into TOAST, a resident job costs ~512 B of metadata regardless of body size, so the 64 KiB ceiling stopped tracking any real resource. 1 MiB matches where the rest of the ecosystem landed — Kafka's `message.max.bytes` and NATS' `max_payload` are both 1 MiB.
+
+It is deliberately not larger, because the body store fixed the *steady-state* cost and not the *peak* one. A body is still materialised in RAM in full twice in its life: on `put` the server allocates the declared length and reads the body off the socket before the engine or any budget sees it, and on `reserve`/`peek` it is read back out of TOAST into a fresh buffer for the wire. Real peak exposure is `max-job-size × concurrent puts and reserves`, and disk-backed bodies don't help with any of that. The README now documents this, with measurements, under [Sizing `--max-job-size`](README.md#sizing---max-job-size).
+
+Worth knowing for capacity planning: the cost tracks bytes genuinely in flight, not connection count or declared size. Measured at 500 connections with `-z 1m`, idle connections cost ~10 KB each (an 8 KiB read buffer, independent of `--max-job-size`) and 500 stalled `put` headers declaring 1 MiB apiece added 0.6 MiB total — the body buffer is allocated zeroed, so it stays reserved address space until bytes actually arrive. Sending those same 500 bodies for real costs the full 509 MiB. Slow clients are cheap; concurrency is what you budget for.
+
+Raising the per-job cap 16× while the total memory budget defaulted to unlimited would have been a straight 16× increase in how far a default-configured server can run before the OOM killer arrives, so the two changes ship together: `--max-jobs-size` now defaults to 1 GiB and gives you `OUT_OF_MEMORY` backpressure out of the box. With persistence on that's roughly 2M resident jobs, since only metadata counts. Pass `--max-jobs-size 0` for the old unlimited behaviour — 0 was already the "unlimited" sentinel `stats` reported for an unset budget.
+
+Operator notes:
+
+- **Upgrading with a large existing binlog and no explicit `--max-jobs-size`:** the budget is enforced after replay, so a WAL whose live set exceeds 1 GiB in memory will now refuse to start with a diagnostic naming the actual figure rather than silently replaying. Raise the flag or pass `0`.
+- Payloads between 64 KiB and 1 MiB that used to be rejected with `JOB_TOO_BIG` are now accepted. If you were relying on the old cap as incidental backpressure, set `-z 65535` explicitly.
+- The startup log line now always reports `max-jobs-size`, printing `unlimited` when opted out — previously the field was simply absent when unset, which is ambiguous now that a budget is the default.
+- Both flags accept the usual suffixes via env var too (`TUBER_MAX_JOB_SIZE=1m`, `TUBER_MAX_JOBS_SIZE=512m`).
+
 **Startup TOAST-reclamation logs no longer read as crash damage.** The stranded-body line was a `WARN` blaming "a partial put that didn't survive crash", which misdescribed the usual cause and put an alarming line in front of operators on ordinary restarts.
 
 TOAST has no on-disk deletion tombstone: a runtime delete drops the index entry and the bytes stay in the segment until compaction rewrites it. Since `BodyStore::open` rebuilds the index by *scanning* the segment files, every deleted-but-uncompacted body reappears as live on the next start and has to be re-reclaimed. Bodies the retained WAL still names go to the orphan pass; bodies whose WAL segment has already been reclaimed have no reference left anywhere and land in the stranded sweep. Both counts therefore track delete volume since the last compaction, not crashes.

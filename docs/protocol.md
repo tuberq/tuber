@@ -22,10 +22,41 @@ Responses:
 - `INSERTED <id>\r\n` — new job created
 - `INSERTED <id> <STATE>\r\n` — idempotency dedup hit (STATE is `READY`, `RESERVED`, `DELAYED`, `BURIED`, or `DELETED`)
 - `BURIED <id>\r\n` (out of memory)
-- `EXPECTED_CRLF\r\n` (body not terminated correctly)
+- `EXPECTED_CRLF\r\n` (body not terminated correctly — **closes the connection**, see below)
 - `JOB_TOO_BIG\r\n`
 - `DRAINING\r\n`
 - `NOT_DRAINING\r\n`
+
+#### Getting `<bytes>` wrong
+
+`<bytes>` is the byte length of the body, not its character count. The server
+reads exactly that many bytes plus a trailing `\r\n`, and the two failure modes
+differ:
+
+- **Declared longer than sent** — the server blocks waiting for the rest of the
+  body. Anything the client sends next is consumed *as body bytes*, not
+  executed. No reply arrives until the declared count is satisfied or the
+  connection drops.
+- **Declared shorter than sent** — the trailer check fails, the server replies
+  `EXPECTED_CRLF\r\n` and **closes the connection**. Nothing is stored.
+
+The close is a deliberate divergence from beanstalkd, which replies and keeps
+parsing. A short declared length desynchronises the stream: the excess is an
+unknown length by definition, so there is no way to locate the next command
+boundary, and resuming the parse loop interprets the remainder of the *body* as
+commands. Given a client that miscounts bytes — JavaScript `.length` counts
+UTF-16 code units, Ruby `String#length` is not `#bytesize`, Python `str` is not
+`bytes` — that hands whoever controls the job payload a way to run arbitrary
+queue commands (`delete`, `flush-tube`, `pause-tube`) by embedding them after a
+`\r\n`. Multi-byte UTF-8 in an attacker-supplied payload is enough to trigger
+it. Closing is the only safe recovery, since the excess cannot be drained.
+
+In both cases the stored body is exactly `<bytes>` long; excess data never
+enters a job body, and a put that fails the trailer check stores nothing.
+
+Client authors: use the byte length of the encoded payload, and treat
+`EXPECTED_CRLF` as a fatal, reconnect-required error rather than something to
+retry on the same connection.
 
 ### use \<tube\>\r\n
 
@@ -185,7 +216,7 @@ Close the connection.
 | Default port | 11300 |
 | Max tube name length | 200 chars |
 | Tube name chars | `A-Za-z0-9` `-+/;.$_()` |
-| Default max job size | 65535 bytes |
+| Default max job size | 1 MiB (1048576 bytes) — beanstalkd's default is 65535 |
 | Max possible job size | 1GB |
 | Urgent priority threshold | < 1024 |
 | Default TTR | 1 second |

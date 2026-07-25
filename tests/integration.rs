@@ -31,6 +31,19 @@ impl TestServer {
         TestServer { port, handle }
     }
 
+    async fn start_with_max_connections(max_connections: usize) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_max_connections(listener, 65535, max_connections)
+                .await
+                .ok();
+        });
+
+        TestServer { port, handle }
+    }
+
     async fn start_with_max_jobs_size(max_jobs_size: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4637,6 +4650,109 @@ async fn test_put_oversized_body_keeps_connection() {
     );
 }
 
+/// The connection ceiling refuses new connections instead of letting the
+/// process run into EMFILE, and a refusal frees its slot again once the peer
+/// disconnects. Uses an explicit cap so the test doesn't depend on the host's
+/// `ulimit -n`.
+#[tokio::test]
+async fn test_max_connections_refuses_over_ceiling() {
+    use tokio::io::AsyncReadExt;
+
+    let server = TestServer::start_with_max_connections(3).await;
+
+    // Fill the ceiling. Each of these must be fully usable.
+    let mut held = Vec::new();
+    for i in 0..3 {
+        let mut c = server.connect().await;
+        c.mustsend("stats\r\n").await;
+        let body = c.read_ok_body().await;
+        assert!(
+            body.contains(&format!("current-connections: {}", i + 1)),
+            "connection {} should be counted: {body}",
+            i + 1
+        );
+        held.push(c);
+    }
+
+    // The fourth is accepted by the kernel, then closed by the server without a
+    // reply — so the read returns EOF rather than data.
+    let mut over = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .expect("kernel accepts; the server is what refuses");
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), over.read(&mut buf))
+        .await
+        .expect("refused connection should be closed promptly")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF on a refused connection, got {n} bytes");
+
+    // Existing connections are unaffected, and the refusal was counted.
+    held[0].mustsend("stats\r\n").await;
+    let body = held[0].read_ok_body().await;
+    assert!(
+        body.contains("connections-refused: 1"),
+        "refusal should be counted: {body}"
+    );
+    assert!(
+        body.contains("max-connections: 3"),
+        "ceiling should be reported: {body}"
+    );
+
+    // Dropping a held connection frees its slot for a new client.
+    held.pop();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut fresh = server.connect().await;
+    fresh.mustsend("stats\r\n").await;
+    let body = fresh.read_ok_body().await;
+    assert!(
+        body.contains("current-connections: 3"),
+        "a freed slot should be reusable: {body}"
+    );
+}
+
+/// A `put` whose declared `<bytes>` is shorter than the body actually sent
+/// desynchronises the stream: the excess has an unknown length, so there is no
+/// way to find the next command boundary. tuber answers EXPECTED_CRLF and then
+/// closes, rather than resuming the parse loop and executing the remainder of
+/// the body as commands (beanstalkd resumes; this is a deliberate divergence).
+///
+/// Without the close, a client that miscounts bytes — UTF-16 `.length`,
+/// `String#length` instead of `#bytesize` — hands whoever controls the job
+/// payload a command-injection primitive.
+#[tokio::test]
+async fn test_under_declared_body_closes_instead_of_executing_remainder() {
+    let server = TestServer::start().await;
+    let mut conn = server.connect().await;
+
+    // Establish a job so the injected `delete 1` would visibly succeed if the
+    // remainder were ever parsed as a command.
+    conn.mustsend("put 0 0 120 5\r\nHELLO\r\n").await;
+    conn.ckresp("INSERTED 1\r\n").await;
+
+    // Declare 2 bytes, send 5 plus a trailing command. The trailer check reads
+    // "AA" where \r\n should be, so this is a framing error; everything after
+    // it ("A\r\ndelete 1\r\n") must never reach the dispatcher.
+    conn.mustsend_bytes(b"put 0 0 120 2\r\nAAAAA\r\ndelete 1\r\n")
+        .await;
+    conn.ckresp("EXPECTED_CRLF\r\n").await;
+
+    // The connection is closed: reads hit EOF rather than UNKNOWN_COMMAND
+    // (from the stray "A") followed by DELETED (from the injected command).
+    let mut buf = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), conn.reader.read_line(&mut buf))
+        .await
+        .expect("server should close promptly after a framing error")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF after EXPECTED_CRLF, got {buf:?}");
+
+    // The job is untouched — proof the injected `delete 1` never ran — and the
+    // rejected put stored nothing.
+    let mut c2 = server.connect().await;
+    c2.mustsend("reserve-with-timeout 1\r\n").await;
+    c2.ckresp("RESERVED 1 5\r\n").await;
+    c2.ckresp("HELLO\r\n").await;
+}
+
 /// Test that a legitimate put with long extension keys works within the line limit.
 #[tokio::test]
 async fn test_fuzz_long_put_with_extensions() {
@@ -5793,9 +5909,11 @@ async fn test_max_jobs_size_stats_fields_present() {
 }
 
 #[tokio::test]
-async fn test_max_jobs_size_default_unlimited() {
-    // When --max-jobs-size is not set, stats should report 0 (unlimited
-    // sentinel) and put should never be rejected by the memory check.
+async fn test_max_jobs_size_none_is_unlimited() {
+    // A `None` budget means unlimited: stats reports the 0 sentinel and put
+    // is never rejected by the memory check. Note this is the *library*
+    // default; the CLI defaults --max-jobs-size to 1 GiB and maps an explicit
+    // `0` back to None to reach this path.
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 

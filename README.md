@@ -79,7 +79,7 @@ Plus tuber's extensions — see [Unique Jobs](#unique-jobs-idempotency), [Job De
 
 Tuber has two independent budgets — RAM and disk — and both gate **only `put`**. Workers can always reserve, release, bury, kick, touch, and delete, even at capacity. The queue keeps draining when it's full; producers get an explicit `OUT_OF_*` rather than a silent crash, and there's no consumer-blocking deadlock of the kind RabbitMQ's memory alarm can produce.
 
-- **Memory budget** — `--max-jobs-size` caps in-memory job footprint (metadata + idempotency tombstones with persistence on; full job bytes without). PUT returns `OUT_OF_MEMORY` when exhausted — explicit backpressure instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete; state transitions never fail due to the budget. The cap also applies at startup, so tuber aborts with a diagnostic instead of OOMing mid-replay.
+- **Memory budget** — `--max-jobs-size` caps in-memory job footprint (metadata + idempotency tombstones with persistence on; full job bytes without). Defaults to 1 GiB, so backpressure is on out of the box; pass `0` to opt out. PUT returns `OUT_OF_MEMORY` when exhausted — explicit backpressure instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete; state transitions never fail due to the budget. The cap also applies at startup, so tuber aborts with a diagnostic instead of OOMing mid-replay.
 - **Storage budget** — `--max-storage-bytes` (mandatory with `-b`) caps WAL + body-store disk usage. PUT returns `OUT_OF_STORAGE` once exceeded; state changes always succeed because tuber reserves one WAL segment's headroom for delete/release/bury/kick records. No silent disk-fill outages.
 - **Per-tube statistics** — processing-time and queue-time EWMAs, p50/p95/p99 percentiles, bury rate. See [Statistics](#statistics) below.
 - **Prometheus metrics** — `/metrics` endpoint with gauges for queue depth, memory/storage budgets, and per-tube counters.
@@ -116,7 +116,7 @@ Most job queue systems treat performance monitoring as the application's problem
 - **Queue time (time-in-queue)** — EWMA, min, and max of how long jobs waited from `put` to `reserve`. Growing queue time means you need more workers — and you'll know before your users do.
 - **Bury rate** — fraction of reserves that ended in a bury, for quick failure monitoring.
 
-All stats are available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-rs). See the full [Statistics Reference](docs/statistics.md) for field details.
+All stats are available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-rs). See the full [Statistics Reference](docs/statistics.md) for field details, and [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md) for the `fd-*` fields and what to alert on.
 
 ### Weighted Reserve
 
@@ -444,9 +444,10 @@ tuber server [OPTIONS]
 | `-s`, `--max-storage-bytes` | `TUBER_MAX_STORAGE_BYTES` | — | Combined cap on WAL + body-store disk usage. **Mandatory** when `-b` is set. PUT returns `OUT_OF_STORAGE` when the projected footprint would exceed this; state changes (reserve/release/bury/kick/delete) always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `100g`). |
 | `-i`, `--sync-interval` | `TUBER_SYNC_INTERVAL` | `100ms` | How often the WAL and body store fsync to disk. Lower = less data loss on crash, more I/O. Accepts `ms`, `s`, `m`, `h`. |
 | `--migrate-wal` | `TUBER_MIGRATE_WAL` | off | Opt in to upgrading a pre-v5 WAL to the v5 + body-store format on startup. Without this flag the server refuses to start when it detects pre-v5 records. |
-| `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `65535` | Max size of a single job body. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
-| `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | unlimited | Max total in-memory footprint of jobs. With persistence enabled, bodies live on disk and don't count — this caps job *metadata* (~512 B/job) plus idempotency tombstones. Without persistence, bodies are in RAM and counted. PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
+| `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `1m` | Max size of a single job body. **Bodies pass through RAM in full on both `put` and `reserve`** — see [Sizing `--max-job-size`](#sizing---max-job-size) before raising it. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
+| `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | `1g` | Max total in-memory footprint of jobs. With persistence enabled, bodies live on disk and don't count — this caps job *metadata* (~512 B/job) plus idempotency tombstones, so 1 GiB is roughly 2M resident jobs. Without persistence, bodies are in RAM and counted. PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Pass `0` for unlimited. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
 | `-V` | `TUBER_VERBOSE` | warn | Verbosity (`-V` info, `-VV` debug) |
+| `--max-connections` | `TUBER_MAX_CONNECTIONS` | derived | Max concurrent client connections. Defaults to the fd soft limit (`ulimit -n`) minus the descriptors TOAST and the WAL currently hold, minus slack — so storage always keeps the descriptors it needs and the ceiling shrinks as the body store grows. Pass `0` for unlimited. See [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md). |
 | `--metrics-port` | `TUBER_METRICS_PORT` | — | Prometheus metrics endpoint port |
 | `--name` | `TUBER_NAME` | — | Instance name (shown in stats and metrics) |
 
@@ -460,6 +461,48 @@ tuber server -VV --metrics-port 9100
 # Memory-bounded + disk-bounded server (Docker-friendly)
 tuber server --max-jobs-size 2g -b /var/lib/tuber -s 100g --metrics-port 9100
 ```
+
+#### Sizing `--max-job-size`
+
+With persistence on, a stored body costs almost nothing in RAM: anything over
+256 bytes goes to the body store, and the resident job shrinks to ~512 B of
+metadata. That's what makes a 1 MiB default reasonable where beanstalkd's
+64 KiB once was.
+
+What the body store does **not** change is that a body is fully materialised
+in memory every time it crosses the wire:
+
+- **On `put`** — the server allocates the declared body length and reads the
+  body off the socket into it, *before* the engine sees the job or any budget
+  is consulted.
+- **On `reserve` / `peek`** — the body is read back out of the body store into
+  a fresh buffer to be written to the socket. Disk-resident does not mean
+  zero-copy.
+
+So `--max-job-size` bounds *transient* memory per in-flight command, and your
+real peak is roughly `max-job-size × concurrent puts and reserves`. Raising it
+to 16 MiB doesn't cost 16 MiB — it costs 16 MiB per connection that decides to
+use it. A thousand workers reserving 16 MiB jobs is 16 GiB of transient
+allocation, and no amount of disk-backed body storage helps.
+
+The cost is driven by bytes actually in flight, not by connection count or by
+what a client *claims* it will send. Measured on a default server (500
+connections, `-z 1m`):
+
+| | RSS delta | per connection |
+|---|---|---|
+| 500 idle connections | 4.8 MiB | ~10 KB — an 8 KiB read buffer plus task overhead, independent of `--max-job-size` |
+| 500 stalled `put` headers declaring 1 MiB each | 0.6 MiB | ~1 KB — the buffer is allocated zeroed, so it is reserved address space until bytes arrive |
+| the same 500 bodies actually sent | 509 MiB | ~1 MiB — the full cost, once real |
+
+So an idle or slow-loris client is cheap, and a client only consumes what it
+pays bandwidth to send. The number to plan against is your genuine concurrency:
+`max-job-size × simultaneous in-flight puts and reserves`.
+
+Size it as a sanity ceiling on individual messages, and lean on
+`--max-jobs-size` and `--max-storage-bytes` for capacity. If you genuinely
+need multi-megabyte payloads, the usual advice applies: put the blob in object
+storage and queue the key.
 
 #### Prometheus metrics
 

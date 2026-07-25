@@ -1402,7 +1402,8 @@ async fn test_max_storage_bytes_returns_out_of_storage() {
     let srv = TestServer::start_with_wal_and_storage_budget(dir.path(), 13 * 1024 * 1024).await;
     let mut c = srv.connect().await;
 
-    let body = "x".repeat(60 * 1024); // 60 KiB — fits within default max-job-size
+    // 60 KiB — fits within the 65535 this harness passes for max_job_size.
+    let body = "x".repeat(60 * 1024);
     let len = body.len();
     let mut accepted = 0u32;
     let mut hit = false;

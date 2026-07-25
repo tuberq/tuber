@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -50,6 +51,128 @@ const FIND_UNBLOCKED_MAX_VISITS: usize = 256;
 /// segments below the live-ratio threshold. Brisk enough to absorb
 /// realistic delete bursts without burning cycles on idle queues.
 const TOAST_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Pause after an `accept()` that failed with EMFILE/ENFILE. The pending
+/// connection leaves the listener readable, so retrying immediately would spin
+/// on the CPU until a descriptor frees up. Short enough that recovery is
+/// prompt once one does.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Minimum gap between accept-failure warnings, so a sustained outage logs
+/// periodically rather than at the retry rate.
+const ACCEPT_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Descriptors held back from the connection cap for everything that is
+/// neither a client socket nor a storage file: the listener, the metrics
+/// listener and its in-flight scrapes, tokio's kqueue/epoll fd, stdio, and
+/// the extra segment compaction holds open while rewriting. Deliberately
+/// generous — the cost of over-reserving is a few refused connections, the
+/// cost of under-reserving is the EMFILE cliff this exists to avoid.
+const FD_SLACK: usize = 64;
+
+/// Shared file-descriptor accounting between the accept loop and the engine.
+///
+/// The point is priority: connections yield to storage, not the other way
+/// round. A refused connection is a client retry; a TOAST segment that cannot
+/// be opened is failed puts and unreadable job bodies. So the connection
+/// ceiling is *derived* from what storage is currently using and shrinks as the
+/// body store grows, rather than being a fixed number chosen at startup that
+/// silently stops leaving enough room.
+#[derive(Debug)]
+pub struct FdBudget {
+    /// `RLIMIT_NOFILE` soft limit read once at startup. `None` when
+    /// `getrlimit` failed, which disables the derived cap.
+    soft_limit: Option<usize>,
+    /// Operator override. `Some(0)` means explicitly unlimited.
+    configured_max: Option<usize>,
+    /// Live client connections.
+    connections: AtomicUsize,
+    /// Descriptors held by TOAST segments plus WAL files. Republished by the
+    /// engine tick, since both grow while the server runs.
+    storage: AtomicUsize,
+    /// Connections refused because the cap was reached.
+    refused: AtomicU64,
+}
+
+impl FdBudget {
+    pub fn new(configured_max: Option<usize>) -> Self {
+        FdBudget {
+            soft_limit: crate::body_store::fd_soft_limit().map(|l| l as usize),
+            configured_max,
+            connections: AtomicUsize::new(0),
+            storage: AtomicUsize::new(0),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    /// Current connection ceiling, or `None` for unlimited (no override, and
+    /// `getrlimit` unavailable — better to serve than to guess a cap).
+    pub fn max_connections(&self) -> Option<usize> {
+        match self.configured_max {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => {
+                let limit = self.soft_limit?;
+                // Saturating: if storage plus slack already exceeds the limit
+                // the ceiling is 0 and we refuse everything, which is the
+                // correct call — storage is already in trouble.
+                Some(limit.saturating_sub(self.storage.load(Ordering::Relaxed) + FD_SLACK))
+            }
+        }
+    }
+
+    /// Publish current storage descriptor usage. Called from the engine tick.
+    pub fn set_storage_fds(&self, n: usize) {
+        self.storage.store(n, Ordering::Relaxed);
+    }
+
+    /// Reserve a slot for a new connection, or refuse. On refusal the caller
+    /// must drop the socket.
+    fn try_acquire(&self) -> bool {
+        let Some(max) = self.max_connections() else {
+            self.connections.fetch_add(1, Ordering::Relaxed);
+            return true;
+        };
+        // Compare-exchange rather than fetch_add-then-check: the latter would
+        // let a burst of concurrent accepts each overshoot before backing out.
+        let mut cur = self.connections.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            match self.connections.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
+    }
+
+    pub fn storage_fds(&self) -> usize {
+        self.storage.load(Ordering::Relaxed)
+    }
+
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    pub fn soft_limit(&self) -> Option<usize> {
+        self.soft_limit
+    }
+}
 
 /// Wall-clock budget for compaction work per tick. Each tick drains as
 /// many eligible segments as it can within this budget, then yields
@@ -236,6 +359,10 @@ struct ServerState {
     /// that never made it to the WAL. The engine loop drains this after
     /// `sync_wal`. Always empty in relaxed mode (process_queue sends directly).
     deferred_replies: Vec<(oneshot::Sender<Response>, Response)>,
+    /// Shared fd accounting. The engine republishes storage usage into it each
+    /// tick; the accept loop reads the derived ceiling. Also the source for the
+    /// `fd-*` and `current-connections`-adjacent stats fields.
+    fd_budget: Arc<FdBudget>,
 }
 
 impl ServerState {
@@ -244,6 +371,7 @@ impl ServerState {
         max_job_bytes: Option<u64>,
         max_storage_bytes: Option<u64>,
         name: Option<String>,
+        fd_budget: Arc<FdBudget>,
     ) -> Self {
         let mut tubes = HashMap::new();
         tubes.insert("default".to_string(), Tube::new("default"));
@@ -342,6 +470,7 @@ impl ServerState {
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
             deferred_replies: Vec::new(),
+            fd_budget,
         }
     }
 
@@ -2868,6 +2997,11 @@ impl ServerState {
              recovered-missing-bodies: {}\n\
              reclaimed-orphan-bodies: {}\n\
              reclaimed-stranded-bodies: {}\n\
+             fd-soft-limit: {}\n\
+             fd-storage-used: {}\n\
+             fd-connections-used: {}\n\
+             max-connections: {}\n\
+             connections-refused: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -2945,6 +3079,13 @@ impl ServerState {
             self.stats.recovered_missing_bodies,
             self.stats.reclaimed_orphan_bodies,
             self.stats.reclaimed_stranded_bodies,
+            // 0 is the "unknown / unlimited" sentinel throughout stats, matching
+            // max-jobs-size and max-storage-bytes.
+            self.fd_budget.soft_limit().unwrap_or(0),
+            self.fd_budget.storage_fds(),
+            self.fd_budget.connections(),
+            self.fd_budget.max_connections().unwrap_or(0),
+            self.fd_budget.refused(),
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
@@ -3566,8 +3707,15 @@ fn build_state(
     sync_interval: Duration,
     migrate_wal: bool,
     name: Option<String>,
+    fd_budget: Arc<FdBudget>,
 ) -> io::Result<ServerState> {
-    let mut state = ServerState::new(max_job_size, max_job_bytes, max_storage_bytes, name);
+    let mut state = ServerState::new(
+        max_job_size,
+        max_job_bytes,
+        max_storage_bytes,
+        name,
+        fd_budget,
+    );
 
     if let Some(dir) = wal_dir {
         // Persistence requires an explicit disk budget. Without one, TOAST
@@ -3816,8 +3964,10 @@ pub async fn run(
     migrate_wal: bool,
     metrics_port: Option<u16>,
     name: Option<String>,
+    max_connections: Option<usize>,
 ) -> io::Result<()> {
     let wal_path = wal_dir.map(Path::new);
+    let fd_budget = Arc::new(FdBudget::new(max_connections));
     let state = build_state(
         max_job_size,
         max_job_bytes,
@@ -3826,15 +3976,23 @@ pub async fn run(
         sync_interval,
         migrate_wal,
         name.clone(),
+        Arc::clone(&fd_budget),
     )?;
 
     let listener = TcpListener::bind((addr, port)).await?;
     let mut opts = format!(" max-job-size={max_job_size}");
-    if let Some(b) = max_job_bytes {
-        opts.push_str(&format!(" max-jobs-size={b}"));
+    match max_job_bytes {
+        Some(b) => opts.push_str(&format!(" max-jobs-size={b}")),
+        // Always log it. Unlimited is now a deliberate opt-out rather than
+        // the default, so its absence from the line would be ambiguous.
+        None => opts.push_str(" max-jobs-size=unlimited"),
     }
     if let Some(b) = max_storage_bytes {
         opts.push_str(&format!(" max-storage-bytes={b}"));
+    }
+    match fd_budget.max_connections() {
+        Some(n) => opts.push_str(&format!(" max-connections={n}")),
+        None => opts.push_str(" max-connections=unlimited"),
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
@@ -3925,6 +4083,7 @@ pub async fn run_with_listener_limited(
         crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal,
         name,
+        Arc::new(FdBudget::new(Some(0))),
     )?;
     serve(listener, state, max_job_size).await
 }
@@ -3947,6 +4106,28 @@ pub async fn run_with_listener_sync_zero(
         Duration::ZERO,
         true,
         None,
+        Arc::new(FdBudget::new(Some(0))),
+    )?;
+    serve(listener, state, max_job_size).await
+}
+
+/// Test-only: run with an explicit connection ceiling, bypassing the
+/// fd-derived default. Lets the cap be exercised without depending on the
+/// test host's `ulimit -n`.
+pub async fn run_with_listener_max_connections(
+    listener: TcpListener,
+    max_job_size: u32,
+    max_connections: usize,
+) -> io::Result<()> {
+    let state = build_state(
+        max_job_size,
+        None,
+        None,
+        None,
+        crate::wal::DEFAULT_SYNC_INTERVAL,
+        false,
+        None,
+        Arc::new(FdBudget::new(Some(max_connections))),
     )?;
     serve(listener, state, max_job_size).await
 }
@@ -4082,6 +4263,8 @@ fn fail_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
 
 /// Run the engine task and accept loop with a fully-built [`ServerState`].
 async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32) -> io::Result<()> {
+    // Grabbed before `state` moves into the engine task.
+    let fd_budget_for_accept = Arc::clone(&state.fd_budget);
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
 
     // TOAST compaction lives in its own task: when a sealed segment's live
@@ -4238,6 +4421,13 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                 }
                 _ = tick_interval.tick() => {
                     state.tick();
+                    // Republish storage fd usage. Both counts move while the
+                    // server runs — TOAST holds one fd per segment and gains
+                    // them as bodies accumulate — so the connection ceiling is
+                    // recomputed from live numbers rather than a startup guess.
+                    let toast_fds = state.body_store.as_ref().map_or(0, |bs| bs.segment_count());
+                    let wal_fds = state.wal.as_ref().map_or(0, |w| w.file_count());
+                    state.fd_budget.set_storage_fds(toast_fds + wal_fds);
                     // SLA backstop. state.tick() can dirty the WAL via TTR
                     // expiry; pending is always empty here because the recv
                     // arm flushes its own before yielding.
@@ -4274,16 +4464,89 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to register SIGTERM handler");
 
+    let fd_budget = Arc::clone(&fd_budget_for_accept);
+    let mut last_refuse_warn: Option<std::time::Instant> = None;
+
+    // Rate-limit the accept-failure warning: under sustained fd exhaustion the
+    // loop retries every ACCEPT_BACKOFF, and logging each attempt would bury
+    // the log in duplicates of the same condition.
+    let mut last_accept_warn: Option<std::time::Instant> = None;
+
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (socket, peer) = result?;
+                let (socket, peer) = match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // An accept error must never terminate the server. These are
+                        // properties of one connection attempt or of transient
+                        // resource pressure — the listener stays valid, and bailing
+                        // out turns "briefly out of file descriptors" into a total
+                        // outage that needs a restart and a WAL replay.
+                        //
+                        // EMFILE/ENFILE need a backoff, not just a retry: the pending
+                        // connection keeps the listener readable, so an immediate
+                        // retry spins at 100% CPU for as long as the pressure lasts.
+                        // Sleeping also gives in-flight connections a chance to close
+                        // and free the descriptors we're waiting on.
+                        let exhausted = matches!(
+                            e.raw_os_error(),
+                            Some(libc::EMFILE) | Some(libc::ENFILE)
+                        );
+                        if last_accept_warn.is_none_or(|t| t.elapsed() >= ACCEPT_WARN_INTERVAL) {
+                            last_accept_warn = Some(std::time::Instant::now());
+                            if exhausted {
+                                tracing::warn!(
+                                    error = %e,
+                                    "accept failed: out of file descriptors — new connections \
+                                     are being refused. Raise the limit (ulimit -n); note TOAST \
+                                     holds one fd per segment, so a large body store reduces \
+                                     the headroom available to connections.",
+                                );
+                            } else {
+                                tracing::warn!(error = %e, "accept failed; continuing");
+                            }
+                        }
+                        if exhausted {
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        }
+                        continue;
+                    }
+                };
+                // Enforce the ceiling before spawning. The socket is already
+                // accepted at this point — there is no way to decline in the
+                // kernel — so refusing means closing it immediately. Dropped
+                // without a reply: the client has sent nothing yet, and an
+                // unsolicited line would be read as the response to whatever
+                // command it sends next.
+                if !fd_budget.try_acquire() {
+                    drop(socket);
+                    if last_refuse_warn.is_none_or(|t| t.elapsed() >= ACCEPT_WARN_INTERVAL) {
+                        last_refuse_warn = Some(std::time::Instant::now());
+                        tracing::warn!(
+                            peer = %peer,
+                            connections = fd_budget.connections(),
+                            max = fd_budget.max_connections().unwrap_or(0),
+                            storage_fds = fd_budget.storage_fds(),
+                            refused_total = fd_budget.refused(),
+                            "connection refused: at the connection ceiling. The default \
+                             ceiling is derived from the fd soft limit minus descriptors \
+                             held by TOAST/WAL; raise `ulimit -n` or set --max-connections.",
+                        );
+                    }
+                    continue;
+                }
                 let _ = socket.set_nodelay(true);
                 tracing::debug!("accepted connection from {}", peer);
 
                 let tx = engine_tx.clone();
+                let budget = Arc::clone(&fd_budget);
                 tokio::spawn(async move {
                     handle_connection(socket, tx, max_job_size).await;
+                    // Released here rather than inside handle_connection so the
+                    // slot is held for the socket's entire life, including the
+                    // drop at the end of this task.
+                    budget.release();
                 });
             }
             _ = sigint.recv() => {
@@ -4447,7 +4710,19 @@ async fn handle_connection(
                     // Verify trailing \r\n
                     if body_buf[body_size] != b'\r' || body_buf[body_size + 1] != b'\n' {
                         let _ = writer.write_all(b"EXPECTED_CRLF\r\n").await;
-                        continue;
+                        // Close rather than continue. A missing trailer means the
+                        // declared `<bytes>` disagreed with what the client sent, so
+                        // the stream is desynchronised and there is no way to locate
+                        // the next command boundary — the excess is an unknown length
+                        // by definition. Resuming the parse loop would interpret the
+                        // remainder of the *body* as commands, which turns a client
+                        // that miscounts bytes (UTF-16 `.length`, `String#length`
+                        // instead of `#bytesize`) into a command-injection path for
+                        // whoever controls the payload.
+                        //
+                        // beanstalkd resumes here; tuber deliberately does not. See
+                        // the over-long command line above for the same reasoning.
+                        break;
                     }
                     body_buf.truncate(body_size);
 

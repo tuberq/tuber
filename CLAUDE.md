@@ -64,7 +64,8 @@ structured `tracing` events on stderr; alerting belongs in the log pipeline.
 
 - `MAX_TUBE_NAME_LEN`: 201 (tube name max is 200 chars)
 - `URGENT_THRESHOLD`: 1024 (jobs with pri < 1024 are "urgent")
-- `JOB_DATA_SIZE_LIMIT_DEFAULT`: 65535 bytes
+- `JOB_DATA_SIZE_LIMIT_DEFAULT`: 1 MiB (1048576) — diverges from beanstalkd's 65535. Bodies live in TOAST, so the steady-state RAM cost of a large body is ~512 B of metadata; the default is instead sized by the *transient* cost, since a body is materialised in RAM in full on both put and reserve (`ServerState::fetch_body`).
+- `JOBS_SIZE_LIMIT_DEFAULT`: 1 GiB — default `--max-jobs-size`. `0` on the CLI means unlimited, matching the `max-jobs-size: 0` sentinel `stats` reports.
 - `JOB_DATA_SIZE_LIMIT_MAX`: 1GB (1073741824)
 - `MAX_TUBE_WEIGHT`: 9999 (for weighted reserve mode)
 - Default port: 11300
