@@ -518,13 +518,59 @@ synchronisation point.
   the bodies are gone, so the jobs are. Move the WAL aside too if you
   want a clean restart with no recovery noise.
 - **Stranded-body reclamation** — symmetric to missing-body reaping.
-  `cmd_put` writes TOAST first, then WAL; if the WAL write fails after
-  TOAST succeeded, the body sits in TOAST with no WAL reference at
-  all. On startup, the reclamation walks the TOAST index, drops any
-  `BodyId` that no live job points at, and force-compacts the
-  affected segments so the bytes physically leave disk (the new
-  current segment created by the rotation costs one 16-byte file
-  header). Counted as `reclaimed-stranded-bodies`.
+  On startup, the reclamation walks the TOAST index and drops any
+  `BodyId` that no live job points at. Counted as
+  `reclaimed-stranded-bodies`.
+
+  It then compacts the affected segments so the bytes physically leave
+  disk, but only those that have gone sparse (live ratio below
+  `COMPACTION_LIVE_RATIO_THRESHOLD`, the same bar
+  `compaction_candidate` applies on the background tick). Compaction
+  copies every *live* body out before unlinking, so rewriting a
+  mostly-live segment to reclaim a sliver is the wrong trade — and
+  startup, before the listener is up, is the worst moment to make it.
+  A qualifying segment that is still the current write target gets a
+  forced rotation first, since neither this pass nor the background
+  tick can compact the segment being appended to; the rotation costs
+  one 16-byte file header, and is skipped when the segment doesn't
+  qualify so a restart loop can't mint a segment per boot.
+
+  The orphan pass (`reclaimed-orphan-bodies`) hands its segments to
+  this step via `delete_many_tracking_segments`. Its ids are already
+  out of the index by then, so the scan above cannot rediscover their
+  segments — without the hand-off those bytes would wait for the
+  segment to seal on its own. One compaction step covers both passes;
+  the counters stay separate.
+
+  **This is normally routine, not a failure signal.** TOAST has no
+  on-disk deletion tombstone: `BodyStore::delete` drops the index
+  entry and decrements the segment's live-bytes counter, but the
+  bytes stay in the segment until compaction rewrites it. Because
+  `BodyStore::open` rebuilds the index by *scanning* the segment
+  files, every deleted-but-uncompacted body reappears as live on the
+  next start. Ones the retained WAL still names are re-killed by the
+  orphan pass (`reclaimed-orphan-bodies`); ones whose WAL segment has
+  already been reclaimed have no reference left anywhere and land
+  here. So the count tracks delete volume since the last compaction
+  of the affected segments.
+
+  It gets large when a segment never rotates: `compaction_candidate`
+  skips the current write segment, so a store that has only ever
+  filled one segment (default 64 MiB) accumulates every dead body
+  until either the segment fills or a restart triggers this pass —
+  which force-rotates and compacts, so the reclaim usually frees most
+  of the store's disk in one go.
+
+  A nonzero count also repeats across restarts when the garbage sits
+  in a segment above the compaction threshold: the bodies leave the
+  index each time but the bytes stay, so the next scan re-finds them.
+  That's working as intended — the segment isn't worth rewriting yet —
+  but it means a *stable* count is not by itself evidence of a leak.
+
+  The genuine leak lands here too: `cmd_put` writes TOAST first, then
+  WAL, so a WAL write that fails after `write_body` succeeded leaves
+  a body with no reference. On disk it is indistinguishable from
+  delete garbage — see the alerting note in the matrix below.
 
 ### TOAST/WAL write-failure matrix for one put
 
@@ -536,7 +582,7 @@ which startup path cleans it up.
 |   | TOAST ✓ | TOAST ✗ |
 |---|---------|---------|
 | **WAL ✓** | Happy path. Body durable, WAL durable. Client acked (immediately in relaxed mode, after sync in strict). | *Unreachable* — WAL is only attempted after `write_body` succeeds. |
-| **WAL ✗** | The leak. Body in TOAST, no WAL reference. WAL gets disabled (`self.wal = None`). On restart: stranded-body reclamation drops the index entry and force-compacts the segment. Counted as `reclaimed-stranded-bodies`. Alert on rate>0. | *Unreachable* — `write_body` errored first; cmd_put returned `INTERNAL_ERROR` and never touched WAL. Equivalent to TOAST ✗ alone. No state, no leak. |
+| **WAL ✗** | The leak. Body in TOAST, no WAL reference. WAL gets disabled (`self.wal = None`). On restart: stranded-body reclamation drops the index entry and force-compacts the segment. Counted as `reclaimed-stranded-bodies` — but so is ordinary delete garbage, so `rate>0` is *not* an alertable signal on its own (see above). The one signal that discriminates is the WAL write error itself: the leak always logs one and disables the WAL, and delete garbage never does. Alert on that. A count that grows restart over restart is corroborating, not diagnostic — threshold-gated compaction can carry the same garbage across several boots. | *Unreachable* — `write_body` errored first; cmd_put returned `INTERNAL_ERROR` and never touched WAL. Equivalent to TOAST ✗ alone. No state, no leak. |
 
 The complementary direction — WAL has a FullJob but TOAST is missing
 the body (segment header bit-rot, manual `rm`, the corruption-drop

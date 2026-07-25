@@ -1,5 +1,23 @@
 # Changes
 
+## Unreleased
+
+**Startup TOAST-reclamation logs no longer read as crash damage.** The stranded-body line was a `WARN` blaming "a partial put that didn't survive crash", which misdescribed the usual cause and put an alarming line in front of operators on ordinary restarts.
+
+TOAST has no on-disk deletion tombstone: a runtime delete drops the index entry and the bytes stay in the segment until compaction rewrites it. Since `BodyStore::open` rebuilds the index by *scanning* the segment files, every deleted-but-uncompacted body reappears as live on the next start and has to be re-reclaimed. Bodies the retained WAL still names go to the orphan pass; bodies whose WAL segment has already been reclaimed have no reference left anywhere and land in the stranded sweep. Both counts therefore track delete volume since the last compaction, not crashes.
+
+They get large when a segment never rotates. `compaction_candidate` skips the current write segment, so a store that has only ever filled one segment accumulates every dead body until the segment fills or a restart forces the issue — a real deployment showed 109,470 stranded bodies against 81 live ones in a single 39 MiB segment. That reclaim also force-rotates and compacts, so the pass usually frees most of the store's disk in one go; the line now reports how much.
+
+The genuine leak — `write_body` succeeded, the WAL write failed — still lands in the same counter and is indistinguishable from delete garbage on disk, so `reclaimed-stranded-bodies` rate>0 was never the alertable signal the metric help and `docs/wal-format.md` claimed. Both now point at the WAL write error the leak always logs, which is the one signal that discriminates.
+
+**Startup TOAST reclamation now covers both passes and skips segments not worth rewriting.** Two fixes to the same step, which pull in opposite directions on I/O and roughly cancel.
+
+The orphan pass deleted its ids straight out of the index, so the stranded scan — which derives its segment list by walking that index — could never see which segments had lost bytes. Unless a stranded body happened to share a segment with an orphan, the orphan bytes stayed on disk. That's more common than it sounds: orphans skew recent (the WAL must still hold both the `FullJob` and the delete record) and therefore cluster in the current write segment, while strandeds skew old and sit in sealed ones. The waste was bounded at roughly one segment, but it counted against `--max-storage-bytes`, so a restart near the cap could bounce puts with `OUT_OF_STORAGE` until compaction caught up. The pass now hands its segments forward via `delete_many_tracking_segments` and both share one compaction step. The counters stay separate.
+
+In the other direction, that compaction was unconditional: one stranded body in a 64 MiB segment that was 99% live triggered a full rewrite of it, at startup, before the listener was up. It now applies `COMPACTION_LIVE_RATIO_THRESHOLD` — the same bar `compaction_candidate` uses on the background tick — and the forced rotation of the current segment happens only when that segment actually qualifies, so a restart loop no longer mints a segment per boot.
+
+One consequence worth knowing: garbage in a segment above the threshold is now re-counted on every restart. The bodies leave the index each time, the bytes stay, the next scan re-finds them. A stable `reclaimed-stranded-bodies` across boots is therefore expected, not a leak signature — which is why the alerting advice above moved to the WAL write error.
+
 ## v0.12.1
 
 **`pause-tube <tube> 0` now unpauses immediately.** It is the documented unpause idiom — what `tuber-cli pause <t> --delay 0` and tuber-tui's `u` key both send — but a zero delay was floored to a full second, so the tube stayed genuinely paused for that second and `stats-tube` reported `pause: 1`.

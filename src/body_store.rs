@@ -19,7 +19,7 @@
 // reconstructed on startup by walking each segment's headers; body bytes
 // are skipped, so recovery cost is bounded by job count, not body volume.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
@@ -432,6 +432,32 @@ impl BodyStore {
         }
     }
 
+    /// `delete_many` that also reports which segments lost bodies.
+    /// Startup-only: the returned set feeds [`BodyStore::reclaim_stranded`]
+    /// so bytes dropped here are considered by the same compaction step,
+    /// instead of lingering until the segment happens to seal. The hot
+    /// `delete_many` path stays allocation-free.
+    pub fn delete_many_tracking_segments(&self, ids: &[BodyId]) -> HashSet<u64> {
+        let mut segs = HashSet::new();
+        if ids.is_empty() {
+            return segs;
+        }
+        let mut total_freed: u64 = 0;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for id in ids {
+                if let Some(seq) = inner.index.get(id).map(|loc| loc.seq) {
+                    segs.insert(seq);
+                }
+                total_freed += Self::delete_locked(&mut inner, *id);
+            }
+        }
+        if total_freed > 0 {
+            self.live_bytes.fetch_sub(total_freed, Ordering::Relaxed);
+        }
+        segs
+    }
+
     fn delete_locked(inner: &mut Inner, id: BodyId) -> u64 {
         if let Some(loc) = inner.index.remove(&id)
             && let Some(seg) = inner.segments.get_mut(&loc.seq)
@@ -502,20 +528,34 @@ impl BodyStore {
     }
 
     /// Drop every TOAST body whose `BodyId` is not in `live_ids`, then
-    /// compact any segment that lost bodies as a result. The compaction
-    /// step is what makes this idempotent: without it the bytes linger
-    /// in the segment file and `BodyStore::open` re-discovers them on
-    /// every restart. Compaction errors are non-fatal — the index drop
-    /// already succeeded, so the next regular compaction tick will
-    /// catch up.
-    pub fn reclaim_stranded(&self, live_ids: &std::collections::HashSet<BodyId>) -> u64 {
+    /// compact the segments that lost enough bytes to be worth
+    /// rewriting. Returns the number of bodies dropped by *this* call.
+    ///
+    /// `extra_segments` names segments already emptied out by a caller's
+    /// own `delete_many_tracking_segments` — the startup orphan pass.
+    /// Those ids are gone from the index by the time this runs, so the
+    /// scan below can't rediscover their segments; folding them in here
+    /// is what lets one compaction step cover both passes. They don't
+    /// count toward the return value.
+    ///
+    /// Compaction is what makes reclamation stick: without it the bytes
+    /// stay in the segment file and `BodyStore::open` re-indexes them on
+    /// the next restart. It is deliberately *not* unconditional, though
+    /// — see the threshold filter below. Compaction errors are
+    /// non-fatal; the index drop already succeeded and the next regular
+    /// tick will catch up.
+    pub fn reclaim_stranded(
+        &self,
+        live_ids: &std::collections::HashSet<BodyId>,
+        extra_segments: &HashSet<u64>,
+    ) -> u64 {
         // Snapshot stranded ids and the segments they live in under one
         // lock; release before doing per-segment compaction (which
         // takes the lock itself).
-        let (stranded, affected_segs): (Vec<BodyId>, std::collections::HashSet<u64>) = {
+        let (stranded, mut affected_segs): (Vec<BodyId>, HashSet<u64>) = {
             let inner = self.inner.lock().unwrap();
             let mut stranded = Vec::new();
-            let mut segs = std::collections::HashSet::new();
+            let mut segs = extra_segments.clone();
             for (id, loc) in inner.index.iter() {
                 if !live_ids.contains(id) {
                     stranded.push(*id);
@@ -525,20 +565,46 @@ impl BodyStore {
             (stranded, segs)
         };
 
-        if stranded.is_empty() {
-            return 0;
+        let count = stranded.len() as u64;
+        if !stranded.is_empty() {
+            self.delete_many(&stranded);
+        }
+        if affected_segs.is_empty() {
+            return count;
         }
 
-        let count = stranded.len() as u64;
-        self.delete_many(&stranded);
+        // Only rewrite segments that have actually gone sparse. Compaction
+        // copies every *live* body out before unlinking, so a segment
+        // that's still mostly live costs a full rewrite to reclaim a
+        // sliver — the same trade `compaction_candidate` declines to make
+        // on the background tick, and startup is the worst moment to pay
+        // it, since the server isn't accepting connections yet. The cost
+        // of declining: those bytes stay on disk and get re-counted on
+        // every restart until enough deletes push the segment under the
+        // threshold.
+        {
+            let inner = self.inner.lock().unwrap();
+            affected_segs.retain(|seq| match inner.segments.get(seq) {
+                Some(seg) if seg.total_bytes > 0 => {
+                    (seg.live_bytes as f64 / seg.total_bytes as f64)
+                        < COMPACTION_LIVE_RATIO_THRESHOLD
+                }
+                _ => false,
+            });
+        }
+        if affected_segs.is_empty() {
+            return count;
+        }
 
-        // If a stranded body sits in the *current* write segment,
-        // `compact_segment` would no-op on it (the current segment can
-        // still accept appends, and unlinking it would lose the next-
-        // write target). Force a rotation so that segment becomes
-        // sealed and compactable. Cost: a fresh 16-byte segment file
-        // that the next put will append into. Only worth it when the
-        // current segment is genuinely affected.
+        // A qualifying segment that is still the *current* write target
+        // can't be compacted in place — `compact_segment` no-ops on it
+        // (it can still accept appends, and unlinking it would lose the
+        // next-write target) and the background tick skips it for the
+        // same reason, so its garbage would sit there until the segment
+        // fills. Force a rotation to seal it. Cost: a fresh 16-byte
+        // segment file that the next put appends into. Gated on the
+        // threshold check above, so a restart loop doesn't mint a new
+        // segment on every boot.
         let current = self.inner.lock().unwrap().current_seq;
         if let Some(cur) = current
             && affected_segs.contains(&cur)
@@ -546,11 +612,12 @@ impl BodyStore {
             let mut inner = self.inner.lock().unwrap();
             if let Err(e) = inner.rotate(&self.dir) {
                 tracing::warn!(
-                    "stranded-body reclamation: rotation failed: {} \
-                     (current segment's strandeds will linger until next \
-                     compaction tick)",
+                    "TOAST reclamation: rotation failed: {} (the current \
+                     segment's dead bodies will linger until it fills)",
                     e,
                 );
+                // Still the write target — compacting it would no-op.
+                affected_segs.remove(&cur);
             } else {
                 self.total_bytes
                     .fetch_add(FILE_HEADER_SIZE as u64, Ordering::Relaxed);
@@ -558,12 +625,12 @@ impl BodyStore {
             }
         }
 
-        // Compact each affected segment so the bytes physically leave
+        // Compact each qualifying segment so the bytes physically leave
         // disk. compact_segment skips the (new) current segment.
         for seq in affected_segs {
             if let Err(e) = self.compact_segment(seq) {
                 tracing::warn!(
-                    "stranded-body compaction failed for segment {}: {} \
+                    "TOAST reclamation: compaction failed for segment {}: {} \
                      (bytes will linger until the next compaction tick)",
                     seq,
                     e,
@@ -1261,6 +1328,104 @@ mod tests {
         let _ = bs.write_body(b"alpha").unwrap();
         let _ = bs.write_body(b"beta").unwrap();
         assert_eq!(bs.compaction_candidate(0.5), None);
+    }
+
+    /// The orphan pass deletes its ids straight out of the index, so the
+    /// stranded scan can't rediscover their segments — they arrive via
+    /// `extra_segments` instead. Without that hand-off the bytes sit on
+    /// disk until the segment happens to seal and the background tick
+    /// picks it up.
+    #[test]
+    fn reclaim_stranded_compacts_segments_named_by_extra_segments() {
+        let tmp = TempDir::new().unwrap();
+        // 600-byte segments: each 500-byte body gets its own.
+        let bs = BodyStore::open(tmp.path(), 600).unwrap();
+        let id_a = bs.write_body(&vec![0xAA; 500]).unwrap(); // seg 0
+        let id_b = bs.write_body(&vec![0xBB; 500]).unwrap(); // seg 1
+        let id_c = bs.write_body(&vec![0xCC; 500]).unwrap(); // seg 2 (current)
+
+        // Stand in for the startup orphan pass: index-only delete, but
+        // remember which segment lost the body.
+        let orphan_segs = bs.delete_many_tracking_segments(&[id_a]);
+        assert_eq!(orphan_segs, HashSet::from([0]));
+        assert!(segment_path(tmp.path(), 0).exists());
+
+        let live: HashSet<BodyId> = HashSet::from([id_b, id_c]);
+
+        // Without the hand-off, nothing links seg 0 to the reclamation:
+        // id_a is already out of the index, so the scan finds nothing.
+        assert_eq!(bs.reclaim_stranded(&live, &HashSet::new()), 0);
+        assert!(
+            segment_path(tmp.path(), 0).exists(),
+            "seg 0 should still be on disk when its orphan isn't declared",
+        );
+
+        // With it, seg 0 is 0% live and gets compacted away.
+        assert_eq!(bs.reclaim_stranded(&live, &orphan_segs), 0);
+        assert!(
+            !segment_path(tmp.path(), 0).exists(),
+            "seg 0 should be unlinked once its orphan is declared",
+        );
+        // The live bodies are untouched.
+        assert_eq!(bs.read_body(id_b).unwrap(), vec![0xBB; 500]);
+        assert_eq!(bs.read_body(id_c).unwrap(), vec![0xCC; 500]);
+    }
+
+    /// Compaction copies every live body out, so a segment that's still
+    /// mostly live isn't worth rewriting — least of all at startup, before
+    /// the server accepts connections. The bodies still leave the index;
+    /// only the on-disk rewrite is declined.
+    #[test]
+    fn reclaim_stranded_leaves_mostly_live_segment_alone() {
+        let tmp = TempDir::new().unwrap();
+        let bs = BodyStore::open(tmp.path(), 64 * 1024).unwrap();
+        let id1 = bs.write_body(&vec![0x11; 1000]).unwrap();
+        let id2 = bs.write_body(&vec![0x22; 1000]).unwrap();
+        let id3 = bs.write_body(&vec![0x33; 1000]).unwrap();
+        let bytes_before = bs.total_bytes();
+
+        // Dropping one of three leaves the segment ~65% live.
+        let live: HashSet<BodyId> = HashSet::from([id1, id2]);
+        assert_eq!(bs.reclaim_stranded(&live, &HashSet::new()), 1);
+
+        assert!(!bs.contains_body(id3), "stranded body leaves the index");
+        assert_eq!(
+            bs.total_bytes(),
+            bytes_before,
+            "segment above the live-ratio threshold is not rewritten",
+        );
+        assert_eq!(
+            bs.segment_count(),
+            1,
+            "no rotation when the current segment doesn't qualify",
+        );
+    }
+
+    /// The counterpart: once the current segment goes sparse, reclamation
+    /// force-rotates it (the background tick never touches the write
+    /// target) and compacts it away in the same pass.
+    #[test]
+    fn reclaim_stranded_rotates_and_compacts_sparse_current_segment() {
+        let tmp = TempDir::new().unwrap();
+        let bs = BodyStore::open(tmp.path(), 64 * 1024).unwrap();
+        let id1 = bs.write_body(&vec![0x11; 1000]).unwrap();
+        let _id2 = bs.write_body(&vec![0x22; 1000]).unwrap();
+        let _id3 = bs.write_body(&vec![0x33; 1000]).unwrap();
+
+        // One of three live — 33%, under the 0.5 threshold.
+        let live: HashSet<BodyId> = HashSet::from([id1]);
+        assert_eq!(bs.reclaim_stranded(&live, &HashSet::new()), 2);
+
+        assert!(
+            !segment_path(tmp.path(), 0).exists(),
+            "seg 0 compacted away"
+        );
+        assert_eq!(
+            bs.segment_count(),
+            1,
+            "only the fresh current segment remains"
+        );
+        assert_eq!(bs.read_body(id1).unwrap(), vec![0x11; 1000]);
     }
 
     #[test]

@@ -3643,15 +3643,22 @@ fn build_state(
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
 
-        // Reclaim TOAST bodies whose owning job was deleted but whose
-        // pre-WAL-fsync `BodyStore::delete` never landed (server crashed
-        // between WAL fsync and TOAST cleanup). Without this, orphans
-        // accumulate on disk indefinitely.
+        // Drop TOAST index entries for bodies whose owning job the WAL
+        // replay saw deleted. Routine, not a crash signal: runtime
+        // `BodyStore::delete` is index-only — the bytes stay in the
+        // segment until compaction rewrites it — and `BodyStore::open`
+        // rebuilds the index by scanning those segments, so every
+        // deleted-but-uncompacted body comes back looking live. This
+        // pass re-kills the ones the retained WAL still names; the rest
+        // fall to the stranded sweep below. Only the counters differ —
+        // both are unreferenced bodies, so `orphan_segs` is handed to
+        // that sweep and the two share one compaction step.
+        let mut orphan_segs = std::collections::HashSet::new();
         if !orphan_bodies.is_empty() {
             state.stats.reclaimed_orphan_bodies = orphan_bodies.len() as u64;
-            body_store.delete_many(&orphan_bodies);
+            orphan_segs = body_store.delete_many_tracking_segments(&orphan_bodies);
             tracing::info!(
-                "WAL replay: reclaimed {} orphan TOAST bodies",
+                "TOAST: dropped {} bodies of jobs the WAL replay saw deleted",
                 orphan_bodies.len()
             );
         }
@@ -3727,20 +3734,33 @@ fn build_state(
         });
         state.stats.recovered_missing_bodies = recovered_missing_bodies;
 
-        // Reclaim TOAST bodies left orphan by a put that wrote the body
-        // but failed the WAL write. See "TOAST/WAL write-failure matrix"
-        // in docs/wal-format.md for the full failure analysis. The
-        // complementary direction (WAL FullJob with missing TOAST) is
-        // handled by the recovered-missing-bodies pass above.
+        // Reclaim every TOAST body no live job points at. Dominant cause
+        // is ordinary garbage: a job deleted at runtime frees its body
+        // from the index only, and once the WAL segment carrying its
+        // FullJob is reclaimed there is nothing left to name the body —
+        // so the startup scan re-indexes it and it lands here rather
+        // than in the orphan pass above. This is also the sweep that
+        // catches the genuine leak: a put that wrote the body but failed
+        // the WAL write. The two are indistinguishable on disk, so this
+        // logs at info; see "TOAST/WAL write-failure matrix" in
+        // docs/wal-format.md. The complementary direction (WAL FullJob
+        // with missing TOAST) is handled by the recovered-missing-bodies
+        // pass above.
         let live_body_ids = crate::job::live_external_body_ids(jobs.values().map(Box::as_ref));
-        let stranded_count = body_store.reclaim_stranded(&live_body_ids);
-        if stranded_count > 0 {
-            tracing::warn!(
-                "WAL→TOAST: reclaimed {} stranded TOAST bodies (no WAL reference — \
-                 likely a partial put that didn't survive crash)",
+        // Index-only deletes don't move `total_bytes`; compaction does. So
+        // this spans the whole reclamation, orphan segments included.
+        let bytes_before = body_store.total_bytes();
+        let stranded_count = body_store.reclaim_stranded(&live_body_ids, &orphan_segs);
+        state.stats.reclaimed_stranded_bodies = stranded_count;
+        let bytes_freed = bytes_before.saturating_sub(body_store.total_bytes());
+        if stranded_count > 0 || bytes_freed > 0 {
+            tracing::info!(
+                "TOAST: reclaimed {} unreferenced bodies, {} freed on disk \
+                 (deleted jobs whose segment hadn't been compacted, plus any \
+                 put whose WAL write failed)",
                 stranded_count,
+                crate::wal::format_bytes(bytes_freed),
             );
-            state.stats.reclaimed_stranded_bodies = stranded_count;
         }
 
         state.restore_jobs(jobs, next_id, tombstones, buried_order);

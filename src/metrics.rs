@@ -376,22 +376,27 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     prom_counter(
         &mut out,
         "tuber_reclaimed_orphan_bodies_total",
-        "TOAST bodies reclaimed at startup whose owning job was deleted \
-         in the WAL but whose runtime BodyStore::delete didn't land before \
-         the crash. Routine — small numbers indicate the reclamation path \
-         is working. Alert on a sustained upward trend across clean \
-         restarts (suggests a leak in the runtime delete path).",
+        "TOAST bodies dropped at startup because the WAL replay saw their \
+         owning job deleted. Routine: runtime deletes are index-only, so \
+         the startup segment scan re-indexes every deleted body that \
+         compaction hasn't yet rewritten away. Scales with delete volume \
+         since the last compaction, not with crashes — not worth alerting \
+         on by itself.",
         &stats,
         "reclaimed-orphan-bodies",
     );
     prom_counter(
         &mut out,
         "tuber_reclaimed_stranded_bodies_total",
-        "TOAST bodies reclaimed at startup that had no WAL reference at \
-         all — typically a partial put where write_body succeeded but \
-         the WAL write/fsync failed. Alert on rate>0 across clean \
-         restarts; every nonzero value indicates an acked put that didn't \
-         survive crash recovery.",
+        "TOAST bodies reclaimed at startup that no live job referenced. \
+         Usually routine — bodies of jobs deleted before their segment was \
+         compacted, whose WAL records have already been reclaimed — and \
+         large values are normal when a long-lived segment never rotated. \
+         Also covers the real leak (write_body succeeded, WAL write \
+         failed), which is indistinguishable on disk — alert on the WAL \
+         write error that leak always logs, not on rate>0 here. A count \
+         that repeats across restarts is expected when the garbage sits \
+         in a segment still above the compaction threshold.",
         &stats,
         "reclaimed-stranded-bodies",
     );
