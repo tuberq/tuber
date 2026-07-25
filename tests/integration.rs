@@ -1080,6 +1080,60 @@ async fn test_unpause_tube() {
     assert!(body.contains("pause-time-left: 0\n"));
 }
 
+/// A pause outlives the jobs that were in the tube when it was set.
+///
+/// The idle reaper collects any non-default tube that is empty and
+/// unused, and the pause lives nowhere but the `Tube` struct — so
+/// draining a paused tube used to discard the pause within one 100 ms
+/// tick. That breaks the ordinary "pause this tube while we investigate,
+/// let in-flight work finish" workflow: the pause disappears exactly when
+/// the last job does, and the next put is reservable immediately with no
+/// indication anything was lost.
+#[tokio::test]
+async fn test_pause_survives_tube_draining() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("use maint\r\n").await;
+    c.ckresp("USING maint\r\n").await;
+    c.mustsend("put 0 0 60 4\r\n").await;
+    c.mustsend("work\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    c.mustsend("pause-tube maint 86400\r\n").await;
+    c.ckresp("PAUSED\r\n").await;
+
+    // Drain it, then stop using it, so the pause is the only thing left
+    // holding the tube open — exactly the state the reaper collected.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("use default\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    // Several reaper ticks.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    c.mustsend("stats-tube maint\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("pause: 86400\n"),
+        "drained tube lost its pause: {body}"
+    );
+
+    // The pause must still be enforced against work arriving afterwards —
+    // the reason this matters beyond the stats output.
+    c.mustsend("use maint\r\n").await;
+    c.ckresp("USING maint\r\n").await;
+    c.mustsend("put 0 0 60 3\r\n").await;
+    c.mustsend("new\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("watch maint\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+}
+
 #[tokio::test]
 async fn test_reserve_ttr_deadline_soon() {
     let srv = TestServer::start().await;

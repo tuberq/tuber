@@ -176,6 +176,17 @@ impl Tube {
     /// structure, so `reserved_ct` is the only thing keeping a tube with
     /// in-flight jobs alive — without it, idle GC would delete the tube
     /// and release/bury/TTR-expiry would re-enqueue into a void.
+    ///
+    /// An unexpired pause also holds the tube open. The pause lives
+    /// nowhere but this struct, so reaping a drained-but-paused tube
+    /// silently discards it: the operator's "stop this tube while we
+    /// investigate" survives only as long as the last job does, and work
+    /// arriving afterwards is reservable immediately. Keeping it costs
+    /// nothing unbounded — `unpause_at` expires on its own, and the next
+    /// tick reaps the tube then. Deliberate divergence from beanstalkd,
+    /// which frees the tube on its refcount without consulting the pause.
+    /// Checked last so the clock read only happens for a tube that is
+    /// otherwise idle.
     pub fn is_idle(&self) -> bool {
         self.ready.is_empty()
             && self.delay.is_empty()
@@ -186,6 +197,7 @@ impl Tube {
             && self.idempotency_cooldowns.is_empty()
             && self.using_ct == 0
             && self.watching_ct == 0
+            && !self.is_paused()
     }
 }
 
@@ -347,5 +359,24 @@ mod tests {
         t.pause = Duration::from_secs(60);
         t.unpause_at = Some(Instant::now() + Duration::from_secs(60));
         assert!(t.is_paused());
+    }
+
+    /// The idle reaper is the only caller of `is_idle`, so a drained but
+    /// still-paused tube must report non-idle — otherwise the pause is
+    /// collected along with the tube and work arriving next is reservable
+    /// at once.
+    #[test]
+    fn test_drained_but_paused_tube_is_not_idle() {
+        let mut t = Tube::new("test");
+        assert!(t.is_idle(), "empty unpaused tube is idle");
+
+        t.pause = Duration::from_secs(60);
+        t.unpause_at = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!t.is_idle(), "a live pause holds a drained tube open");
+
+        // An expired pause must not pin the tube forever.
+        t.unpause_at = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!t.is_paused());
+        assert!(t.is_idle(), "expired pause releases the tube to the reaper");
     }
 }

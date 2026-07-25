@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A paused tube no longer loses its pause when it drains.** `pause-tube maint 300` followed by the tube emptying discarded the pause within one 100 ms tick, and work arriving afterwards was reservable immediately — with nothing logged and nothing in `stats-tube` to show it had happened, because the tube itself was gone.
+
+The idle reaper collects any non-`default` tube that is empty and unused, and `Tube::is_idle()` checked ready/delay/buried/waiting/reserved/idempotency/using/watching — everything except the pause, which lives nowhere but the `Tube` struct. So the pause survived exactly as long as the last job did. That breaks the ordinary shape of the feature: pause a tube while you investigate, let in-flight work finish, and the pause silently expires at the moment it starts mattering. A side effect of the same gap: `pause-tube` on an already-drained tube returns `NOT_FOUND`, since the tube was reaped before the command arrived.
+
+`is_idle()` now treats an unexpired pause as non-idle. Nothing grows without bound — `unpause_at` expires on its own and the next tick reaps the tube then — and the check is last in the `&&` chain, so the clock read only happens for a tube that is otherwise idle.
+
+This diverges from beanstalkd, which refcounts tubes and frees them without consulting the pause (`tube_dref` → `tube_free` → `ms_remove`); verified against 1.13, which drops a drained tube so eagerly that `pause-tube` on it fails outright. Reported from tuber-tui, where a paused-but-drained tube kept vanishing from the display.
+
+Not fixed, and worth knowing for client authors: the reaper still means a tube can disappear between a client's `list-tubes` and its follow-up `stats-tube <name>`, which then answers `NOT_FOUND`. That is inherent to reaping — it is a TOCTOU across two commands, present in beanstalkd for the same reason — so any client that iterates tubes must tolerate `NOT_FOUND` per tube rather than failing the whole poll.
+
 **Connection ceiling derived from the file-descriptor budget**, with `--max-connections` to override.
 
 There was no cap on concurrent connections, so a flood could take every descriptor in the process. That matters beyond connection availability: TOAST holds one open fd per ~64 MiB segment for the life of the process, so connections and job storage draw on the same pool, and connections winning means failed puts and unreadable bodies.
