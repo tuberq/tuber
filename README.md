@@ -4,7 +4,7 @@ A simple, fast job queue server. One binary, zero dependencies. Running in produ
 
 Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, delayed jobs, job reservations, and named tubes — and adds unique jobs, concurrency control, job group pipelines, batch operations, weighted queues, and offloaded job bodies.
 
-[![tuber-tui](screenshots/tui.png)](https://github.com/tuberq/tuber-rs)
+[![tuber-tui](screenshots/tuber-tui-server.png)](https://github.com/tuberq/tuber-rs)
 *[tuber-tui](https://github.com/tuberq/tuber-rs) — a terminal dashboard compatible with both Tuber and Beanstalkd.*
 
 ## Why Tuber?
