@@ -44,6 +44,19 @@ impl TestServer {
         TestServer { port, handle }
     }
 
+    async fn start_with_idle_timeout(idle_timeout: Duration) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_idle_timeout(listener, 65535, idle_timeout)
+                .await
+                .ok();
+        });
+
+        TestServer { port, handle }
+    }
+
     async fn start_with_max_jobs_size(max_jobs_size: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -126,6 +139,32 @@ impl TestConn {
         buf
     }
 
+    /// Assert the server closes this connection within `within`. Used by the
+    /// idle-pruning tests: a pruned connection is closed with no reply, so the
+    /// only thing the client observes is EOF.
+    async fn expect_closed(&mut self, within: Duration) {
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(within, self.reader.read(&mut buf))
+            .await
+            .expect("connection should have been closed")
+            .unwrap();
+        assert_eq!(n, 0, "expected EOF, got {n} bytes: {:?}", &buf[..n]);
+    }
+
+    /// Assert the server does *not* close this connection for `quiet`. The
+    /// inverse of `expect_closed`, for the cases pruning must leave alone.
+    async fn expect_still_open(&mut self, quiet: Duration) {
+        let mut buf = [0u8; 64];
+        if let Ok(res) = tokio::time::timeout(quiet, self.reader.read(&mut buf)).await {
+            let n = res.unwrap();
+            panic!(
+                "connection was closed or sent data while it should have been left \
+                 alone (read {n} bytes: {:?})",
+                &buf[..n]
+            );
+        }
+    }
+
     /// Read an OK <len>\r\n<body>\r\n response and return the full response
     /// (both lines concatenated).
     async fn read_ok_body(&mut self) -> String {
@@ -187,7 +226,7 @@ impl TestConn {
         let mut jobs = Vec::with_capacity(n);
         for _ in 0..n {
             let rline = self.readline().await;
-            let parts: Vec<&str> = rline.trim_end().split_whitespace().collect();
+            let parts: Vec<&str> = rline.split_whitespace().collect();
             assert_eq!(parts[0], "RESERVED", "expected RESERVED, got {:?}", rline);
             let id: u64 = parts[1].parse().unwrap();
             let bytes: usize = parts[2].parse().unwrap();
@@ -4203,7 +4242,7 @@ async fn test_reserve_batch_concurrency_key() {
 
     // Put 5 jobs with concurrency limit of 2
     for i in 0..5u32 {
-        let cmd = format!("put 0 0 120 3 con:key:2\r\n");
+        let cmd = "put 0 0 120 3 con:key:2\r\n".to_string();
         c.mustsend(&cmd).await;
         c.mustsend(&format!("jb{i}\r\n")).await;
         c.ckrespsub("INSERTED").await;
@@ -4762,6 +4801,140 @@ async fn test_max_connections_refuses_over_ceiling() {
         body.contains("current-connections: 3"),
         "a freed slot should be reusable: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Idle pruning
+// ---------------------------------------------------------------------------
+
+/// One idle period for the pruning tests. Long enough that ordinary scheduling
+/// jitter can't be mistaken for an idle client, short enough to keep the suite
+/// quick.
+const IDLE_PERIOD: Duration = Duration::from_secs(1);
+
+/// Comfortably more than one idle period — used both as the deadline for
+/// "should be closed by now" and as the quiet window for "should have been left
+/// alone", so a connection that survives this has survived at least two checks.
+const PAST_IDLE: Duration = Duration::from_millis(2500);
+
+/// The cheapest way to hold a connection slot hostage: connect and send
+/// nothing at all. Such a connection has no `ConnState` on the server (that is
+/// created lazily on first command), so it is invisible to anything that
+/// inspects connection state — the timer has to live in the connection's own
+/// task to catch it.
+#[tokio::test]
+async fn test_silent_connection_is_pruned() {
+    let server = TestServer::start_with_idle_timeout(IDLE_PERIOD).await;
+
+    let mut silent = server.connect().await;
+    silent.expect_closed(PAST_IDLE).await;
+
+    // The close is counted, and the configured period is reported so an
+    // operator can tell pruning is on without checking the process args.
+    let mut probe = server.connect().await;
+    probe.mustsend("stats\r\n").await;
+    let body = probe.read_ok_body().await;
+    assert!(
+        body.contains("connections-pruned: 1"),
+        "prune should be counted: {body}"
+    );
+    assert!(
+        body.contains("conn-idle-timeout: 1"),
+        "period should be reported: {body}"
+    );
+}
+
+/// The case that makes a naive idle timeout dangerous: a worker that reserved a
+/// job and is now *running* it sends nothing for as long as the work takes.
+/// Closing it would release the job back to the queue and present as a random
+/// worker death, so the engine vetoes the prune.
+#[tokio::test]
+async fn test_connection_holding_reserved_job_is_not_pruned() {
+    let server = TestServer::start_with_idle_timeout(IDLE_PERIOD).await;
+
+    let mut worker = server.connect().await;
+    let id = worker.put_and_reserve(0, 0, 120, "slow work").await;
+
+    // Silent for several periods while "working".
+    worker.expect_still_open(PAST_IDLE).await;
+
+    // Still the same connection, still holding the same job.
+    worker.mustsend(&format!("delete {id}\r\n")).await;
+    worker.ckresp("DELETED\r\n").await;
+
+    worker.mustsend("stats\r\n").await;
+    let body = worker.read_ok_body().await;
+    assert!(
+        body.contains("connections-pruned: 0"),
+        "a busy worker must not be pruned: {body}"
+    );
+}
+
+/// A worker parked in a blocking `reserve` is silent but entirely legitimate —
+/// and it is the normal steady state for a worker pool on a quiet queue. It is
+/// excluded structurally rather than by predicate: the task is blocked awaiting
+/// the engine's reply, not reading, so its idle timer cannot fire at all.
+#[tokio::test]
+async fn test_parked_reserve_is_not_pruned() {
+    let server = TestServer::start_with_idle_timeout(IDLE_PERIOD).await;
+
+    let mut worker = server.connect().await;
+    worker.mustsend("reserve\r\n").await;
+
+    // No reply and no close, however long the queue stays empty.
+    worker.expect_still_open(PAST_IDLE).await;
+
+    // And the parked reserve is still live: a job put now is handed to it.
+    let mut producer = server.connect().await;
+    let id = producer.put_job(0, 0, 120, "late").await;
+    let line = worker.readline().await;
+    assert_eq!(
+        line,
+        format!("RESERVED {id} 4\r\n"),
+        "parked reserve should still be served"
+    );
+}
+
+/// A connection sending bytes but never completing a command. The deadline runs
+/// from the last completed command, not from the last byte, so dribbling can't
+/// hold a slot open indefinitely by resetting the timer.
+#[tokio::test]
+async fn test_incomplete_command_line_is_pruned() {
+    let server = TestServer::start_with_idle_timeout(IDLE_PERIOD).await;
+
+    let mut conn = server.connect().await;
+    conn.mustsend("stat").await; // no newline: the command never completes
+    conn.expect_closed(PAST_IDLE).await;
+}
+
+/// A `put` header commits the connection to a body. Without the deadline
+/// covering the body read too, one header followed by silence would be a
+/// one-line bypass of the entire idle timeout.
+#[tokio::test]
+async fn test_put_header_without_body_is_pruned() {
+    let server = TestServer::start_with_idle_timeout(IDLE_PERIOD).await;
+
+    let mut conn = server.connect().await;
+    conn.mustsend("put 0 0 120 5\r\n").await;
+    conn.expect_closed(PAST_IDLE).await;
+}
+
+/// A connection that keeps working is left alone across many periods' worth of
+/// wall clock, because each completed command restarts the deadline.
+#[tokio::test]
+async fn test_active_connection_is_not_pruned() {
+    let server = TestServer::start_with_idle_timeout(IDLE_PERIOD).await;
+
+    let mut conn = server.connect().await;
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        conn.mustsend("stats\r\n").await;
+        let body = conn.read_ok_body().await;
+        assert!(
+            body.contains("connections-pruned: 0"),
+            "an active connection must not be pruned: {body}"
+        );
+    }
 }
 
 /// A `put` whose declared `<bytes>` is shorter than the body actually sent
@@ -6045,7 +6218,7 @@ async fn test_many_waiters_concurrency_keyed_drain() {
                     break;
                 }
                 assert!(line.starts_with("RESERVED "), "{:?}", line);
-                let parts: Vec<&str> = line.trim_end().split_whitespace().collect();
+                let parts: Vec<&str> = line.split_whitespace().collect();
                 let id: u64 = parts[1].parse().unwrap();
                 let body_len: usize = parts[2].parse().unwrap();
                 let mut body_buf = vec![0u8; body_len + 2];

@@ -12,6 +12,22 @@ This diverges from beanstalkd, which refcounts tubes and frees them without cons
 
 Not fixed, and worth knowing for client authors: the reaper still means a tube can disappear between a client's `list-tubes` and its follow-up `stats-tube <name>`, which then answers `NOT_FOUND`. That is inherent to reaping — it is a TOCTOU across two commands, present in beanstalkd for the same reason — so any client that iterates tubes must tolerate `NOT_FOUND` per tube rather than failing the whole poll.
 
+**Idle connections can now be pruned**, with `--conn-idle-timeout <secs>` (off by default).
+
+The connection ceiling below bounds the damage from a client that opens connections and never closes them — storage keeps its descriptors and the process survives — but nothing reclaimed, so those slots stayed held until the client disconnected and everyone else stayed locked out.
+
+Pruning needs care rather than a plain timeout, because the connections most worth keeping are the silent ones. **A worker parked in `reserve` sends nothing at all** — that is the normal steady state for a worker pool on a quiet queue — and **a worker running jobs it reserved is silent for as long as the work takes**. A "no traffic for N seconds" sweep would close exactly those, releasing in-flight jobs back to the queue and presenting as random worker deaths whenever the queue went quiet.
+
+So the decision is split. The connection's own task owns the timer and closes only after the engine confirms the connection holds nothing (not parked in `reserve`, no reserved jobs). Putting the timer in the task rather than in the engine tick makes a parked `reserve` safe structurally rather than by predicate — that task is blocked awaiting its reply, not reading, so its timer cannot fire — and it catches the case an engine-side sweep would miss entirely: a connection that has never sent a command has no `ConnState` at all, since registration is lazy, which makes connect-and-send-nothing both the cheapest way to hold a slot and invisible to anything walking the connection table.
+
+Worth recording for anyone who reaches for it later: the predicate that suggests itself, `!ConnState::is_waiting()`, would not have worked. `CONN_TYPE_WAITING` is defined but never set anywhere, so `is_waiting()` is always false. The authoritative source for "parked in reserve" is the engine's waiter list.
+
+The deadline runs from the last *completed command* rather than the last byte, and covers the `put` body read and the two refused-body drain paths as well as the command line. Each of those was otherwise a bypass: a client could stay immortal by dribbling one byte per period, or by sending a single `put` header and then going quiet. Pruning closes with no reply — the client isn't awaiting one, and an unsolicited line would be read as the response to whatever it sends next — so clients see a clean EOF.
+
+New in `stats` and `/metrics`: `connections-pruned` and `conn-idle-timeout` (`tuber_connections_pruned_total`, `tuber_conn_idle_timeout_seconds`).
+
+Off by default because the period is a judgement about your clients, not about tuber. The awkward case is not the worker pool — those are protected — but a long-lived producer that puts a job rarely: a connection held open for an hourly job is indistinguishable from an abandoned socket. Sizing guidance in [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md).
+
 **Connection ceiling derived from the file-descriptor budget**, with `--max-connections` to override.
 
 There was no cap on concurrent connections, so a flood could take every descriptor in the process. That matters beyond connection availability: TOAST holds one open fd per ~64 MiB segment for the life of the process, so connections and job storage draw on the same pool, and connections winning means failed puts and unreadable bodies.

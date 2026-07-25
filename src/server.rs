@@ -92,6 +92,13 @@ pub struct FdBudget {
     storage: AtomicUsize,
     /// Connections refused because the cap was reached.
     refused: AtomicU64,
+    /// How long a connection may sit without completing a command before it is
+    /// eligible for pruning. `None` disables pruning entirely (the default) —
+    /// see [`handle_connection`] for why the timer lives in the connection task
+    /// rather than in the engine tick.
+    idle_timeout: Option<Duration>,
+    /// Connections closed by idle pruning.
+    pruned: AtomicU64,
 }
 
 impl FdBudget {
@@ -102,7 +109,15 @@ impl FdBudget {
             connections: AtomicUsize::new(0),
             storage: AtomicUsize::new(0),
             refused: AtomicU64::new(0),
+            idle_timeout: None,
+            pruned: AtomicU64::new(0),
         }
+    }
+
+    /// Enable idle pruning. `None` or a zero duration leaves it off.
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout.filter(|d| !d.is_zero());
+        self
     }
 
     /// Current connection ceiling, or `None` for unlimited (no override, and
@@ -172,6 +187,22 @@ impl FdBudget {
     pub fn soft_limit(&self) -> Option<usize> {
         self.soft_limit
     }
+
+    /// Idle-pruning period, or `None` when pruning is disabled.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
+    }
+
+    pub fn pruned(&self) -> u64 {
+        self.pruned.load(Ordering::Relaxed)
+    }
+
+    /// Count one idle-pruned connection. Called by the engine, which is the
+    /// only place that decides a connection is prunable — the slot itself is
+    /// returned by the usual `release` when the connection task ends.
+    fn note_pruned(&self) {
+        self.pruned.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Wall-clock budget for compaction work per tick. Each tick drains as
@@ -220,6 +251,13 @@ enum EnginePayload {
         cmd: Command,
         body: Option<Vec<u8>>,
         reply_tx: oneshot::Sender<Response>,
+    },
+    /// "This connection has gone quiet past the idle timeout — is it holding
+    /// anything?" Answered `true` when it is safe to close. The connection task
+    /// owns the timer (see [`handle_connection`]); only the engine knows what
+    /// the connection holds, so the decision is split across the two.
+    IdleCheck {
+        reply_tx: oneshot::Sender<bool>,
     },
     Disconnect,
     Shutdown,
@@ -680,6 +718,35 @@ impl ServerState {
                 let cost = Self::tombstone_memory_cost(&k);
                 self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
             }
+        }
+    }
+
+    /// Is it safe to close this connection for being idle?
+    ///
+    /// The connection task has already established that no bytes have arrived
+    /// for a full idle period and that it is not parked awaiting a reserve
+    /// reply. What it cannot see is the engine's view: a worker that reserved
+    /// jobs and is now busy running them sends nothing for as long as the work
+    /// takes, and closing it would release those jobs back to the queue and
+    /// present as a random worker death.
+    ///
+    /// `None` — no `ConnState` at all — means the connection has never sent a
+    /// command, so `handle_command` never auto-registered it. That is the
+    /// cheapest way to hold a slot hostage (connect, send nothing) and is
+    /// exactly what pruning is for, so it prunes.
+    ///
+    /// The waiter scan is belt and braces: a connection parked in `reserve` is
+    /// blocked awaiting its reply rather than reading, so its timer cannot fire
+    /// in the first place. It is `waiters` and not `ConnState::is_waiting()`
+    /// because `CONN_TYPE_WAITING` is never actually set anywhere — that
+    /// predicate would silently always be false.
+    fn conn_is_prunable(&self, conn_id: u64) -> bool {
+        if self.waiters.iter().any(|w| w.conn_id == conn_id) {
+            return false;
+        }
+        match self.conns.get(&conn_id) {
+            None => true,
+            Some(conn) => conn.reserved_jobs.is_empty(),
         }
     }
 
@@ -1234,11 +1301,10 @@ impl ServerState {
         // rule, let a stale high limit widen concurrency for later jobs.
 
         // Register idempotency key in tube index
-        if let Some(key_tuple) = job.idempotency_key() {
-            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+        if let Some(key_tuple) = job.idempotency_key()
+            && let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.idempotency_keys.insert(key_tuple.0.clone(), id);
             }
-        }
 
         // Track group membership
         if let Some(grp) = job.group() {
@@ -3002,6 +3068,8 @@ impl ServerState {
              fd-connections-used: {}\n\
              max-connections: {}\n\
              connections-refused: {}\n\
+             connections-pruned: {}\n\
+             conn-idle-timeout: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -3086,6 +3154,14 @@ impl ServerState {
             self.fd_budget.connections(),
             self.fd_budget.max_connections().unwrap_or(0),
             self.fd_budget.refused(),
+            self.fd_budget.pruned(),
+            // Seconds; 0 is the "disabled" sentinel, consistent with the other
+            // 0-means-no-limit fields above. Rounded *up* so a sub-second
+            // timeout (only reachable from tests) reports 1 rather than
+            // reading as disabled.
+            self.fd_budget
+                .idle_timeout()
+                .map_or(0, |d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
@@ -3689,6 +3765,20 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("byte count {s:?} overflows u64"))
 }
 
+/// Everything [`build_state`] needs, bundled so the CLI entry point and the
+/// test-only `run_with_listener*` variants name their knobs at the call site
+/// rather than lining up eight positional arguments.
+struct StateConfig<'a> {
+    max_job_size: u32,
+    max_job_bytes: Option<u64>,
+    max_storage_bytes: Option<u64>,
+    wal_dir: Option<&'a Path>,
+    sync_interval: Duration,
+    migrate_wal: bool,
+    name: Option<String>,
+    fd_budget: Arc<FdBudget>,
+}
+
 /// Build ServerState, replaying the WAL if `wal_dir` is set.
 ///
 /// On a large binlog this can take seconds to minutes and allocate
@@ -3699,16 +3789,17 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
 ///
 /// May return `io::ErrorKind::OutOfMemory` if, after replaying the WAL,
 /// the actual in-memory job set exceeds `max_job_bytes`.
-fn build_state(
-    max_job_size: u32,
-    max_job_bytes: Option<u64>,
-    max_storage_bytes: Option<u64>,
-    wal_dir: Option<&Path>,
-    sync_interval: Duration,
-    migrate_wal: bool,
-    name: Option<String>,
-    fd_budget: Arc<FdBudget>,
-) -> io::Result<ServerState> {
+fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
+    let StateConfig {
+        max_job_size,
+        max_job_bytes,
+        max_storage_bytes,
+        wal_dir,
+        sync_interval,
+        migrate_wal,
+        name,
+        fd_budget,
+    } = cfg;
     let mut state = ServerState::new(
         max_job_size,
         max_job_bytes,
@@ -3953,6 +4044,9 @@ fn build_state(
 /// makes TCP-level health checks (e.g. `nc -z host 11300`) an honest signal of
 /// readiness — during replay there is nothing to connect to, rather than a
 /// listening socket that silently never calls `accept()`.
+// One parameter per server CLI flag; clap already owns the grouping, and the
+// wide list stops here — everything past the listener travels as [`StateConfig`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     addr: &str,
     port: u16,
@@ -3965,19 +4059,20 @@ pub async fn run(
     metrics_port: Option<u16>,
     name: Option<String>,
     max_connections: Option<usize>,
+    conn_idle_timeout: Option<Duration>,
 ) -> io::Result<()> {
     let wal_path = wal_dir.map(Path::new);
-    let fd_budget = Arc::new(FdBudget::new(max_connections));
-    let state = build_state(
+    let fd_budget = Arc::new(FdBudget::new(max_connections).with_idle_timeout(conn_idle_timeout));
+    let state = build_state(StateConfig {
         max_job_size,
         max_job_bytes,
         max_storage_bytes,
-        wal_path,
+        wal_dir: wal_path,
         sync_interval,
         migrate_wal,
-        name.clone(),
-        Arc::clone(&fd_budget),
-    )?;
+        name: name.clone(),
+        fd_budget: Arc::clone(&fd_budget),
+    })?;
 
     let listener = TcpListener::bind((addr, port)).await?;
     let mut opts = format!(" max-job-size={max_job_size}");
@@ -3993,6 +4088,11 @@ pub async fn run(
     match fd_budget.max_connections() {
         Some(n) => opts.push_str(&format!(" max-connections={n}")),
         None => opts.push_str(" max-connections=unlimited"),
+    }
+    // Only logged when enabled: pruning is opt-in, so its absence is the
+    // documented default rather than an ambiguous omission.
+    if let Some(d) = fd_budget.idle_timeout() {
+        opts.push_str(&format!(" conn-idle-timeout={}s", d.as_secs()));
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
@@ -4075,16 +4175,16 @@ pub async fn run_with_listener_limited(
     migrate_wal: bool,
     name: Option<String>,
 ) -> io::Result<()> {
-    let state = build_state(
+    let state = build_state(StateConfig {
         max_job_size,
         max_job_bytes,
         max_storage_bytes,
         wal_dir,
-        crate::wal::DEFAULT_SYNC_INTERVAL,
+        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal,
         name,
-        Arc::new(FdBudget::new(Some(0))),
-    )?;
+        fd_budget: Arc::new(FdBudget::new(Some(0))),
+    })?;
     serve(listener, state, max_job_size).await
 }
 
@@ -4098,16 +4198,16 @@ pub async fn run_with_listener_sync_zero(
     max_job_size: u32,
     wal_dir: &Path,
 ) -> io::Result<()> {
-    let state = build_state(
+    let state = build_state(StateConfig {
         max_job_size,
-        None,
-        Some(1024 * 1024 * 1024),
-        Some(wal_dir),
-        Duration::ZERO,
-        true,
-        None,
-        Arc::new(FdBudget::new(Some(0))),
-    )?;
+        max_job_bytes: None,
+        max_storage_bytes: Some(1024 * 1024 * 1024),
+        wal_dir: Some(wal_dir),
+        sync_interval: Duration::ZERO,
+        migrate_wal: true,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0))),
+    })?;
     serve(listener, state, max_job_size).await
 }
 
@@ -4119,16 +4219,37 @@ pub async fn run_with_listener_max_connections(
     max_job_size: u32,
     max_connections: usize,
 ) -> io::Result<()> {
-    let state = build_state(
+    let state = build_state(StateConfig {
         max_job_size,
-        None,
-        None,
-        None,
-        crate::wal::DEFAULT_SYNC_INTERVAL,
-        false,
-        None,
-        Arc::new(FdBudget::new(Some(max_connections))),
-    )?;
+        max_job_bytes: None,
+        max_storage_bytes: None,
+        wal_dir: None,
+        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
+        migrate_wal: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(max_connections))),
+    })?;
+    serve(listener, state, max_job_size).await
+}
+
+/// Test-only: run with idle pruning enabled at `idle_timeout`, which
+/// production reaches via `--conn-idle-timeout`. Sub-second values are allowed
+/// here so tests don't have to sleep for whole seconds.
+pub async fn run_with_listener_idle_timeout(
+    listener: TcpListener,
+    max_job_size: u32,
+    idle_timeout: Duration,
+) -> io::Result<()> {
+    let state = build_state(StateConfig {
+        max_job_size,
+        max_job_bytes: None,
+        max_storage_bytes: None,
+        wal_dir: None,
+        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
+        migrate_wal: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0)).with_idle_timeout(Some(idle_timeout))),
+    })?;
     serve(listener, state, max_job_size).await
 }
 
@@ -4232,6 +4353,17 @@ fn process_message(
                 }
                 DispatchOutcome::Deferred => {}
             }
+            ProcessResult::Continue
+        }
+        EnginePayload::IdleCheck { reply_tx } => {
+            let prune = state.conn_is_prunable(msg.conn_id);
+            // Counted here rather than in the connection task: a `true` answer
+            // is acted on unconditionally, and this is the only place with the
+            // shared budget to count into.
+            if prune {
+                state.fd_budget.note_pruned();
+            }
+            let _ = reply_tx.send(prune);
             ProcessResult::Continue
         }
         EnginePayload::Disconnect => {
@@ -4541,8 +4673,9 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
 
                 let tx = engine_tx.clone();
                 let budget = Arc::clone(&fd_budget);
+                let idle_timeout = fd_budget.idle_timeout();
                 tokio::spawn(async move {
-                    handle_connection(socket, tx, max_job_size).await;
+                    handle_connection(socket, tx, max_job_size, idle_timeout).await;
                     // Released here rather than inside handle_connection so the
                     // slot is held for the socket's entire life, including the
                     // drop at the end of this task.
@@ -4599,10 +4732,240 @@ const MAX_U64_DIGITS: usize = 20;
 /// For reference, put with all extensions is 891 bytes (well under this limit).
 const MAX_LINE_LEN: u64 = (13 + MAX_DELETE_BATCH * (MAX_U64_DIGITS + 1) + 2) as u64;
 
+/// Outcome of reading one command line from a client.
+enum LineRead {
+    /// A complete, newline-terminated line is in `line_buf`.
+    Line,
+    /// The peer closed cleanly.
+    Eof,
+    /// `MAX_LINE_LEN` bytes accumulated with no newline in sight.
+    TooLong,
+    Error(io::Error),
+    /// Idle past the timeout, and the engine confirmed the connection holds
+    /// nothing. Close it without a reply.
+    Idle,
+}
+
+/// The idle deadline has passed with nothing read. Ask the engine whether this
+/// connection is holding anything; `true` means close it.
+///
+/// A `false` answer resets `last_activity`, which is what keeps a busy worker
+/// from being re-checked in a tight loop: the next check is then a full idle
+/// period away rather than immediate, since nothing else would ever move the
+/// timestamp for a connection that is silent by nature.
+///
+/// An unreachable or dead engine answers `false` — never close a connection we
+/// could not verify. The connection loop is about to fail on its own anyway,
+/// because its next command reply will come from the same channel.
+async fn engine_approves_prune(
+    conn_id: u64,
+    engine_tx: &mpsc::Sender<EngineMsg>,
+    last_activity: &mut Instant,
+) -> bool {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sent = engine_tx
+        .send(EngineMsg {
+            conn_id,
+            payload: EnginePayload::IdleCheck { reply_tx },
+        })
+        .await
+        .is_ok();
+    if sent && reply_rx.await.unwrap_or(false) {
+        return true;
+    }
+    *last_activity = Instant::now();
+    false
+}
+
+/// Read one command line, enforcing the idle deadline if one is configured.
+///
+/// Retries around a fired-but-refused deadline rather than returning, so a busy
+/// connection resumes the same read. That is safe because `read_until` appends
+/// into a caller-owned buffer and consumes as it copies: a cancelled attempt
+/// loses the byte *count* (which the caller does not use) but never the bytes.
+/// The `take` budget is recomputed from what has already accumulated, so a
+/// client dribbling a line across several attempts still stops at
+/// `MAX_LINE_LEN` in total rather than getting a fresh allowance each time.
+async fn read_command_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    line_buf: &mut Vec<u8>,
+    conn_id: u64,
+    engine_tx: &mpsc::Sender<EngineMsg>,
+    idle_timeout: Option<Duration>,
+    last_activity: &mut Instant,
+) -> LineRead {
+    loop {
+        // Limit the read to prevent unbounded memory growth from clients that
+        // send data without a newline. Matches beanstalkd behavior.
+        let remaining = MAX_LINE_LEN.saturating_sub(line_buf.len() as u64);
+        if remaining == 0 {
+            return LineRead::TooLong;
+        }
+        // Bound to a local so the `Take` adaptor outlives the read future it is
+        // borrowed by; both are dropped before the next attempt, which is what
+        // lets the recomputed `remaining` above take effect on a resumed read.
+        let mut limited = (&mut *reader).take(remaining);
+        let read = limited.read_until(b'\n', line_buf);
+
+        let result = match idle_timeout {
+            None => read.await,
+            Some(limit) => {
+                // Budget measured from the last *completed command*, not from
+                // the start of this attempt: a client sending one byte per
+                // almost-a-period must still hit the deadline instead of
+                // resetting it forever.
+                let left = limit.saturating_sub(last_activity.elapsed());
+                match tokio::time::timeout(left, read).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        if engine_approves_prune(conn_id, engine_tx, last_activity).await {
+                            return LineRead::Idle;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+
+        return match result {
+            Ok(0) => LineRead::Eof,
+            Ok(_) if line_buf.ends_with(b"\n") => LineRead::Line,
+            Ok(_) => LineRead::TooLong,
+            Err(e) => LineRead::Error(e),
+        };
+    }
+}
+
+/// Fill `buf` completely, enforcing the idle deadline if one is configured.
+///
+/// Hand-rolled rather than `read_exact` because the deadline has to be able to
+/// interrupt this read too. A `put` header commits the connection to a body,
+/// and without this a client could send one header and then go silent forever —
+/// a one-line bypass of the whole idle timeout. `read_exact` cannot be used
+/// under a cancelling timeout: its progress lives inside the future, so a
+/// cancelled attempt loses track of how much landed and a restart would refill
+/// from the top. Tracking `filled` here keeps a resumed read correct.
+///
+/// Returns `Ok(true)` when the buffer is full, `Ok(false)` when the deadline
+/// fired and the engine agreed to close.
+async fn read_body_exact(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    buf: &mut [u8],
+    conn_id: u64,
+    engine_tx: &mpsc::Sender<EngineMsg>,
+    idle_timeout: Option<Duration>,
+    last_activity: &mut Instant,
+) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let read = reader.read(&mut buf[filled..]);
+        let n = match idle_timeout {
+            None => read.await?,
+            Some(limit) => {
+                let left = limit.saturating_sub(last_activity.elapsed());
+                match tokio::time::timeout(left, read).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        if engine_approves_prune(conn_id, engine_tx, last_activity).await {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        filled += n;
+    }
+    Ok(true)
+}
+
+/// Chunk size for discarding a body the server has already refused. The point
+/// is to consume the bytes, not to keep them, and a refused body can be up to
+/// `JOB_DATA_SIZE_LIMIT_MAX`.
+const DRAIN_CHUNK: usize = 8192;
+
+/// Discard exactly `n` bytes, enforcing the idle deadline if one is configured.
+///
+/// Used after the server has answered `JOB_TOO_BIG` or rejected a `put` line:
+/// the declared body is still inbound and has to be consumed so it isn't parsed
+/// as commands. Loops over a small scratch buffer instead of
+/// `io::copy(take(n), sink())` so a deadline that fires part-way through knows
+/// how much is left and can resume — `copy` reports its progress only on
+/// success, so a cancelled one loses the count.
+///
+/// Returns `Ok(true)` when fully drained, `Ok(false)` when the deadline fired
+/// and the engine agreed to close.
+async fn drain_bytes(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    n: u64,
+    conn_id: u64,
+    engine_tx: &mpsc::Sender<EngineMsg>,
+    idle_timeout: Option<Duration>,
+    last_activity: &mut Instant,
+) -> io::Result<bool> {
+    // Heap, not a `[u8; DRAIN_CHUNK]` local: this future is awaited from
+    // `handle_connection`, and an inline array would be folded into that state
+    // machine's size for every connection's whole lifetime, not just while
+    // draining. Right-sized for small refusals, and allocated only on this
+    // already-exceptional path.
+    let mut scratch = vec![0u8; n.min(DRAIN_CHUNK as u64) as usize];
+    let mut left = n;
+    while left > 0 {
+        let want = left.min(DRAIN_CHUNK as u64) as usize;
+        let read = reader.read(&mut scratch[..want]);
+        let got = match idle_timeout {
+            None => read.await?,
+            Some(limit) => {
+                let limit_left = limit.saturating_sub(last_activity.elapsed());
+                match tokio::time::timeout(limit_left, read).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        if engine_approves_prune(conn_id, engine_tx, last_activity).await {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        if got == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        left -= got as u64;
+    }
+    Ok(true)
+}
+
+/// Serve one client connection.
+///
+/// **Idle pruning.** When `idle_timeout` is set, a connection that neither
+/// completes a command nor sends a byte for that long is closed. The timer lives
+/// here, in the connection's own task, rather than as a sweep over `ConnState`
+/// in the engine tick, for three reasons:
+///
+/// - A worker parked in `reserve` — silent, but the single most legitimate thing
+///   a connection can be doing, and the normal steady state for a worker pool —
+///   is blocked awaiting its reply below, not reading. Its timer structurally
+///   cannot fire, so it is excluded by construction instead of by a predicate
+///   that has to be remembered and got right.
+/// - A connection that has never sent a command has no `ConnState` at all
+///   (`handle_command` registers lazily), so an engine-side sweep would miss the
+///   cheapest way to hold a slot: connect and send nothing.
+/// - No per-tick clock scan across every connection.
+///
+/// What this task cannot see is whether the connection holds reserved jobs, so
+/// the deadline asks the engine before acting (`EnginePayload::IdleCheck`).
+/// Closing is silent, for the same reason a refused connection is: the client is
+/// not awaiting a reply, so an unsolicited line would be read as the response to
+/// whatever it sends next.
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     engine_tx: mpsc::Sender<EngineMsg>,
     max_job_size: u32,
+    idle_timeout: Option<Duration>,
 ) {
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -4614,30 +4977,41 @@ async fn handle_connection(
     // errors on invalid UTF-8).
     let mut line_buf: Vec<u8> = Vec::new();
     let mut resp_buf = Vec::with_capacity(256);
+    let mut last_activity = Instant::now();
 
     loop {
         line_buf.clear();
-        // Limit read to MAX_LINE_LEN to prevent unbounded memory growth from
-        // clients that send data without a newline. Matches beanstalkd behavior.
-        let _n = match (&mut reader)
-            .take(MAX_LINE_LEN)
-            .read_until(b'\n', &mut line_buf)
-            .await
+        match read_command_line(
+            &mut reader,
+            &mut line_buf,
+            conn_id,
+            &engine_tx,
+            idle_timeout,
+            &mut last_activity,
+        )
+        .await
         {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if !line_buf.ends_with(b"\n") {
-                    // Line exceeded MAX_LINE_LEN without a newline — bad client
-                    let _ = writer.write_all(b"BAD_FORMAT\r\n").await;
-                    break;
-                }
-                n
+            LineRead::Line => {}
+            LineRead::Eof => break,
+            LineRead::TooLong => {
+                // Line exceeded MAX_LINE_LEN without a newline — bad client
+                let _ = writer.write_all(b"BAD_FORMAT\r\n").await;
+                break;
             }
-            Err(e) => {
+            LineRead::Error(e) => {
                 tracing::debug!("read error for conn {}: {}", conn_id, e);
                 break;
             }
-        };
+            LineRead::Idle => {
+                tracing::debug!(
+                    conn_id,
+                    idle_secs = idle_timeout.map_or(0, |d| d.as_secs()),
+                    "closing idle connection",
+                );
+                break;
+            }
+        }
+        last_activity = Instant::now();
 
         // Strip trailing \r\n (byte-wise), then require valid UTF-8. A non-UTF-8
         // command line is answered with UNKNOWN_COMMAND — byte-oriented
@@ -4670,11 +5044,18 @@ async fn handle_connection(
                 // commands. Mirrors the JOB_TOO_BIG drain path below.
                 if let Some(body_size) = protocol::put_declared_body_len(cmd_str) {
                     let to_drain = body_size as u64 + 2;
-                    if tokio::io::copy(&mut (&mut reader).take(to_drain), &mut tokio::io::sink())
-                        .await
-                        .is_err()
+                    match drain_bytes(
+                        &mut reader,
+                        to_drain,
+                        conn_id,
+                        &engine_tx,
+                        idle_timeout,
+                        &mut last_activity,
+                    )
+                    .await
                     {
-                        break;
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => break,
                     }
                 }
                 continue;
@@ -4695,18 +5076,41 @@ async fn handle_connection(
                 let _ = writer.write_all(b"JOB_TOO_BIG\r\n").await;
                 // Drain the body + \r\n so the connection stays usable
                 let to_drain = body_size as u64 + 2;
-                if tokio::io::copy(&mut (&mut reader).take(to_drain), &mut tokio::io::sink())
-                    .await
-                    .is_err()
+                match drain_bytes(
+                    &mut reader,
+                    to_drain,
+                    conn_id,
+                    &engine_tx,
+                    idle_timeout,
+                    &mut last_activity,
+                )
+                .await
                 {
-                    break;
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
                 }
                 continue;
             }
 
             let mut body_buf = vec![0u8; body_size + 2]; // +2 for \r\n
-            match reader.read_exact(&mut body_buf).await {
-                Ok(_) => {
+            match read_body_exact(
+                &mut reader,
+                &mut body_buf,
+                conn_id,
+                &engine_tx,
+                idle_timeout,
+                &mut last_activity,
+            )
+            .await
+            {
+                // Deadline fired mid-body and the engine agreed to close. The
+                // partial body is discarded with the connection; nothing was
+                // acked, so the client's put simply never happened.
+                Ok(false) => {
+                    tracing::debug!(conn_id, "closing idle connection mid-body");
+                    break;
+                }
+                Ok(true) => {
                     // Verify trailing \r\n
                     if body_buf[body_size] != b'\r' || body_buf[body_size + 1] != b'\n' {
                         let _ = writer.write_all(b"EXPECTED_CRLF\r\n").await;

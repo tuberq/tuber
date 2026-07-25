@@ -217,6 +217,20 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "connections-refused",
     );
+    prom_counter(
+        &mut out,
+        "tuber_connections_pruned_total",
+        "Connections closed for being idle",
+        &stats,
+        "connections-pruned",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_conn_idle_timeout_seconds",
+        "Idle-pruning period in seconds (0 if disabled)",
+        &stats,
+        "conn-idle-timeout",
+    );
     prom_gauge(
         &mut out,
         "tuber_producers_current",

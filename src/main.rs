@@ -133,6 +133,21 @@ enum Commands {
         #[arg(long, env = "TUBER_MAX_CONNECTIONS")]
         max_connections: Option<usize>,
 
+        /// Close connections idle for this many seconds. 0 (the default)
+        /// disables pruning.
+        ///
+        /// "Idle" means the connection has neither completed a command nor sent
+        /// a byte for the whole period, *and* the server has confirmed it is
+        /// holding nothing: a worker parked in `reserve` or still running jobs
+        /// it reserved is never closed, however long it stays silent. Without
+        /// this, a client that opens connections and leaves them open holds
+        /// slots against the connection ceiling until it disconnects. Pick a
+        /// period comfortably longer than your slowest legitimate client gap —
+        /// a producer that puts a job once an hour on a long-lived connection
+        /// looks exactly like an abandoned socket.
+        #[arg(long, env = "TUBER_CONN_IDLE_TIMEOUT", default_value_t = 0)]
+        conn_idle_timeout: u64,
+
         /// Maximum total on-disk size for the WAL + body store combined.
         /// PUT returns OUT_OF_STORAGE once exceeded; reserve / release /
         /// bury / kick / delete always succeed (they only ever shrink the
@@ -290,6 +305,7 @@ async fn run() {
             max_job_size,
             max_jobs_size,
             max_connections,
+            conn_idle_timeout,
             max_storage_bytes,
             migrate_wal,
             verbose,
@@ -342,6 +358,8 @@ async fn run() {
                 metrics_port,
                 name,
                 max_connections,
+                // 0 means disabled, matching the other 0-is-no-limit knobs.
+                (conn_idle_timeout != 0).then(|| Duration::from_secs(conn_idle_timeout)),
             )
             .await
             {

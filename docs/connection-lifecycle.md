@@ -39,7 +39,10 @@ descriptors that connections cannot have.
                  ├─ set_nodelay, spawn per-connection task
                  ├─ command loop: read line (≤ MAX_LINE_LEN) → dispatch → reply
                  │     ├─ over-long line with no newline ─→ BAD_FORMAT, close
-                 │     └─ put body trailer missing        ─→ EXPECTED_CRLF, close
+                 │     ├─ put body trailer missing        ─→ EXPECTED_CRLF, close
+                 │     └─ idle past --conn-idle-timeout ─→ engine IdleCheck
+                 │             ├─ holds nothing ─→ count prune, close (no reply)
+                 │             └─ busy          ─→ resume the read
                  └─ task ends ─→ engine Disconnect ─→ FdBudget::release()
 ```
 
@@ -108,6 +111,8 @@ but without a backoff, so it busy-spins and floods the log for the duration.
 | `fd-connections-used` | `tuber_fd_connections_used` | descriptors held by clients |
 | `max-connections` | `tuber_fd_max_connections` | current ceiling (0 = unlimited) |
 | `connections-refused` | `tuber_connections_refused_total` | cumulative refusals |
+| `connections-pruned` | `tuber_connections_pruned_total` | cumulative idle closes |
+| `conn-idle-timeout` | `tuber_conn_idle_timeout_seconds` | pruning period (0 = disabled) |
 
 **What to alert on:** the *ratio* `tuber_fd_connections_used /
 tuber_fd_max_connections` approaching 1, and any rise in
@@ -134,27 +139,67 @@ The TOAST term is the one that surprises people: a 16 GiB body store is ~256
 segments, so on a 1024-descriptor limit it has already taken a quarter of the
 budget. `BodyStore` warns once when open segments reach 75% of the soft limit.
 
-## Not yet implemented
+## Idle pruning
 
-**Idle pruning.** Nothing reclaims a connection that is merely sitting there,
-so a client holding connections open at the ceiling locks out others until it
-disconnects. The cap bounds the damage — storage keeps its descriptors and the
-process survives — but it does not reclaim.
+The cap bounds the damage but does not reclaim: without pruning, a client that
+opens connections and leaves them open holds those slots until it disconnects,
+locking others out. `--conn-idle-timeout <secs>` closes connections that have
+gone quiet. **Off by default** (`0`), because "quiet" is normal for a lot of
+legitimate clients and the cost of getting the period wrong is dropped work.
 
-The reason it needs care rather than a simple timeout: **a worker blocked in
-`reserve` is silent but completely legitimate**, and that is the normal steady
-state for a worker pool — hundreds of connections sending nothing for hours. A
-naive "no traffic for N seconds" sweep would kill exactly the connections most
-worth keeping, and would present as random worker deaths whenever the queue is
-quiet. A connection holding reserved jobs is likewise busy, not idle.
+A connection is pruned when *both* halves agree:
 
-The safe predicate is therefore narrower than "no traffic":
+| Checked by | Condition |
+|---|---|
+| Connection task | No completed command and no byte received for the whole period |
+| Engine (`IdleCheck`) | Not parked in `reserve`, and `reserved_jobs` is empty |
 
-```rust
-conn.last_activity.elapsed() > idle_timeout
-    && !conn.is_waiting()             // not parked in reserve
-    && conn.reserved_jobs.is_empty()  // not mid-job
-```
+The split matters. **A worker blocked in `reserve` is silent but completely
+legitimate** — that is the normal steady state for a worker pool, hundreds of
+connections sending nothing for hours — and **a worker running jobs it reserved
+is silent for as long as the work takes**. A naive "no traffic for N seconds"
+sweep would kill exactly the connections most worth keeping and present as
+random worker deaths whenever the queue is quiet.
 
-`is_waiting()` and `reserved_jobs` already exist on `ConnState`; a
-`last_activity` timestamp does not yet.
+### Why the timer lives in the connection task
+
+Not as a sweep over `ConnState` in the engine tick, for three reasons:
+
+- **A parked `reserve` is excluded structurally.** That task is blocked awaiting
+  the engine's reply, not reading, so its timer cannot fire at all — no
+  predicate to remember and get right. (The predicate that suggests itself,
+  `!ConnState::is_waiting()`, would not have worked anyway: `CONN_TYPE_WAITING`
+  is defined but never set anywhere, so `is_waiting()` is always false. The
+  authoritative source for "parked" is the engine's `waiters` list.)
+- **A connection that has never sent a command has no `ConnState`.**
+  `handle_command` registers lazily, so connect-and-send-nothing — the cheapest
+  way to hold a slot — is invisible to anything walking `conns`. The per-task
+  timer catches it; the engine answers `true` for an unknown id.
+- No per-tick clock scan across every connection.
+
+The deadline runs from the last *completed command*, not the last byte received,
+and it covers the body read and the two refused-body drain paths as well as the
+command line. Otherwise each of those would be a bypass: a client could hold a
+slot forever by dribbling one byte per period, or by sending a single `put`
+header and then going silent.
+
+Pruning closes with no reply, for the same reason a refused connection does: the
+client is not waiting on anything, so an unsolicited line would be read as the
+response to whatever it sends next. Clients see a clean EOF. Each close
+increments `connections-pruned`.
+
+### Choosing a period
+
+Pick one comfortably longer than the longest gap your legitimate clients leave
+between commands. The awkward case is not the worker pool — those are protected
+— but a **long-lived producer that puts a job rarely**: a connection held open
+for an hourly job looks exactly like an abandoned socket, and gets closed. Most
+clients reconnect transparently; ones that don't will surface the close as an
+error on their next `put`.
+
+The period also sets a small engine cost. A connection the engine vetoes is
+re-checked once per period for as long as it stays silent, so the steady-state
+message rate is roughly `busy_silent_connections / period` — negligible at
+sensible settings (10k workers on a 60 s period is ~170 msg/s), but worth not
+combining a very short period with a very large worker pool, since the engine is
+single-threaded. A pruned connection costs one message, once.
