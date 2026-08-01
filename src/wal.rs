@@ -337,6 +337,13 @@ pub struct Position {
     pub offset: u64,
 }
 
+impl Position {
+    /// Sorts below every real position (segments start at 1, records at
+    /// `HEADER_SIZE`), so a reader opened here yields the whole log. This
+    /// is the bootstrap cursor: the WAL is its own base backup.
+    pub const ZERO: Position = Position { seg: 0, offset: 0 };
+}
+
 /// A WAL record at the moment of its append, in logical (pre-serialization)
 /// form. Field-for-field identical to what `deserialize_record` yields for
 /// the same bytes, so a consumer sees one record shape whether it taps the
@@ -1303,6 +1310,31 @@ pub(crate) fn format_bytes(n: u64) -> String {
 
 // --- WAL file management ---
 
+/// Path of segment `seq` in `dir`. The zero-padding is cosmetic (keeps
+/// `ls` sorted); parsing is lenient about width.
+fn segment_path(dir: &Path, seq: u64) -> PathBuf {
+    dir.join(format!("{}{:06}", FILE_PREFIX, seq))
+}
+
+/// Sequence numbers of every segment present in `dir`, ascending.
+/// Non-segment names — including `.corrupt` quarantine sidecars, whose
+/// suffix fails the numeric parse — are skipped.
+fn list_segment_seqs(dir: &Path) -> io::Result<Vec<u64>> {
+    let mut seqs: Vec<u64> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(seq_str) = name.strip_prefix(FILE_PREFIX)
+            && let Ok(seq) = seq_str.parse::<u64>()
+        {
+            seqs.push(seq);
+        }
+    }
+    seqs.sort();
+    Ok(seqs)
+}
+
 struct WalFile {
     seq: u64,
     path: PathBuf,
@@ -1711,23 +1743,8 @@ impl Wal {
     }
 
     fn scan_dir(&mut self) -> io::Result<()> {
-        let mut seqs: Vec<u64> = Vec::new();
-
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(seq_str) = name.strip_prefix(FILE_PREFIX)
-                && let Ok(seq) = seq_str.parse::<u64>()
-            {
-                seqs.push(seq);
-            }
-        }
-
-        seqs.sort();
-
-        for seq in seqs {
-            let path = self.dir.join(format!("{}{:06}", FILE_PREFIX, seq));
+        for seq in list_segment_seqs(&self.dir)? {
+            let path = segment_path(&self.dir, seq);
             let meta = fs::metadata(&path)?;
             let bytes = meta.len() as usize;
             self.files.push_back(WalFile {
@@ -1748,7 +1765,7 @@ impl Wal {
     }
 
     fn file_path(&self, seq: u64) -> PathBuf {
-        self.dir.join(format!("{}{:06}", FILE_PREFIX, seq))
+        segment_path(&self.dir, seq)
     }
 
     fn create_next_file(&mut self) -> io::Result<()> {
@@ -2733,6 +2750,144 @@ impl Wal {
             Some(n) => {
                 self.fail_io_after = Some(n - 1);
                 Ok(())
+            }
+        }
+    }
+}
+
+// --- Positioned reading ---
+
+/// Read-only iterator over WAL records from a starting [`Position`].
+///
+/// A `WalReader` opens segment files independently of any live [`Wal`] —
+/// it takes no locks and shares no state with the writer, so it can run
+/// against a directory the engine is actively appending to. It exists for
+/// consumers that need history before they can follow the live
+/// [`WalObserver`] tee: catch-up scans, backups, audit tails.
+///
+/// The segment list is snapshotted at [`open`](WalReader::open); segments
+/// created afterwards are not visible. To follow a growing log, drain the
+/// reader, then re-open from [`position`](WalReader::position) — re-opening
+/// at a boundary the reader reported is exact (no overlap, no gap), and a
+/// consumer that also interleaves a live tee dedupes by comparing each
+/// teed record's position against its cursor.
+///
+/// Two ends are distinguished deliberately:
+/// - **The durable frontier.** The writer buffers up to `BUF_CAPACITY`
+///   bytes in userland, so the newest segment's tail may be absent or
+///   half-present in the file. A truncated parse *there* is not
+///   corruption — the reader reports "no more records" and its position
+///   stays put, ready to resume once the writer flushes.
+/// - **Real corruption.** A truncated or bad record in any *sealed*
+///   segment (one a newer segment follows) is an error. Unlike
+///   [`Wal::replay`], the reader never quarantines or mutates files —
+///   diagnosis belongs to the owning process, not an external scanner.
+pub struct WalReader {
+    dir: PathBuf,
+    /// Segments still to visit, ascending. The last entry is the snapshot's
+    /// newest — the only one where a truncated tail is benign.
+    seqs: VecDeque<u64>,
+    current: Option<SegmentCursor>,
+    /// Where the next record will be read from; see [`position`](Self::position).
+    pos: Position,
+}
+
+/// One loaded segment mid-iteration.
+struct SegmentCursor {
+    seq: u64,
+    version: u32,
+    data: Vec<u8>,
+    offset: usize,
+    /// Snapshot-newest: truncation here means "caught up", not corruption.
+    newest: bool,
+}
+
+impl WalReader {
+    /// Open a reader over `dir`, positioned at `from`. Records at
+    /// positions `>= from` will be yielded; use [`Position::ZERO`] to read
+    /// everything. `from` must be a record boundary previously reported by
+    /// this module (an observer tee, a reader, or `ZERO`) — an arbitrary
+    /// offset lands mid-record and reads garbage.
+    pub fn open(dir: impl Into<PathBuf>, from: Position) -> io::Result<WalReader> {
+        let dir = dir.into();
+        let seqs: VecDeque<u64> = list_segment_seqs(&dir)?
+            .into_iter()
+            .filter(|&s| s >= from.seg)
+            .collect();
+        Ok(WalReader {
+            dir,
+            seqs,
+            current: None,
+            pos: from,
+        })
+    }
+
+    /// The resume cursor: the position of the next record this reader
+    /// would yield. After `next_record` returns `Ok(None)` this is where a
+    /// later reader should [`open`](Self::open) from — it only ever moves
+    /// forward, and it never points into the middle of a record.
+    pub fn position(&self) -> Position {
+        self.pos
+    }
+
+    /// Yield the next record and the position it was read from, or
+    /// `Ok(None)` when the snapshot is exhausted (including a buffered
+    /// tail not yet flushed by the writer — see the type docs).
+    pub fn next_record(&mut self) -> Result<Option<(Position, WalRecord)>, WalError> {
+        loop {
+            let Some(cur) = self.current.as_mut() else {
+                let Some(seq) = self.seqs.pop_front() else {
+                    return Ok(None);
+                };
+                let newest = self.seqs.is_empty();
+                let data = match fs::read(segment_path(&self.dir, seq)) {
+                    Ok(d) => d,
+                    // Compacted away between listing and read: its live
+                    // records were migrated to newer segments we'll visit.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(WalError::Io(e)),
+                };
+                let version = match read_header(&data) {
+                    Ok((v, _flags)) => v,
+                    // A sub-header newest segment is the benign artifact of
+                    // a crash between creation and the header fsync (replay
+                    // removes it quietly for the same reason).
+                    Err(WalError::Truncated) if newest => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                // First segment resumes at the cursor; later ones start at
+                // the top. ZERO's offset clamps up to the header.
+                let start = if seq == self.pos.seg {
+                    (self.pos.offset as usize).max(HEADER_SIZE)
+                } else {
+                    HEADER_SIZE
+                };
+                self.pos = Position { seg: seq, offset: start as u64 };
+                self.current = Some(SegmentCursor { seq, version, data, offset: start, newest });
+                continue;
+            };
+
+            // `offset > len` happens when resuming at a boundary the writer
+            // has not flushed yet — same answer as an exact-end segment:
+            // nothing more to read here.
+            if cur.offset >= cur.data.len() {
+                let last = self.seqs.is_empty();
+                self.current = None;
+                if last {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            match deserialize_record(&cur.data[cur.offset..], cur.version) {
+                Ok((record, consumed)) => {
+                    let pos = Position { seg: cur.seq, offset: cur.offset as u64 };
+                    cur.offset += consumed;
+                    self.pos = Position { seg: cur.seq, offset: cur.offset as u64 };
+                    return Ok(Some((pos, record)));
+                }
+                Err(WalError::Truncated) if cur.newest => return Ok(None),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -5657,5 +5812,126 @@ mod tests {
             );
         }
         assert_eq!(teed, in_files);
+    }
+
+    // --- WalReader ---
+
+    /// Drain a reader into `(Position, SeenRecord)` pairs — the same shape
+    /// the observer tee records, so tests can compare the two directly.
+    fn drain_reader(reader: &mut WalReader) -> Vec<(Position, SeenRecord)> {
+        let mut out = Vec::new();
+        while let Some((pos, record)) = reader.next_record().unwrap() {
+            out.push((pos, seen_in_file(&record)));
+        }
+        out
+    }
+
+    #[test]
+    fn test_reader_yields_what_the_tee_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny max segment size so the log spans several segments — the
+        // reader must walk rotations exactly as the tee positioned them.
+        let mut wal =
+            Wal::open(dir.path(), WalConfig::with_max_file_size(HEADER_SIZE + 1)).unwrap();
+        let (events, _syncs) = attach_recording_observer(&mut wal);
+
+        let mut job1 = make_test_job(1, b"one");
+        let mut job2 = make_test_job(2, b"two");
+        let mut job3 = make_test_job(3, b"three");
+        wal.write_put(&mut job1).unwrap();
+        wal.write_put(&mut job2).unwrap();
+        wal.write_state_change(
+            &mut job1,
+            Some(JobState::Buried),
+            5,
+            Duration::ZERO,
+            0,
+            StateChangeReason::Bury,
+        )
+        .unwrap();
+        wal.write_put(&mut job3).unwrap();
+        wal.write_state_change(&mut job2, None, 0, Duration::ZERO, 0, StateChangeReason::None)
+            .unwrap();
+        wal.sync().unwrap(); // flush so the reader can see every byte
+
+        let mut reader = WalReader::open(dir.path(), Position::ZERO).unwrap();
+        let read = drain_reader(&mut reader);
+        assert_eq!(read, *events.lock().unwrap());
+        assert_eq!(
+            reader.position(),
+            wal.end_position(),
+            "a drained reader's cursor is the log's end"
+        );
+    }
+
+    #[test]
+    fn test_reader_resumes_from_mid_log_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal =
+            Wal::open(dir.path(), WalConfig::with_max_file_size(HEADER_SIZE + 1)).unwrap();
+        let (events, _syncs) = attach_recording_observer(&mut wal);
+
+        for id in 1..=5 {
+            let mut job = make_test_job(id, b"x");
+            wal.write_put(&mut job).unwrap();
+        }
+        wal.sync().unwrap();
+        let events = events.lock().unwrap();
+
+        // Read two records, capture the cursor, then resume with a fresh
+        // reader — exactly the drain/re-open loop a follower runs.
+        let mut first = WalReader::open(dir.path(), Position::ZERO).unwrap();
+        first.next_record().unwrap().unwrap();
+        first.next_record().unwrap().unwrap();
+        let cursor = first.position();
+        drop(first);
+
+        let mut resumed = WalReader::open(dir.path(), cursor).unwrap();
+        let rest = drain_reader(&mut resumed);
+        assert_eq!(
+            rest, events[2..],
+            "resume must yield exactly the records after the cursor"
+        );
+
+        // Resuming from the tee's own positions works identically: open at
+        // the 4th record's teed position, get it and everything after.
+        let mut from_tee = WalReader::open(dir.path(), events[3].0).unwrap();
+        assert_eq!(drain_reader(&mut from_tee), events[3..]);
+    }
+
+    #[test]
+    fn test_reader_stops_at_buffered_tail_then_sees_it_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+
+        // Unsynced: the record sits in the BufWriter, invisible to a file
+        // read — only the id mark the segment opened with is on disk. The
+        // reader must report a clean end after it, not an error, and hold
+        // its cursor at the unflushed boundary.
+        let mut job = make_test_job(1, b"buffered");
+        wal.write_put(&mut job).unwrap();
+
+        let mut reader = WalReader::open(dir.path(), Position::ZERO).unwrap();
+        assert_eq!(
+            drain_reader(&mut reader),
+            vec![(
+                Position { seg: 1, offset: HEADER_SIZE as u64 },
+                // The put that opens the segment counts in its mark.
+                SeenRecord::IdMark { high_water: 1 }
+            )]
+        );
+        let cursor = reader.position();
+        assert_eq!(
+            cursor,
+            Position { seg: 1, offset: (HEADER_SIZE + ID_MARK_RECORD_SIZE) as u64 }
+        );
+
+        // After the flush, resuming from that cursor yields the record.
+        wal.sync().unwrap();
+        let mut resumed = WalReader::open(dir.path(), cursor).unwrap();
+        assert_eq!(
+            drain_reader(&mut resumed),
+            vec![(cursor, SeenRecord::Put { job_id: 1 })]
+        );
     }
 }
