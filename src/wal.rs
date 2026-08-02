@@ -56,7 +56,7 @@ const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 const BODY_KIND_INLINE: u8 = 0x00;
 const BODY_KIND_EXTERNAL: u8 = 0x01;
 const BODY_KIND_EXTERNAL_CRC: u8 = 0x02; // v9
-const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
+const HEADER_SIZE: usize = 12; // magic(4) + version(4) + generation(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
 const RECORD_TYPE_TOMBSTONE: u8 = 0x03; // v8
@@ -595,6 +595,11 @@ impl<B: AsRef<[u8]>> ScheduleEntryList for Vec<ScheduleRecord<B>> {
 /// alone can't provide: resolving external body references, scanning the
 /// history that predates the attach, and knowing where that history ends.
 pub struct ObserverContext {
+    /// Lineage of the log being observed; see [`Wal::promote`]. An
+    /// observer that ships records to a peer needs this to answer "are we
+    /// even talking about the same log" — segment numbers repeat across a
+    /// promotion, so a position alone cannot.
+    pub generation: u32,
     /// The live body store, if one is attached (the server always attaches
     /// one before the observer; a bare `Wal` may not). Resolving a
     /// `BodyRef::External` reference goes through this — reads follow the
@@ -1404,15 +1409,20 @@ fn uncopied_segment_error(path: &Path, damage: &str, err: &io::Error) -> io::Err
     ))
 }
 
-fn write_header(w: &mut impl Write) -> io::Result<()> {
+fn write_header(w: &mut impl Write, generation: u32) -> io::Result<()> {
     w.write_all(WAL_MAGIC)?;
     w.write_all(&WAL_VERSION.to_le_bytes())?;
-    w.write_all(&0u32.to_le_bytes())?; // reserved flags
+    w.write_all(&generation.to_le_bytes())?;
     Ok(())
 }
 
-/// Returns `(version, flags)` from a WAL file header. Validates that the
-/// version is within the supported range.
+/// Returns `(version, generation)` from a WAL file header. Validates that
+/// the version is within the supported range.
+///
+/// The third word was reserved-and-always-zero through v9, which is why
+/// generations needed no format bump: every pre-failover segment already
+/// reads as generation 0, the correct answer for a log that has never been
+/// promoted. See [`Wal::promote`].
 fn read_header(data: &[u8]) -> Result<(u32, u32), WalError> {
     if data.len() < HEADER_SIZE {
         return Err(WalError::Truncated);
@@ -1424,8 +1434,8 @@ fn read_header(data: &[u8]) -> Result<(u32, u32), WalError> {
     if !(WAL_VERSION_MIN..=WAL_VERSION).contains(&version) {
         return Err(WalError::BadVersion(version));
     }
-    let flags = u32::from_le_bytes(data[8..12].try_into().map_err(|_| WalError::Truncated)?);
-    Ok((version, flags))
+    let generation = u32::from_le_bytes(data[8..12].try_into().map_err(|_| WalError::Truncated)?);
+    Ok((version, generation))
 }
 
 /// Human-readable byte size for log lines. Picks the largest binary
@@ -1576,6 +1586,9 @@ pub struct Wal {
     /// Optional tap on the write path; see [`WalObserver`]. Absent in
     /// normal operation — a `None` check is the whole hot-path cost.
     observer: Option<Box<dyn WalObserver>>,
+    /// Lineage this process writes; stamped into the header of every
+    /// segment it creates. See [`Wal::promote`].
+    generation: u32,
     #[allow(dead_code)] // held for flock side effect
     lock_fd: Option<File>,
     #[cfg(test)]
@@ -1701,6 +1714,7 @@ impl Wal {
             toast_mark: None,
             replayed_schedules: ReplayedSchedules::default(),
             observer: None,
+            generation: 0,
             lock_fd: Some(lock_fd),
             #[cfg(test)]
             sync_count: 0,
@@ -1806,6 +1820,7 @@ impl Wal {
     /// set at this moment.
     pub fn set_observer(&mut self, mut obs: Box<dyn WalObserver>) {
         obs.on_attach(ObserverContext {
+            generation: self.generation,
             body_store: self.body_store.clone(),
             dir: self.dir.clone(),
             attach_position: self.end_position(),
@@ -1912,7 +1927,41 @@ impl Wal {
             }
         }
 
+        self.generation = self.scan_generation()?;
         Ok(())
+    }
+
+    /// Highest lineage stamped on any segment in the directory, or 0 for a
+    /// directory that has none — fresh, or written entirely before
+    /// generations existed (their reserved word was zero, which is the
+    /// right answer).
+    ///
+    /// The *maximum* rather than the newest segment's, so that a
+    /// generation-unaware binary appending a gen-0 segment after a
+    /// promotion cannot make this process continue the regression. Replay
+    /// logs that anomaly; this makes sure it doesn't compound. Costs one
+    /// 12-byte read per segment at startup, the same shape as
+    /// `min_format_version`.
+    fn scan_generation(&self) -> io::Result<u32> {
+        use std::io::Read;
+        let mut max = 0u32;
+        for f in self.files.iter() {
+            let mut buf = [0u8; HEADER_SIZE];
+            let mut file = match File::open(&f.path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            // Short or malformed headers are replay's business (quarantine
+            // or quiet removal); here they simply carry no lineage.
+            if file.read_exact(&mut buf).is_err() {
+                continue;
+            }
+            if let Ok((_version, generation)) = read_header(&buf) {
+                max = max.max(generation);
+            }
+        }
+        Ok(max)
     }
 
     fn file_path(&self, seq: u64) -> PathBuf {
@@ -1937,7 +1986,7 @@ impl Wal {
         crate::body_store::fsync_dir(&self.dir)?;
 
         let mut fd = BufWriter::with_capacity(BUF_CAPACITY, file);
-        write_header(&mut fd)?;
+        write_header(&mut fd, self.generation)?;
         // Open with the id high-water mark. GC never removes the newest
         // segment, so the mark survives every older segment being collected,
         // and replay can't hand out an id twice. The TOAST recovery point
@@ -2032,21 +2081,60 @@ impl Wal {
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
         if self.should_rotate() {
-            // Close current file. Sync TOAST first so any BodyId references
-            // about to land in the WAL are already durable. The next segment
-            // opens with the point that reached.
-            if let Some(point) = self.pre_sync_body_store()? {
-                self.toast_mark = Some(point);
-            }
-            if let Some(f) = self.files.back_mut()
-                && let Some(mut fd) = f.fd.take()
-            {
-                Self::flush_and_fsync(&mut fd)?;
-                self.record_sync();
-            }
-            self.create_next_file()?;
+            self.rotate()?;
         }
         Ok(())
+    }
+
+    /// Seal the current segment and open a fresh one, durably: the outgoing
+    /// file is fsynced before the new one exists. Size-based rotation and
+    /// [`promote`](Self::promote) share it — the latter needs an
+    /// unconditional roll, since the generation lives in the segment header
+    /// and so cannot change mid-file.
+    fn rotate(&mut self) -> io::Result<()> {
+        // Close current file. Sync TOAST first so any BodyId references
+        // about to land in the WAL are already durable. The next segment
+        // opens with the point that reached.
+        if let Some(point) = self.pre_sync_body_store()? {
+            self.toast_mark = Some(point);
+        }
+        if let Some(f) = self.files.back_mut()
+            && let Some(mut fd) = f.fd.take()
+        {
+            Self::flush_and_fsync(&mut fd)?;
+            self.record_sync();
+        }
+        self.create_next_file()
+    }
+
+    /// The lineage this WAL writes. Segments stamped with a lower value
+    /// were written before the most recent promotion; a peer reporting a
+    /// different one is not talking about the same log.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Begin a new lineage: bump the generation and roll onto a segment
+    /// stamped with it, returning the new value.
+    ///
+    /// This is the mechanism half of failover; the policy half — fencing
+    /// the old primary, flipping the VIP, deciding a promotion should
+    /// happen at all — belongs to the caller. What this guarantees is the
+    /// ordering that makes the rest safe: it returns only once generation
+    /// N+1 is durable, so a caller that opens its client listener
+    /// afterwards can never ack a write that a crash would replay as
+    /// generation N. Fencing prevents divergence; generations only let you
+    /// *detect* it, and only if that ordering holds.
+    ///
+    /// Costs one nearly-empty segment, since a generation cannot change
+    /// mid-file.
+    pub fn promote(&mut self) -> io::Result<u32> {
+        // Everything written under the old lineage goes down first, so the
+        // gen-N/gen-N+1 boundary on disk is exactly the segment boundary.
+        self.sync()?;
+        self.generation += 1;
+        self.rotate()?;
+        Ok(self.generation)
     }
 
     // --- Space reservation ---
@@ -2370,6 +2458,9 @@ impl Wal {
         // sub-header segment was once a full segment with fsynced records
         // and must be treated as corruption, not cleaned up.
         let newest_seq: u64 = file_infos.iter().map(|(s, _)| *s).max().unwrap_or(0);
+        // Lineage of the newest segment inspected so far; see the
+        // monotonicity check below.
+        let mut last_generation: u32 = 0;
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
         for (idx, (seq, path)) in file_infos.iter().enumerate() {
@@ -2404,7 +2495,30 @@ impl Wal {
             };
 
             let version = match read_header(&data) {
-                Ok((v, _flags)) => v,
+                Ok((v, segment_generation)) => {
+                    // Segments are visited in ascending seq order, so
+                    // lineage must never go backwards. When it does,
+                    // something appended to this directory after a
+                    // promotion without knowing about generations — an
+                    // older binary, or two directories merged. The records
+                    // themselves are still valid, so replay them: refusing
+                    // to start would turn a detectable anomaly into an
+                    // outage, and `scan_generation` has already made sure
+                    // this process won't extend the regression.
+                    if segment_generation < last_generation {
+                        tracing::error!(
+                            "WAL: segment {} is generation {} but an earlier segment is \
+                             generation {} — this directory was written by a process \
+                             unaware of promotions; records replay normally, but treat \
+                             its lineage as suspect",
+                            seq,
+                            segment_generation,
+                            last_generation,
+                        );
+                    }
+                    last_generation = segment_generation;
+                    v
+                }
                 Err(e) => {
                     // A *newest* file shorter than the segment header is
                     // the artifact of a crash between segment creation and
@@ -3013,7 +3127,7 @@ impl WalReader {
                     Err(e) => return Err(WalError::Io(e)),
                 };
                 let version = match read_header(&data) {
-                    Ok((v, _flags)) => v,
+                    Ok((v, _generation)) => v,
                     // A sub-header newest segment is the benign artifact of
                     // a crash between creation and the header fsync (replay
                     // removes it quietly for the same reason).
@@ -3297,7 +3411,7 @@ mod tests {
     #[test]
     fn test_file_header_roundtrip() {
         let mut buf = Vec::new();
-        write_header(&mut buf).unwrap();
+        write_header(&mut buf, 0).unwrap();
         assert_eq!(buf.len(), HEADER_SIZE);
         read_header(&buf).unwrap();
     }
@@ -4127,7 +4241,7 @@ mod tests {
         // fault eating its records.
         let seg2 = dir_path.join(format!("{}{:06}", FILE_PREFIX, 2));
         let mut seg2_header = Vec::new();
-        write_header(&mut seg2_header).unwrap();
+        write_header(&mut seg2_header, 0).unwrap();
         fs::write(&seg2, seg2_header).unwrap();
         {
             let f = OpenOptions::new().write(true).open(&seg1).unwrap();
@@ -5639,6 +5753,93 @@ mod tests {
             orphans.is_empty(),
             "live body must not be reported as orphan: {:?}",
             orphans
+        );
+    }
+
+    // --- Generations ---
+
+    /// Lineage stamped on one segment file, read straight off disk rather
+    /// than asked of the `Wal` — the point of these tests is that the
+    /// bytes carry it.
+    fn segment_generation(dir: &Path, seq: u64) -> u32 {
+        let data = fs::read(segment_path(dir, seq)).unwrap();
+        read_header(&data).unwrap().1
+    }
+
+    #[test]
+    fn test_fresh_wal_is_generation_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        assert_eq!(wal.generation(), 0);
+    }
+
+    #[test]
+    fn test_promote_stamps_new_lineage_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let mut job1 = make_test_job(1, b"before");
+        wal.write_put(&mut job1).unwrap();
+        let before_seq = wal.current_seq();
+
+        assert_eq!(wal.promote().unwrap(), 1);
+        assert_eq!(wal.generation(), 1);
+        assert!(
+            wal.current_seq() > before_seq,
+            "promotion must roll onto a fresh segment — the stamp is per-file"
+        );
+
+        let mut job2 = make_test_job(2, b"after");
+        wal.write_put(&mut job2).unwrap();
+        wal.sync().unwrap();
+
+        // The pre-promotion segment keeps its old lineage, so the gen
+        // boundary on disk is exactly the segment boundary.
+        assert_eq!(segment_generation(dir.path(), before_seq), 0);
+        assert_eq!(segment_generation(dir.path(), wal.current_seq()), 1);
+
+        drop(wal);
+        let reopened = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        assert_eq!(
+            reopened.generation(),
+            1,
+            "lineage must come back from the headers, not from config"
+        );
+    }
+
+    #[test]
+    fn test_generation_does_not_regress_on_a_stale_segment() {
+        // A binary unaware of promotions appends to a promoted directory
+        // and writes a zero in the word it still thinks is reserved. That
+        // is exactly the anomaly not bumping WAL_VERSION accepts, so the
+        // directory must still open, still replay, and must not adopt the
+        // stale lineage and start minting gen-0 segments again.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        wal.promote().unwrap();
+        wal.promote().unwrap();
+        assert_eq!(wal.generation(), 2);
+        let stale_seq = wal.current_seq() + 1;
+        drop(wal);
+
+        let mut stale = Vec::new();
+        write_header(&mut stale, 0).unwrap();
+        fs::write(segment_path(dir.path(), stale_seq), &stale).unwrap();
+
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        assert_eq!(
+            wal.generation(),
+            2,
+            "newest segment says 0, but lineage only moves forward"
+        );
+        // Records under a regressed lineage are still valid records.
+        wal.replay().unwrap();
+
+        let mut job = make_test_job(1, b"x");
+        wal.write_put(&mut job).unwrap();
+        assert_eq!(
+            segment_generation(dir.path(), wal.current_seq()),
+            2,
+            "segments minted after the anomaly must carry the real lineage"
         );
     }
 
