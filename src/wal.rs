@@ -532,6 +532,24 @@ impl<B: AsRef<[u8]>> ScheduleEntryList for Vec<ScheduleRecord<B>> {
     }
 }
 
+/// Handles an observer needs beyond the record stream itself, delivered
+/// once by [`Wal::set_observer`]. Everything here is a capability the tee
+/// alone can't provide: resolving external body references, scanning the
+/// history that predates the attach, and knowing where that history ends.
+pub struct ObserverContext {
+    /// The live body store, if one is attached (the server always attaches
+    /// one before the observer; a bare `Wal` may not). Resolving a
+    /// `BodyRef::External` reference goes through this — reads follow the
+    /// live index, so a body relocated by TOAST compaction still resolves.
+    pub body_store: Option<Arc<BodyStore>>,
+    /// The WAL directory, for opening [`WalReader`]s over history.
+    pub dir: PathBuf,
+    /// Where the tee begins: every record at a position strictly below
+    /// this is history (reachable only via [`WalReader`]); every position
+    /// `on_record` will ever report is at or above it.
+    pub attach_position: Position,
+}
+
 /// Tap into the WAL write path. `on_record` fires synchronously for every
 /// record appended — puts, state changes, tombstones, and the marks a
 /// segment opens with or a sync appends — after the record's bytes have
@@ -546,6 +564,12 @@ impl<B: AsRef<[u8]>> ScheduleEntryList for Vec<ScheduleRecord<B>> {
 /// bounded, the observer must drop or disconnect its consumer rather than
 /// block.
 pub trait WalObserver: Send {
+    /// Called once, synchronously, from [`Wal::set_observer`] — before any
+    /// `on_record`. Default: ignore.
+    fn on_attach(&mut self, ctx: ObserverContext) {
+        let _ = ctx;
+    }
+
     fn on_record(&mut self, pos: Position, event: WalEvent<'_>);
 
     /// Every record at a position strictly below `end` is durable on disk.
@@ -1719,8 +1743,15 @@ impl Wal {
 
     /// Attach an observer to the write path; see [`WalObserver`]. Called
     /// once at startup, before any writes — records appended while no
-    /// observer is attached are only reachable through a file scan.
-    pub fn set_observer(&mut self, obs: Box<dyn WalObserver>) {
+    /// observer is attached are only reachable through a file scan. Attach
+    /// the body store first: the [`ObserverContext`] captures whatever is
+    /// set at this moment.
+    pub fn set_observer(&mut self, mut obs: Box<dyn WalObserver>) {
+        obs.on_attach(ObserverContext {
+            body_store: self.body_store.clone(),
+            dir: self.dir.clone(),
+            attach_position: self.end_position(),
+        });
         self.observer = Some(obs);
     }
 
@@ -5858,6 +5889,41 @@ mod tests {
             );
         }
         assert_eq!(teed, in_files);
+    }
+
+    #[test]
+    fn test_observer_attach_context() {
+        struct CtxObserver {
+            got: std::sync::Arc<std::sync::Mutex<Option<(bool, PathBuf, Position)>>>,
+        }
+        impl WalObserver for CtxObserver {
+            fn on_attach(&mut self, ctx: ObserverContext) {
+                *self.got.lock().unwrap() =
+                    Some((ctx.body_store.is_some(), ctx.dir, ctx.attach_position));
+            }
+            fn on_record(&mut self, _pos: Position, _event: WalEvent<'_>) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1024 * 1024)).unwrap();
+        // Pre-attach history: the context must point one past it.
+        let mut job = make_test_job(1, b"history");
+        wal.write_put(&mut job).unwrap();
+        let expected = wal.end_position();
+
+        let got = std::sync::Arc::new(std::sync::Mutex::new(None));
+        wal.set_observer(Box::new(CtxObserver {
+            got: std::sync::Arc::clone(&got),
+        }));
+
+        let (has_body_store, ctx_dir, attach_pos) =
+            got.lock().unwrap().take().expect("on_attach must fire");
+        assert!(!has_body_store, "no body store was attached to this Wal");
+        assert_eq!(ctx_dir, dir.path());
+        assert_eq!(
+            attach_pos, expected,
+            "attach position must be one past existing history"
+        );
     }
 
     // --- WalReader ---

@@ -4400,12 +4400,19 @@ fn a_sync_under_a_clock_far_ahead_does_not_silence_the_entry() {
 // --- WalObserver wiring (ServerConfig → build_state → Wal) ---
 
 /// Minimal observer for wiring tests: records the job id of every teed
-/// record that names a job, behind a shared handle.
+/// record that names a job, behind a shared handle, and whether attach
+/// delivered a body store (the server must hand one over — it always sets
+/// it before the observer).
 struct JobIdObserver {
     seen: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    got_body_store: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 impl crate::wal::WalObserver for JobIdObserver {
+    fn on_attach(&mut self, ctx: crate::wal::ObserverContext) {
+        *self.got_body_store.lock().unwrap() = Some(ctx.body_store.is_some());
+    }
+
     fn on_record(&mut self, _pos: crate::wal::Position, event: crate::wal::WalEvent<'_>) {
         let id = match event {
             crate::wal::WalEvent::Put { job } => job.id,
@@ -4445,8 +4452,18 @@ fn test_wal_observer_attaches_after_replay() {
     // covers only what happens after the attach point; everything before
     // it is the WalReader's territory.
     let seen: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
-    let mut s = build_state(cfg(Some(Box::new(JobIdObserver { seen: seen.clone() })))).unwrap();
+    let got_body_store: std::sync::Arc<std::sync::Mutex<Option<bool>>> = Default::default();
+    let mut s = build_state(cfg(Some(Box::new(JobIdObserver {
+        seen: seen.clone(),
+        got_body_store: got_body_store.clone(),
+    }))))
+    .unwrap();
     assert_eq!(s.jobs.len(), 1, "seeded job must survive replay");
+    assert_eq!(
+        *got_body_store.lock().unwrap(),
+        Some(true),
+        "attach must deliver the server's body store"
+    );
     assert!(
         seen.lock().unwrap().is_empty(),
         "observer must not see replayed history"
