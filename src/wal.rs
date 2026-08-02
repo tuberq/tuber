@@ -389,10 +389,20 @@ impl WalRecord {
 /// appended before `b`. Positions are stable across restarts — they name
 /// bytes in files, not anything in memory — which makes them usable as a
 /// resume cursor by external readers (backups, replication, audit tails).
+///
+/// The fields are private on purpose. A position is log *identity*, and
+/// identity grows a generation number the moment failover exists: after a
+/// promotion, two divergent logs both have a `seg 7, offset 4096` and only
+/// a generation tells them apart. So external code never assembles one
+/// from parts — it takes positions from this module and persists them via
+/// [`Display`](std::fmt::Display)/[`FromStr`](std::str::FromStr), the one
+/// encoding that can gain a component without invalidating cursors already
+/// written to disk. Ordering derives from field order, so a generation
+/// added as the *first* field keeps `a < b` meaning "earlier in the log".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position {
-    pub seg: u64,
-    pub offset: u64,
+    seg: u64,
+    offset: u64,
 }
 
 impl Position {
@@ -400,7 +410,55 @@ impl Position {
     /// `HEADER_SIZE`), so a reader opened here yields the whole log. This
     /// is the bootstrap cursor: the WAL is its own base backup.
     pub const ZERO: Position = Position { seg: 0, offset: 0 };
+
+    /// Which segment this position names, for diagnostics and
+    /// segment-level bookkeeping (retention, pinning a segment against
+    /// deletion while it is scanned). Resuming a read takes the whole
+    /// `Position`, never this on its own.
+    pub fn seg(&self) -> u64 {
+        self.seg
+    }
+
+    /// Byte offset of the record within its segment, for diagnostics.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
 }
+
+/// `"<seg>:<offset>"` — the durable form of a cursor, round-tripping
+/// through [`FromStr`](std::str::FromStr). A generation would extend this
+/// to `"<gen>:<seg>:<offset>"`, with the two-field form parsed as
+/// generation 0, so cursors persisted by today's consumers keep working.
+impl std::fmt::Display for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.seg, self.offset)
+    }
+}
+
+impl std::str::FromStr for Position {
+    type Err = ParsePositionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (seg, offset) = s.split_once(':').ok_or(ParsePositionError)?;
+        Ok(Position {
+            seg: seg.parse().map_err(|_| ParsePositionError)?,
+            offset: offset.parse().map_err(|_| ParsePositionError)?,
+        })
+    }
+}
+
+/// The string handed to `Position::from_str` was not a cursor this module
+/// emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsePositionError;
+
+impl std::fmt::Display for ParsePositionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid WAL position (expected \"<seg>:<offset>\")")
+    }
+}
+
+impl std::error::Error for ParsePositionError {}
 
 /// A WAL record at the moment of its append, in logical (pre-serialization)
 /// form. Field-for-field identical to what `deserialize_record` yields for
@@ -5585,6 +5643,34 @@ mod tests {
     }
 
     // --- WalObserver seam ---
+
+    #[test]
+    fn test_position_round_trips_through_string() {
+        // The only way an external consumer may persist a cursor, so it has
+        // to survive the trip exactly — an off-by-one here silently reships
+        // or skips a record after a restart.
+        for pos in [
+            Position::ZERO,
+            Position {
+                seg: 1,
+                offset: HEADER_SIZE as u64,
+            },
+            Position {
+                seg: u64::MAX,
+                offset: u64::MAX,
+            },
+        ] {
+            let text = pos.to_string();
+            assert_eq!(text.parse::<Position>().unwrap(), pos, "{text}");
+        }
+    }
+
+    #[test]
+    fn test_position_rejects_junk() {
+        for s in ["", "1", "1:", ":2", "1:2:3", "a:2", "1:-2", "1 : 2"] {
+            assert!(s.parse::<Position>().is_err(), "{s:?} parsed");
+        }
+    }
 
     /// What a [`RecordingObserver`] keeps per event: enough to identify the
     /// record without borrowing from the WAL.
