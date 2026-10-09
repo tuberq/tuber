@@ -114,3 +114,80 @@ fn binlog_without_storage_budget_is_rejected() {
         "expected the storage-budget error message; stdout:\n{out}"
     );
 }
+
+/// Reserve a free loopback port. The server logs the port it was *given*, not
+/// the one it bound, so `-p 0` leaves a test nothing to connect to.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("bind ephemeral port")
+        .port()
+}
+
+/// Send one protocol line and read the one-line reply.
+fn roundtrip(conn: &mut std::net::TcpStream, line: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, Write};
+    conn.write_all(format!("{line}\r\n").as_bytes())?;
+    let mut reply = String::new();
+    std::io::BufReader::new(conn.try_clone()?).read_line(&mut reply)?;
+    Ok(reply)
+}
+
+#[test]
+fn server_survives_log_output_losing_its_reader() {
+    // The crash: started as `tuber server -V ... 2>&1 | <reader>` and the reader
+    // went away. tracing-subscriber's default `log_internal_errors` answers a
+    // failed stdout write with `eprintln!`, which panics when stderr is the same
+    // dead pipe; the panic hook's own `error!` then repeats that inside the
+    // hook, and std aborts the process on the nested panic.
+    let port = free_port().to_string();
+    let mut cmd = Command::new(bin());
+    cmd.args(["server", "-l", "127.0.0.1", "-p", &port, "-V"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for e in PERSIST_ENVS {
+        cmd.env_remove(e);
+    }
+    let mut child = cmd.spawn().expect("spawn tuber binary");
+
+    // Wait for the startup line to begin, so logging is known to work before
+    // we break it.
+    let mut first = [0u8; 1];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut first)
+        .expect("startup log line");
+
+    let mut conn = (0..50)
+        .find_map(|_| {
+            std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
+                .ok()
+                .or_else(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                })
+        })
+        .expect("connect to server");
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    // Close the read ends of both pipes: every log write from here is EPIPE.
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+
+    // `drain` and `undrain` each emit an info! event on the way to replying.
+    let drain = roundtrip(&mut conn, "drain");
+    let undrain = roundtrip(&mut conn, "undrain");
+    std::thread::sleep(Duration::from_millis(100));
+    let status = child.try_wait().expect("try_wait");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        status.is_none(),
+        "server died once its log pipe lost its reader: {status:?}"
+    );
+    assert_eq!(drain.expect("drain reply"), "DRAINING\r\n");
+    assert_eq!(undrain.expect("undrain reply"), "NOT_DRAINING\r\n");
+}

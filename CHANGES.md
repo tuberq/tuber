@@ -1,5 +1,13 @@
 # Changes
 
+## Unreleased
+
+**The server no longer aborts when its log output loses its reader.** Started as `tuber server -V … 2>&1 | <reader>`, the server died with SIGABRT the first time it logged after the reader exited — closing the terminal tab the reader ran in, or a `tee` going away, was enough. No jobs were lost (the process simply stopped), but nothing restarted it.
+
+Log lines go to stdout. On a failed write, tracing-subscriber's default reports the failure with `eprintln!`, and `eprintln!` panics when its own write fails — which it does when stderr is the same dead pipe. The panic hook then reports that panic through `tracing`, takes the same path, and panics again inside the hook; std aborts on a nested panic. The hook only decides how it dies: without it, the first panic would still have unwound the server's main task.
+
+The subscriber now sets `log_internal_errors(false)`, so a line that cannot be written is dropped and the server keeps serving. Lines logged while the output is gone are lost; to keep them, send output to a file or the journal rather than through a pipe.
+
 ## v0.13.0
 
 **A paused tube no longer loses its pause when it drains.** `pause-tube maint 300` followed by the tube emptying discarded the pause within one 100 ms tick, and work arriving afterwards was reservable immediately — with nothing logged and nothing in `stats-tube` to show it had happened, because the tube itself was gone.

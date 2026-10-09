@@ -5,6 +5,12 @@
 pub fn init(console_level: tracing::Level) {
     tracing_subscriber::fmt()
         .with_max_level(console_level)
+        // On a failed write the default reports the failure with `eprintln!`,
+        // which panics if stderr is broken too — as both are once a
+        // `2>&1 | reader` loses its reader. The panic hook below logs through
+        // this same path, panics again, and std aborts the server. A queue
+        // that can no longer log should go on serving, so drop the line.
+        .log_internal_errors(false)
         .init();
     install_panic_hook();
 }
