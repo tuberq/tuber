@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## v0.14.0
 
 **The server no longer aborts when its log output loses its reader.** Started as `tuber server -V … 2>&1 | <reader>`, the server died with SIGABRT the first time it logged after the reader exited — closing the terminal tab the reader ran in, or a `tee` going away, was enough. No jobs were lost (the process simply stopped), but nothing restarted it.
 
