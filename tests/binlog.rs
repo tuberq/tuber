@@ -770,15 +770,10 @@ async fn test_wal_replay_idempotency() {
 
 /// Test 12: Concurrency limit >1 survives WAL replay
 ///
-/// Before the fix, restore_jobs() never populated concurrency_limits,
-/// so after restart is_concurrency_blocked() would default to limit 1
-/// instead of the configured limit (e.g. 3).
-///
-/// The bug: cmd_put() registers the limit at put-time, but restore_jobs()
-/// doesn't. After restart, acquire_concurrency_key() lazily sets the limit
-/// on the first reserve — but is_concurrency_blocked() runs BEFORE acquire,
-/// so once 1 job is reserved (count=1), the next check sees count(1) >= limit(1)
-/// and blocks. The limit never gets a chance to update to 3.
+/// Limits are registered lazily, on reserve, after a restart as at put
+/// time: the first reserve's acquire_concurrency_key records limit 3 along
+/// with count 1, so the second reserve's check sees 1 < 3. Restore must not
+/// register them up front (see test_restored_con_limit_does_not_outlive_its_job).
 #[tokio::test]
 async fn test_wal_replay_concurrency_limit() {
     let dir = tempfile::tempdir().unwrap();
@@ -2408,4 +2403,32 @@ async fn test_v7_wal_needs_migrate_wal_and_says_nothing_is_rewritten() {
         !msg.contains("TOAST"),
         "the inline-body note is for pre-v5 WALs only: {msg}"
     );
+}
+
+#[tokio::test]
+async fn test_restored_con_limit_does_not_outlive_its_job() {
+    // Restore registered every job's con: limit up front. A limit is only
+    // dropped when the key's last reservation ends, so a con:k:5 job deleted
+    // without ever being reserved left k at 5, and two con:k jobs ran at once.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 con:k:5\r\na\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("delete 1\r\n").await;
+        c.ckresp("DELETED\r\n").await;
+        for id in 2..=3 {
+            c.mustsend("put 0 0 60 1 con:k\r\nb\r\n").await;
+            c.ckresp(&format!("INSERTED {id}\r\n")).await;
+        }
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp("RESERVED 2 1\r\n").await;
+        c.ckresp("b\r\n").await;
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp("TIMED_OUT\r\n").await;
+    })
+    .await;
 }

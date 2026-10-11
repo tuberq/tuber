@@ -391,7 +391,6 @@ impl ServerState {
             let idempotency_key = job.idempotency_key().cloned();
             let group = job.group().cloned();
             let after_group = job.after_group().cloned();
-            let concurrency_key = job.concurrency_key().cloned();
 
             self.ensure_tube(&tube_name);
 
@@ -439,12 +438,6 @@ impl ServerState {
                 JobState::Reserved => unreachable!(
                     "WAL deserialization translates Reserved -> Ready before restore_jobs"
                 ),
-            }
-
-            // Register concurrency limit
-            if let Some((key, limit)) = concurrency_key {
-                let entry = self.concurrency_limits.entry(key).or_insert(0);
-                *entry = (*entry).max(limit);
             }
 
             // Register idempotency key in tube index
