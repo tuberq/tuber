@@ -148,6 +148,25 @@ enum Commands {
         #[arg(long, env = "TUBER_CONN_IDLE_TIMEOUT", default_value_t = 0)]
         conn_idle_timeout: u64,
 
+        /// Seconds of silence before TCP keepalive probes start on a client
+        /// connection. 0 turns keepalive off.
+        ///
+        /// Probes then go out every sixth of this period, and the
+        /// connection is closed after 6 go unanswered, so a peer that vanished
+        /// without closing (host crash, network partition, a NAT or load
+        /// balancer dropping the flow) is noticed within about twice this
+        /// period. Its reserved jobs then go straight back to ready. The
+        /// probes are answered by the client's kernel, so a worker busy on a
+        /// long job is never mistaken for a dead one, and they keep idle
+        /// connections alive through middleboxes that drop quiet flows.
+        #[arg(
+            long,
+            env = "TUBER_TCP_KEEPALIVE",
+            default_value_t = tuber::server::DEFAULT_TCP_KEEPALIVE_SECS,
+            value_parser = clap::value_parser!(u64).range(0..=tuber::server::MAX_TCP_KEEPALIVE_SECS)
+        )]
+        tcp_keepalive: u64,
+
         /// Maximum total on-disk size for the WAL + body store combined.
         /// PUT returns OUT_OF_STORAGE once exceeded; reserve / release /
         /// bury / kick / delete always succeed (they only ever shrink the
@@ -310,6 +329,7 @@ async fn run() {
             max_jobs_size,
             max_connections,
             conn_idle_timeout,
+            tcp_keepalive,
             max_storage_bytes,
             migrate_wal,
             verbose,
@@ -364,6 +384,7 @@ async fn run() {
                 max_connections,
                 // 0 means disabled, matching the other 0-is-no-limit knobs.
                 (conn_idle_timeout != 0).then(|| Duration::from_secs(conn_idle_timeout)),
+                (tcp_keepalive != 0).then(|| Duration::from_secs(tcp_keepalive)),
             )
             .await
             {

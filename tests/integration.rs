@@ -57,6 +57,19 @@ impl TestServer {
         TestServer { port, handle }
     }
 
+    async fn start_with_tcp_keepalive(idle: Option<Duration>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_tcp_keepalive(listener, 65535, idle)
+                .await
+                .ok();
+        });
+
+        TestServer { port, handle }
+    }
+
     async fn start_with_max_jobs_size(max_jobs_size: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -5249,6 +5262,79 @@ async fn test_command_sent_while_parked_runs_after_the_reserve() {
     w.ckresp(&format!("RESERVED {id} 1\r\n")).await;
     w.ckresp("x\r\n").await;
     w.ckresp("USING foo\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
+// TCP keepalive
+// ---------------------------------------------------------------------------
+
+/// The server's end of `c`. The test server runs in this process, so its
+/// accepted socket is one of our own fds; find it by its address pair.
+/// Linux-only: walks /proc/self/fd.
+#[cfg(target_os = "linux")]
+fn server_side_socket(c: &TestConn) -> std::os::fd::OwnedFd {
+    use std::os::fd::BorrowedFd;
+    let want_local = c.reader.get_ref().peer_addr().unwrap();
+    let want_peer = c.reader.get_ref().local_addr().unwrap();
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let Some(fd) = entry.unwrap().file_name().to_str().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        // A stale fd from the listing just fails these lookups and is skipped.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let sock = socket2::SockRef::from(&borrowed);
+        let local = sock.local_addr().ok().and_then(|a| a.as_socket());
+        let peer = sock.peer_addr().ok().and_then(|a| a.as_socket());
+        if local == Some(want_local) && peer == Some(want_peer) {
+            return borrowed.try_clone_to_owned().unwrap();
+        }
+    }
+    panic!("no server-side socket for {want_peer} -> {want_local}");
+}
+
+/// Accepted sockets get TCP keepalive, so a peer that vanishes without a FIN
+/// or RST (host crash, partition, a middlebox dropping the flow) is noticed:
+/// after 60 s of silence, 6 probes 10 s apart. Without it a parked worker on
+/// such a peer stays registered forever, since nothing is ever sent to fail.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_accepted_sockets_have_tcp_keepalive_by_default() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    // A reply means the socket has been accepted and configured.
+    c.mustsend("list-tube-used\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    let fd = server_side_socket(&c);
+    let sock = socket2::SockRef::from(&fd);
+    assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE is off");
+    assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(60));
+    assert_eq!(
+        sock.tcp_keepalive_interval().unwrap(),
+        Duration::from_secs(10)
+    );
+    assert_eq!(sock.tcp_keepalive_retries().unwrap(), 6);
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("tcp-keepalive: 60\n"), "{body}");
+}
+
+/// `--tcp-keepalive 0` leaves accepted sockets without it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_tcp_keepalive_off_leaves_sockets_alone() {
+    let srv = TestServer::start_with_tcp_keepalive(None).await;
+    let mut c = srv.connect().await;
+    c.mustsend("list-tube-used\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    let fd = server_side_socket(&c);
+    assert!(!socket2::SockRef::from(&fd).keepalive().unwrap());
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("tcp-keepalive: 0\n"), "{body}");
 }
 
 // ---------------------------------------------------------------------------

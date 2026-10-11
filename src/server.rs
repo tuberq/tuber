@@ -99,6 +99,43 @@ pub struct FdBudget {
     idle_timeout: Option<Duration>,
     /// Connections closed by idle pruning.
     pruned: AtomicU64,
+    /// Idle time before TCP keepalive probes start on an accepted socket, or
+    /// `None` for no keepalive. See [`set_tcp_keepalive`].
+    tcp_keepalive: Option<Duration>,
+}
+
+/// Default for `--tcp-keepalive`, in seconds. Under the idle timeouts of the
+/// common cloud load balancers (AWS NLB 350 s, Azure 240 s), so the probes also
+/// keep a parked worker's flow from being silently dropped.
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+
+/// Largest `--tcp-keepalive` accepted. Linux caps `TCP_KEEPIDLE` at 32767 s;
+/// past it every accepted socket would fail to configure.
+pub const MAX_TCP_KEEPALIVE_SECS: u64 = 32767;
+
+/// Unanswered probes before the kernel declares the peer dead. Probes go out
+/// every `idle / TCP_KEEPALIVE_PROBES`, so a dead peer is detected within
+/// about twice the idle time.
+const TCP_KEEPALIVE_PROBES: u32 = 6;
+
+/// Turn on TCP keepalive for an accepted socket: after `idle` with nothing
+/// received, probe every `idle / 6` (at least 1 s) and fail the socket after
+/// 6 unanswered probes.
+///
+/// This catches a peer that vanishes without a FIN or RST — host crash,
+/// partition, a NAT or load balancer dropping the flow — which nothing else
+/// can: a parked worker on such a peer is never sent anything, so nothing
+/// ever fails. The probes are answered by the peer's kernel, not the client,
+/// so a worker busy on a long job is never mistaken for a dead one. The
+/// failure surfaces as a read error, which ends a parked reserve
+/// ([`await_parked_reply`]) or any other read as a disconnect.
+fn set_tcp_keepalive(socket: &tokio::net::TcpStream, idle: Duration) -> io::Result<()> {
+    let interval = (idle / TCP_KEEPALIVE_PROBES).max(Duration::from_secs(1));
+    let params = socket2::TcpKeepalive::new()
+        .with_time(idle)
+        .with_interval(interval)
+        .with_retries(TCP_KEEPALIVE_PROBES);
+    socket2::SockRef::from(socket).set_tcp_keepalive(&params)
 }
 
 impl FdBudget {
@@ -111,7 +148,19 @@ impl FdBudget {
             refused: AtomicU64::new(0),
             idle_timeout: None,
             pruned: AtomicU64::new(0),
+            tcp_keepalive: Some(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS)),
         }
+    }
+
+    /// Set the TCP keepalive idle time. `None` or zero turns keepalive off.
+    pub fn with_tcp_keepalive(mut self, idle: Option<Duration>) -> Self {
+        self.tcp_keepalive = idle.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// TCP keepalive idle time, or `None` when keepalive is off.
+    pub fn tcp_keepalive(&self) -> Option<Duration> {
+        self.tcp_keepalive
     }
 
     /// Enable idle pruning. `None` or a zero duration leaves it off.
@@ -3106,6 +3155,7 @@ impl ServerState {
              connections-refused: {}\n\
              connections-pruned: {}\n\
              conn-idle-timeout: {}\n\
+             tcp-keepalive: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -3198,6 +3248,8 @@ impl ServerState {
             self.fd_budget
                 .idle_timeout()
                 .map_or(0, |d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
+            // Seconds; 0 when off.
+            self.fd_budget.tcp_keepalive().map_or(0, |d| d.as_secs()),
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
@@ -4120,9 +4172,14 @@ pub async fn run(
     name: Option<String>,
     max_connections: Option<usize>,
     conn_idle_timeout: Option<Duration>,
+    tcp_keepalive: Option<Duration>,
 ) -> io::Result<()> {
     let wal_path = wal_dir.map(Path::new);
-    let fd_budget = Arc::new(FdBudget::new(max_connections).with_idle_timeout(conn_idle_timeout));
+    let fd_budget = Arc::new(
+        FdBudget::new(max_connections)
+            .with_idle_timeout(conn_idle_timeout)
+            .with_tcp_keepalive(tcp_keepalive),
+    );
     let state = build_state(StateConfig {
         max_job_size,
         max_job_bytes,
@@ -4153,6 +4210,11 @@ pub async fn run(
     // documented default rather than an ambiguous omission.
     if let Some(d) = fd_budget.idle_timeout() {
         opts.push_str(&format!(" conn-idle-timeout={}s", d.as_secs()));
+    }
+    // Always logged: it's on by default, so "off" is a deliberate choice.
+    match fd_budget.tcp_keepalive() {
+        Some(d) => opts.push_str(&format!(" tcp-keepalive={}s", d.as_secs())),
+        None => opts.push_str(" tcp-keepalive=off"),
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
@@ -4309,6 +4371,26 @@ pub async fn run_with_listener_idle_timeout(
         migrate_wal: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_idle_timeout(Some(idle_timeout))),
+    })?;
+    serve(listener, state, max_job_size).await
+}
+
+/// Test-only: run with TCP keepalive at `idle` (`None` = off), which production
+/// reaches via `--tcp-keepalive`. The other constructors use the default.
+pub async fn run_with_listener_tcp_keepalive(
+    listener: TcpListener,
+    max_job_size: u32,
+    idle: Option<Duration>,
+) -> io::Result<()> {
+    let state = build_state(StateConfig {
+        max_job_size,
+        max_job_bytes: None,
+        max_storage_bytes: None,
+        wal_dir: None,
+        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
+        migrate_wal: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0)).with_tcp_keepalive(idle)),
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4733,6 +4815,11 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                     continue;
                 }
                 let _ = socket.set_nodelay(true);
+                if let Some(idle) = fd_budget.tcp_keepalive()
+                    && let Err(e) = set_tcp_keepalive(&socket, idle)
+                {
+                    tracing::debug!(peer = %peer, "could not enable TCP keepalive: {e}");
+                }
                 tracing::debug!("accepted connection from {}", peer);
 
                 let tx = engine_tx.clone();
