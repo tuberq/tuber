@@ -330,7 +330,7 @@ released. Commands that only make sense inside one live session:
 | `bury`, `release`, `touch` | Require the job reserved *by this connection* — from a fresh one they can only answer `NOT_FOUND` |
 | `touch-all` | Heartbeats this connection's reserved set — a fresh one holds nothing, so it always answers `TOUCHED_ALL 0` |
 | `watch` / `ignore` | Mutate this connection's watch list |
-| `reserve-mode` | Sets `fifo`/`weighted` for this connection |
+| `reserve-mode` | Sets `fifo`/`weighted`/`weighted-fair` for this connection |
 | `peek-reserved` | Peeks a job this connection reserved |
 | `list-tube-used`, `list-tubes-watched` | Report this connection's state |
 | `schedule-begin` / `-put` / `-commit` | A sync is staged on this connection; a one-shot can begin one but never commit it |
@@ -394,7 +394,7 @@ touch-all\r\n                         # TOUCHED_ALL <n>
 # Watch set and reserve strategy
 watch <tube> [weight]\r\n             # WATCHING <count>
 ignore <tube>\r\n                     # WATCHING <count> | NOT_IGNORED
-reserve-mode fifo|weighted\r\n        # USING <mode> | BAD_FORMAT
+reserve-mode fifo|weighted|weighted-fair\r\n  # USING <mode> | BAD_FORMAT
 
 # This connection's state
 peek-reserved\r\n                     # FOUND <id> <bytes> | NOT_FOUND

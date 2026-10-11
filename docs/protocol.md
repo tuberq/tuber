@@ -121,7 +121,7 @@ Response: `WATCHING <count>\r\n` or `NOT_IGNORED\r\n`
 
 ### reserve-mode \<mode\>\r\n
 
-Set reserve mode to `fifo` or `weighted`.
+Set reserve mode to `fifo` (the default), `weighted` or `weighted-fair`.
 
 Response: `USING <mode>\r\n` or `BAD_FORMAT\r\n`
 

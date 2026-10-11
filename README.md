@@ -17,7 +17,7 @@ Job queues today fall into two camps, and both make compromises.
 
 **Tuber takes both.** Metadata stays in RAM for fast reserve/release/delete, backed by an optional write-ahead log for durability. **Larger job bodies live on disk, not in RAM** — they're offloaded using a TOAST-style scheme (inspired by PostgreSQL), so memory usage stays bounded regardless of payload size or queue depth. Small bodies (≤ 256 B, typical for UUIDs, IDs, short envelopes) ride along inside their WAL record — they're never copied to the body store, so they avoid TOAST overhead entirely. You get RAM-speed coordination with disk-scale capacity, in a single binary with no database to tune. Unlike beanstalkd — which keeps every job body resident in memory — tuber's RAM footprint is a function of job *count*, not job *size*.
 
-Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) work out of the box across every major language. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/tuberq/beaneater/tree/tuber) for Ruby.
+Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) work out of the box across every major language. For Tuber's extended features (idempotency, job groups, concurrency keys) from Ruby, use the [`tuber` gem](https://github.com/tuberq/tuber-gem).
 
 ### Feature Comparison
 
@@ -35,7 +35,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory alarms ¹² |
 | **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | Metrics events | In DB ⁸ | — | — |
 | **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | Oldest only ⁹ | In DB ⁸ | — | — |
-| **Persistence** | WAL, ~100ms fsync | WAL, ~100ms fsync | Redis RDB/AOF | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
+| **Persistence** | WAL, ~100ms fsync | Optional binlog (`-b`), 50 ms fsync | Redis RDB/AOF | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
 | **Infrastructure** | None (single binary) | None (single binary) | Redis | Redis | PostgreSQL | DB ⁶ | Erlang runtime |
 
 <sub>¹ Sidekiq OSS has queue weights and basic job processing. Unique jobs and batches require [Pro](https://sidekiq.org/products/pro.html); concurrency controls and periodic jobs require [Enterprise](https://sidekiq.org/products/enterprise.html) (the third-party sidekiq-cron gem covers the latter).</sub>
@@ -724,7 +724,7 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `reserve-with-timeout <seconds>\r\n` | Like `reserve` but times out. Returns `RESERVED …` or `TIMED_OUT`. |
 | `reserve-job <id>\r\n` | Reserve a specific job by ID. Returns `RESERVED …` or `NOT_FOUND`. |
 | **+** `reserve-batch <count>\r\n` | Reserve up to `<count>` jobs at once (1–1000). Non-blocking — returns whatever is available. See [Batch Operations](#batch-operations). |
-| **+** `reserve-mode <mode>\r\n` | Set reserve strategy: `default` (priority-first), `weighted` (random by tube weight), or `weighted-fair` (adjusted for processing time). See [Weighted Reserve](#weighted-reserve). |
+| **+** `reserve-mode <mode>\r\n` | Set reserve strategy: `fifo` (priority-first, the default), `weighted` (random by tube weight), or `weighted-fair` (adjusted for processing time). See [Weighted Reserve](#weighted-reserve). |
 | `delete <id>\r\n` | Delete a job. Returns `DELETED` or `NOT_FOUND`. |
 | **+** `delete-batch <id> …\r\n` | Delete multiple jobs by ID (1–1000, space-separated). Returns `DELETED_BATCH <deleted> <not_found>`. See [Batch Operations](#batch-operations). |
 | `release <id> <pri> <delay>\r\n` | Release a reserved job back to ready (or delayed). Returns `RELEASED`. |

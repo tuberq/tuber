@@ -87,7 +87,7 @@ structured `tracing` events on stderr; alerting belongs in the log pipeline.
 Standard beanstalkd commands: `put`, `reserve`, `reserve-with-timeout`, `reserve-job`, `delete`, `release`, `bury`, `kick`, `kick-job`, `touch`, `peek`, `peek-ready`, `peek-delayed`, `peek-buried`, `use`, `watch`, `ignore`, `stats`, `stats-job`, `stats-tube`, `list-tubes`, `list-tube-used`, `list-tubes-watched`, `pause-tube`, `quit`.
 
 Tuber extensions beyond standard beanstalkd:
-- `reserve-mode <default|weighted>` - switch between priority-first and weighted-random reserve strategies.
+- `reserve-mode <fifo|weighted|weighted-fair>` - switch between priority-first (`fifo`, the default), weighted-random, and weighted-random adjusted for each tube's processing time.
 - `peek-reserved` - peek at the oldest reserved job in the current `use` tube. Returns `FOUND <id> <bytes>` or `NOT_FOUND`.
 - `flush-tube <tube>` - delete all jobs from a tube. Returns `FLUSHED <count>`.
 - `flush-buried <tube>` - delete all buried jobs from a tube, leaving ready/delayed/reserved jobs untouched. Returns `FLUSHED <count>`.
