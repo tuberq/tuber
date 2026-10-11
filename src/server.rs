@@ -4100,7 +4100,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
                 // it aside and start without schedules: each app's next sync
                 // restores its own. (One from a different tuber version is
                 // `Unsupported`, not damage, and stops startup below.)
-                let aside = crate::schedule::store::set_aside_damaged(dir)?;
+                let aside = crate::schedule::store::set_aside_corrupt(dir)?;
                 tracing::error!("{e}; moved to {aside:?}, no schedules until apps re-sync");
                 crate::schedule::store::ScheduleFiles::open(dir)?
             }

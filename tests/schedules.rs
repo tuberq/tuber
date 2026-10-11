@@ -845,7 +845,7 @@ async fn a_damaged_schedules_file_is_set_aside_not_fatal() {
     let srv = TestServer::start_with_binlog(dir.path()).await;
     let mut c = srv.connect().await;
     assert!(c.list("list-schedules").await.is_empty());
-    assert!(dir.path().join("schedules.damaged").exists());
+    assert!(dir.path().join("schedules.corrupt").exists());
 
     // And schedules work again from the next sync.
     c.ck("schedule-begin app", "SYNCING app").await;
@@ -872,7 +872,7 @@ async fn a_second_damaged_file_does_not_overwrite_the_first() {
             p.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("schedules.damaged")
+                .starts_with("schedules.corrupt")
         })
         .map(|p| std::fs::read(p).unwrap())
         .collect();

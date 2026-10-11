@@ -38,8 +38,8 @@ use jiff::Timestamp;
 
 use super::{Catchup, Entry, EntryStats, Line, Schedules};
 
-pub const DEFS_FILE: &str = "schedules";
-pub const STAMPS_FILE: &str = "schedules.fired";
+const DEFS_FILE: &str = "schedules";
+const STAMPS_FILE: &str = "schedules.fired";
 const DEFS_MAGIC: &[u8; 4] = b"TSCH";
 const STAMPS_MAGIC: &[u8; 4] = b"TSTP";
 const VERSION: u32 = 1;
@@ -68,15 +68,15 @@ impl ScheduleFiles {
         };
         files.defs_bytes = defs.len() as u64;
 
-        let stamps = match read(dir, STAMPS_FILE, STAMPS_MAGIC) {
-            Ok(Some(bytes)) => {
-                files.stamps_bytes = bytes.len() as u64;
-                parse_stamps(&bytes).unwrap_or_else(|e| {
-                    tracing::error!("{STAMPS_FILE}: {e}; last fires lost");
-                    HashMap::new()
-                })
-            }
-            Ok(None) => HashMap::new(),
+        let stamps = read(dir, STAMPS_FILE, STAMPS_MAGIC).and_then(|bytes| {
+            let Some(bytes) = bytes else {
+                return Ok(HashMap::new());
+            };
+            files.stamps_bytes = bytes.len() as u64;
+            parse_stamps(&bytes)
+        });
+        let stamps = match stamps {
+            Ok(stamps) => stamps,
             Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(e),
             Err(e) => {
                 tracing::error!("{STAMPS_FILE}: {e}; last fires lost");
@@ -84,7 +84,7 @@ impl ScheduleFiles {
             }
         };
 
-        let mut r = Reader::records(&defs)?;
+        let mut r = Reader::records(&defs);
         for _ in 0..r.count {
             let owner = r.string()?;
             let line_text = r.string()?;
@@ -126,7 +126,7 @@ impl ScheduleFiles {
 
     /// Rewrite both files after a commit.
     pub fn write_all(&mut self, schedules: &Schedules) -> io::Result<()> {
-        let mut w = Writer::new(DEFS_MAGIC, schedules.len());
+        let mut w = Writer::new(DEFS_MAGIC, schedules.len(), self.defs_bytes);
         for e in schedules.iter() {
             w.string(&e.owner);
             w.string(&wire_line(&e.line, e.body.len()));
@@ -139,55 +139,60 @@ impl ScheduleFiles {
 
     /// Rewrite the last fires, before the fires they record are put.
     pub fn write_stamps(&mut self, schedules: &Schedules) -> io::Result<()> {
-        let fired: Vec<&Entry> = schedules.iter().filter(|e| e.last_fire.is_some()).collect();
-        let mut w = Writer::new(STAMPS_MAGIC, fired.len());
-        for e in fired {
+        let fired: Vec<(&Entry, Timestamp)> = schedules
+            .iter()
+            .filter_map(|e| Some((e, e.last_fire?)))
+            .collect();
+        let mut w = Writer::new(STAMPS_MAGIC, fired.len(), self.stamps_bytes);
+        for (e, last_fire) in fired {
             w.string(&e.owner);
             w.string(&e.line.name);
-            w.time(e.last_fire.expect("filtered on last_fire"));
+            w.time(last_fire);
         }
         self.stamps_bytes = replace(&self.dir, STAMPS_FILE, &w.finish())?;
         Ok(())
     }
 }
 
-/// Move a damaged definitions file out of the way, to the first free
-/// `schedules.damaged[.N]`, so an earlier one is never overwritten.
-pub fn set_aside_damaged(dir: &Path) -> io::Result<PathBuf> {
-    let aside = (0..)
-        .map(|n| match n {
-            0 => dir.join(format!("{DEFS_FILE}.damaged")),
-            n => dir.join(format!("{DEFS_FILE}.damaged.{n}")),
-        })
+/// Move a damaged definitions file out of the way, to `schedules.corrupt`
+/// as the WAL names its corrupt segments — or `schedules.corrupt.N`, the
+/// first that's free, so an earlier one is never overwritten.
+pub fn set_aside_corrupt(dir: &Path) -> io::Result<PathBuf> {
+    let path = dir.join(DEFS_FILE);
+    let base = crate::wal::corrupt_sidecar_path(&path);
+    let aside = std::iter::once(base.clone())
+        .chain((1..).map(|n| base.with_extension(format!("corrupt.{n}"))))
         .find(|p| !p.exists())
         .expect("an unbounded range has a free name");
-    fs::rename(dir.join(DEFS_FILE), &aside)?;
+    fs::rename(&path, &aside)?;
     Ok(aside)
 }
 
 /// `line` as the `schedule-put` arguments that would recreate it.
 fn wire_line(line: &Line, body_len: usize) -> String {
-    let mut s = format!(
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64 + line.spec_text.len());
+    let _ = write!(
+        s,
         "{} {} {} {} {} {}",
         line.name, line.tube, line.pri, line.delay, line.ttr, body_len
     );
-    let tags = line.tags.to_string();
-    if !tags.is_empty() {
-        s.push(' ');
-        s.push_str(&tags);
+    if !line.tags.is_empty() {
+        let _ = write!(s, " {}", line.tags);
     }
     match line.catchup {
         Catchup::Once => {}
-        Catchup::Within(secs) => s.push_str(&format!(" catchup:{secs}")),
+        Catchup::Within(secs) => {
+            let _ = write!(s, " catchup:{secs}");
+        }
         Catchup::Never => s.push_str(" catchup:0"),
     }
-    s.push(' ');
-    s.push_str(&line.spec_text);
+    let _ = write!(s, " {}", line.spec_text);
     s
 }
 
 fn parse_stamps(bytes: &[u8]) -> io::Result<HashMap<(String, String), Timestamp>> {
-    let mut r = Reader::records(bytes)?;
+    let mut r = Reader::records(bytes);
     let mut stamps = HashMap::new();
     for _ in 0..r.count {
         let owner = r.string()?;
@@ -240,7 +245,7 @@ fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<u64> {
     drop(f);
     fs::rename(&tmp, dir.join(name))?;
     // The rename is only durable once the directory entry is.
-    File::open(dir)?.sync_all()?;
+    crate::body_store::fsync_dir(dir)?;
     Ok(bytes.len() as u64)
 }
 
@@ -249,8 +254,9 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(magic: &[u8; 4], count: usize) -> Writer {
-        let mut buf = Vec::with_capacity(256);
+    /// `size_hint`: the file's last size, so the buffer rarely regrows.
+    fn new(magic: &[u8; 4], count: usize, size_hint: u64) -> Writer {
+        let mut buf = Vec::with_capacity(size_hint.max(256) as usize);
         buf.extend_from_slice(magic);
         buf.extend_from_slice(&VERSION.to_le_bytes());
         buf.extend_from_slice(&(count as u32).to_le_bytes());
@@ -286,12 +292,12 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     /// A reader over the records of a file `read` has checked.
-    fn records(file: &'a [u8]) -> io::Result<Reader<'a>> {
+    fn records(file: &'a [u8]) -> Reader<'a> {
         let count = u32::from_le_bytes(file[8..12].try_into().unwrap());
-        Ok(Reader {
+        Reader {
             buf: &file[12..file.len() - 4],
             count,
-        })
+        }
     }
 
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {

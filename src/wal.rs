@@ -665,7 +665,7 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
 }
 
 /// Path a corrupt segment is moved/copied aside to: `<path>.corrupt`.
-fn corrupt_sidecar_path(path: &Path) -> PathBuf {
+pub(crate) fn corrupt_sidecar_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push(".corrupt");
     PathBuf::from(os)

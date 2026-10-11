@@ -54,7 +54,7 @@ Two on-disk stores side by side:
 
 **WAL I/O failure:** a WAL write or fsync error drops the WAL for good (`ServerState::fail_wal`; the fd is never retried). Puts get `INTERNAL_ERROR` until restart, as do strict-mode acks for the batch that failed; state changes on existing jobs still apply in memory. `binlog-enabled` / `tuber_binlog_enabled` go false/0.
 
-**Schedules:** two small files beside the WAL, each replaced whole (tmp, fsync, rename, fsync dir): `schedules` (definitions, rewritten on `schedule-commit` before `SYNCED`) and `schedules.fired` (last fires, rewritten *before* a tick's fires are put — at-most-once: a crash loses a tick, never repeats it; if it can't be written nothing fires). Not WAL records. A damaged `schedules` is moved to `schedules.damaged` and the server starts without schedules.
+**Schedules:** two small files beside the WAL, each replaced whole (tmp, fsync, rename, fsync dir): `schedules` (definitions, rewritten on `schedule-commit` before `SYNCED`) and `schedules.fired` (last fires, rewritten *before* a tick's fires are put — at-most-once: a crash loses a tick, never repeats it; if it can't be written nothing fires). Not WAL records. A damaged `schedules` is moved to `schedules.corrupt[.N]` and the server starts without schedules.
 
 **Sync interval:** `--sync-interval` (env `TUBER_SYNC_INTERVAL`, default 100 ms) drives both stores. `--wal-sync-interval` is accepted as a hidden alias for backwards compatibility.
 
