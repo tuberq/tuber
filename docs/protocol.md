@@ -141,8 +141,10 @@ The safety margin is 1 second. The minimum TTR is also 1 second, so a job with T
 
 Recurring schedules: entries tuber puts into a tube at the times a cron
 spec names, so an app needs no scheduler process of its own. An app
-registers its whole schedule at boot in one sync; the design and its
-decisions are in [scheduler.md](scheduler.md).
+registers its whole schedule at boot in one sync. How to adopt it from an
+app, and what a client library should do, is in
+[scheduling.md](scheduling.md); the design and its decisions are in
+[scheduler.md](scheduler.md).
 
 ```
 schedule-begin splat

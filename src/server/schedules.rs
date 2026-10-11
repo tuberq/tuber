@@ -84,7 +84,9 @@ impl ServerState {
         let counts = self.schedules.commit(sync, Timestamp::now());
         // Durable before the reply. On failure the new set stands in memory
         // and the client hears INTERNAL_ERROR, as a put whose WAL write
-        // fails does; the next commit or fire writes the files again.
+        // fails does. Only a later commit rewrites the definitions (a fire
+        // writes just the stamps), so a restart before then restores the
+        // previous set.
         if let Some(files) = self.schedule_files.as_mut()
             && let Err(e) = files.write_all(&self.schedules)
         {

@@ -3,8 +3,9 @@
 > **Status: implemented (2026-10-11).** Proposed and built the same day; the
 > three decisions left open in the proposal — DST, missed ticks, crashes —
 > are recorded under [Settled decisions](#settled-decisions). Prompted by
-> Splat's notes of 2026-10-11. The command reference is in
-> [protocol.md](protocol.md#schedule-commands) and the fields in
+> Splat's notes of 2026-10-11. The guide for app developers is
+> [scheduling.md](scheduling.md), the command reference
+> [protocol.md](protocol.md#schedule-commands) and the fields
 > [statistics.md](statistics.md#schedule-stats-stats-schedule-owner-name);
 > this document is the reasoning behind them. The piece useful with or
 > without a scheduler landed first: `idp:` dedups are counted per tube by
