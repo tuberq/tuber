@@ -10,6 +10,7 @@ pub mod heap;
 pub mod job;
 pub mod metrics;
 pub mod protocol;
+pub mod schedule;
 pub mod server;
 pub mod telemetry;
 pub mod tube;
