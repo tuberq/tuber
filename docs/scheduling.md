@@ -25,10 +25,8 @@ after:   web  worker ──(sync at boot)──▶ tuber ◀──reserve── 
 
 ## Quick start
 
-From Ruby, with tuber-gem:
-
-> The gem's `schedules.sync` helper is in progress. Until it ships, use the
-> raw protocol below; the helper sends exactly that.
+From Ruby, with [tuber-gem](https://github.com/tuberq/tuber-gem) 0.7.0 or
+later. Its README lists every option `s.add` takes.
 
 ```ruby
 tuber = Tuber.new   # reads TUBER_URL
@@ -135,6 +133,10 @@ but pointless.
 | `OUT_OF_MEMORY` / `OUT_OF_STORAGE` on commit | Nothing changed: the set would exceed `--max-jobs-size` / `--max-storage-bytes` | Alert |
 | `INTERNAL_ERROR` on commit | The set **is** live, but couldn't be written to disk; a tuber restart would bring back the previous set | Alert, and sync again once the disk is fixed: only a commit rewrites the definitions |
 
+From Ruby, `sync` raises `Tuber::ScheduleSyncError` for any reply but
+`SYNCED`, naming the refused entry (`#entry`) and the reply (`#status`). Its
+`#applied?` is true only for the `INTERNAL_ERROR` row.
+
 Why a refused line aborts the sync: if tuber committed the rest, the refused
 entry would be deleted — a typo in one zone would silently drop a job.
 Instead, a bad deploy leaves the last good schedule running. The refusals:
@@ -237,6 +239,10 @@ tuber schedules                       # one line per entry: spec, tube, next fir
 tuber schedules -o splat
 printf 'stats-schedule splat data_retention\r\n' | nc -w 1 localhost 11300
 ```
+
+From Ruby, `tuber.schedules.list("splat")` and
+`tuber.schedules.stats("splat", "data_retention")` read the same, with times
+as `Time` and counters as Integers.
 
 `stats-schedule` shows the next three fires in the entry's own zone, offset
 included. That's the quickest check that tuber read a zone the way you meant.
