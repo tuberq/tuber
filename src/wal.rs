@@ -799,6 +799,9 @@ pub struct Wal {
     lock_fd: Option<File>,
     #[cfg(test)]
     sync_count: u64,
+    /// Test-only: when set, every write and sync fails as a full disk would.
+    #[cfg(test)]
+    fail_io: bool,
 }
 
 impl Wal {
@@ -911,6 +914,8 @@ impl Wal {
             lock_fd: Some(lock_fd),
             #[cfg(test)]
             sync_count: 0,
+            #[cfg(test)]
+            fail_io: false,
         };
 
         wal.scan_dir()?;
@@ -944,6 +949,8 @@ impl Wal {
         if !self.dirty {
             return Ok(());
         }
+        #[cfg(test)]
+        self.injected_failure()?;
         self.pre_sync_body_store()?;
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
@@ -1138,6 +1145,8 @@ impl Wal {
     // --- Write operations ---
 
     pub fn write_put(&mut self, job: &mut Job) -> io::Result<()> {
+        #[cfg(test)]
+        self.injected_failure()?;
         self.rotate_if_needed()?;
 
         let record = serialize_full_job(job);
@@ -1195,6 +1204,8 @@ impl Wal {
         expiry_epoch_secs: u64,
         reason: StateChangeReason,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        self.injected_failure()?;
         self.rotate_if_needed()?;
 
         let delay_nanos = new_delay.as_nanos().min(u64::MAX as u128) as u64;
@@ -1707,6 +1718,21 @@ impl Wal {
     #[cfg(test)]
     pub fn sync_count(&self) -> u64 {
         self.sync_count
+    }
+
+    /// Test-only: make every later write and sync fail, as a full disk would.
+    #[cfg(test)]
+    pub fn inject_io_failure(&mut self) {
+        self.fail_io = true;
+    }
+
+    #[cfg(test)]
+    fn injected_failure(&self) -> io::Result<()> {
+        if self.fail_io {
+            Err(io::Error::other("injected WAL I/O failure"))
+        } else {
+            Ok(())
+        }
     }
 }
 

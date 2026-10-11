@@ -69,6 +69,7 @@ Only meaningful when persistence is enabled with `-b`:
 
 | Field | Description |
 |---|---|
+| `binlog-enabled` | `true` while the WAL is persisting jobs. `false` without `-b` — or, with `-b`, after a WAL write or fsync error, when puts are refused with `INTERNAL_ERROR` until restart. Exported as `tuber_binlog_enabled` (1/0); with `-b` set, alert on 0. |
 | `binlog-oldest-index` | Oldest WAL segment number |
 | `binlog-current-index` | Current WAL segment number |
 | `binlog-max-size` | Maximum WAL file size |

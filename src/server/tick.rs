@@ -251,8 +251,7 @@ impl ServerState {
             for job_id in migrate_ids {
                 if let (Some(wal), Some(job)) = (self.wal.as_mut(), self.jobs.get_mut(&job_id)) {
                     if let Err(e) = wal.write_put(job) {
-                        tracing::error!("WAL compaction write error: {}, disabling WAL", e);
-                        self.wal = None;
+                        self.fail_wal("compaction write", e);
                         break;
                     }
                     // A compaction FullJob only carries created_at_epoch, so a
@@ -275,11 +274,7 @@ impl ServerState {
                             0,
                             StateChangeReason::None,
                         ) {
-                            tracing::error!(
-                                "WAL compaction delay re-assert error: {}, disabling WAL",
-                                e
-                            );
-                            self.wal = None;
+                            self.fail_wal("compaction delay re-assert", e);
                             break;
                         }
                     }

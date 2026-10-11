@@ -2125,3 +2125,90 @@ fn test_reserve_batch_partial_wins_over_body_store_error() {
     // The unreadable job is auto-buried (not left ready to re-wedge the tube).
     assert_eq!(s.jobs.get(&2).unwrap().state, JobState::Buried);
 }
+
+fn make_wal_state(dir: &std::path::Path, sync_interval: Duration) -> ServerState {
+    let mut s = make_state();
+    let config = crate::wal::WalConfig {
+        max_file_size: None,
+        sync_interval,
+    };
+    s.wal = Some(crate::wal::Wal::open(dir, config).unwrap());
+    s
+}
+
+fn send_put(
+    s: &mut ServerState,
+    strict: bool,
+    conn_id: u64,
+    body: &[u8],
+    pending: &mut Vec<(oneshot::Sender<Response>, Response)>,
+) -> oneshot::Receiver<Response> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let msg = EngineMsg {
+        conn_id,
+        payload: EnginePayload::Command {
+            cmd: put_cmd(0, 0, 60, body.len() as u32),
+            body: Some(body.to_vec()),
+            reply_tx,
+        },
+    };
+    process_message(s, strict, msg, pending);
+    reply_rx
+}
+
+/// Strict mode, one group-commit batch: put 1 is buffered and waiting on the
+/// batch fsync when put 2's WAL write fails. Neither is durable, so neither
+/// may be acked INSERTED. This used to ack both: the failure set `wal = None`,
+/// put 2 then went out as an immediate INSERTED, and `sync_wal` reported a
+/// missing WAL as a successful sync, so put 1's deferred ack went out too.
+#[test]
+fn test_strict_batch_wal_write_failure_acks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::ZERO);
+    let c = register(&mut s);
+    let strict = s.wal_is_strict();
+    assert!(strict);
+
+    let mut pending = Vec::new();
+    let _rx1 = send_put(&mut s, strict, c, b"a", &mut pending);
+    assert_eq!(pending.len(), 1, "put 1 waits on the batch fsync");
+
+    s.wal.as_mut().unwrap().inject_io_failure();
+    let mut rx2 = send_put(&mut s, strict, c, b"b", &mut pending);
+
+    assert!(
+        !s.sync_wal(),
+        "the batch's writes are not durable, so its acks must fail"
+    );
+    let r2 = rx2.try_recv();
+    assert!(
+        matches!(r2, Ok(Response::InternalError)),
+        "the put whose write failed must not be acked, got {r2:?}"
+    );
+}
+
+/// Once the WAL has failed, puts are refused: there is nowhere to persist
+/// them. Holds in relaxed mode too, where the failure is usually first seen
+/// by the tick's backstop fsync. State changes on existing jobs still apply
+/// in memory: at worst a crash redelivers those jobs.
+#[test]
+fn test_wal_failure_refuses_later_puts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+
+    let resp = s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+    assert!(matches!(resp, Response::Inserted(1)), "got {resp:?}");
+
+    s.wal.as_mut().unwrap().inject_io_failure();
+    assert!(!s.sync_wal(), "the backstop fsync fails");
+
+    let resp = s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"b".to_vec()));
+    assert!(
+        matches!(resp, Response::InternalError),
+        "a put after the WAL failed must be refused, got {resp:?}"
+    );
+
+    let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
+    assert!(matches!(resp, Response::Deleted), "got {resp:?}");
+}

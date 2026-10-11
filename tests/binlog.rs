@@ -1809,3 +1809,149 @@ async fn test_reserve_toast_read_failure_auto_buries_job() {
     c.mustsend("delete 1\r\n").await;
     c.ckresp("DELETED\r\n").await;
 }
+
+/// Scrape `/metrics` from a metrics server and return one series' value.
+async fn scrape_metric(metrics_port: u16, name: &str) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", metrics_port))
+        .await
+        .unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    resp.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ').map(str::to_string))
+}
+
+/// A WAL that runs out of disk must not leave the server acking puts it can
+/// no longer persist. It used to drop the WAL and carry on in memory: strict
+/// mode quietly became immediate acks, every later put got INSERTED, and a
+/// restart lost all of them. Nothing outside `stats` showed it.
+///
+/// Runs the server as a child process with every file capped at 64 KiB
+/// (RLIMIT_FSIZE), so the WAL segment hits EFBIG a few hundred puts in.
+#[tokio::test]
+async fn test_wal_disk_full_refuses_puts_and_loses_no_acked_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().to_path_buf();
+
+    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp_listener.local_addr().unwrap().port();
+    drop(tmp_listener);
+
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_tuber"));
+    cmd.args([
+        "server",
+        "-l",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-b",
+        wal_path.to_str().unwrap(),
+        "-i",
+        "0",
+        "--max-storage-bytes",
+        "1g",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    // SIGXFSZ is ignored so an oversize write fails with EFBIG instead of
+    // killing the process. Both calls are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let cap = libc::rlimit {
+                rlim_cur: 64 * 1024,
+                rlim_max: 64 * 1024,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &cap) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("failed to start tuber subprocess");
+
+    let mut stream = None;
+    for _ in 0..40 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (read_half, write_half) = stream
+        .expect("server did not start accepting connections")
+        .into_split();
+    let mut c = TestConn {
+        reader: BufReader::new(read_half),
+        writer: write_half,
+    };
+
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_port = ml.local_addr().unwrap().port();
+    tokio::spawn(tuber::metrics::serve_with_listener(
+        ml,
+        format!("127.0.0.1:{port}"),
+    ));
+    let enabled_before = scrape_metric(metrics_port, "tuber_binlog_enabled").await;
+
+    // Put until the disk fills, then keep going.
+    let mut acked = Vec::new();
+    let mut first_refusal = None;
+    let mut after_refusal = Vec::new();
+    for i in 0..20_000 {
+        if first_refusal.is_some() && after_refusal.len() == 20 {
+            break;
+        }
+        c.mustsend("put 0 0 60 1\r\nx\r\n").await;
+        let line = c.readline().await;
+        if let Some(id) = line.strip_prefix("INSERTED ") {
+            acked.push(id.trim().parse::<u64>().unwrap());
+        }
+        if first_refusal.is_none() {
+            if !line.starts_with("INSERTED") {
+                first_refusal = Some((i, line));
+            }
+        } else {
+            after_refusal.push(line);
+        }
+    }
+    let (refused_at, refusal) = first_refusal.expect("the 64 KiB cap never failed a WAL write");
+    assert_eq!(refusal, "INTERNAL_ERROR\r\n", "put #{refused_at}");
+    let enabled_after = scrape_metric(metrics_port, "tuber_binlog_enabled").await;
+
+    unsafe {
+        libc::kill(child.id().unwrap() as i32, libc::SIGKILL);
+    }
+    child.wait().await.unwrap();
+
+    // Every job the server acked must survive the crash.
+    let srv = TestServer::start_with_wal(&wal_path).await;
+    let mut c2 = srv.connect().await;
+    let mut lost = Vec::new();
+    for id in &acked {
+        c2.mustsend(&format!("peek {id}\r\n")).await;
+        if c2.readline().await.starts_with("FOUND") {
+            c2.ckresp("x\r\n").await;
+        } else {
+            lost.push(*id);
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {} acked jobs were lost (the disk filled at put #{refused_at}); first lost ids: {:?}",
+        lost.len(),
+        acked.len(),
+        &lost[..lost.len().min(5)],
+    );
+
+    // With the WAL gone the server keeps refusing puts, and says so.
+    assert!(
+        after_refusal.iter().all(|l| l == "INTERNAL_ERROR\r\n"),
+        "puts after the WAL failed: {after_refusal:?}"
+    );
+    assert_eq!(enabled_before.as_deref(), Some("1"));
+    assert_eq!(enabled_after.as_deref(), Some("0"));
+}

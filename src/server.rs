@@ -372,6 +372,11 @@ struct ServerState {
     waiters: Vec<WaitingReserve>,
     /// Optional write-ahead log for persistence.
     wal: Option<Wal>,
+    /// Set when a WAL write or fsync failed and the WAL was dropped. Puts
+    /// are refused from then on — there is nowhere left to persist them —
+    /// until a restart. Distinguishes "persistence lost" from "never
+    /// configured", which `wal == None` alone can't.
+    wal_failed: bool,
     /// External body store ("TOAST"). Present iff `wal` is — bodies live
     /// here when persistence is enabled, addressed by `BodyId` in the WAL's
     /// `FullJob` records (v5+).
@@ -508,6 +513,7 @@ impl ServerState {
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
             deferred_replies: Vec::new(),
+            wal_failed: false,
             fd_budget,
         }
     }
@@ -587,11 +593,10 @@ impl ServerState {
             Some(l) => l,
             None => return false,
         };
-        // Key the cap off the body store, not the WAL. A WAL fsync error
-        // disables the WAL (`self.wal = None`) but leaves TOAST attached, so
-        // keying off `wal` would silently drop the disk cap after any transient
-        // WAL error — bodies would then keep hitting disk uncapped. When the WAL
-        // is gone its byte count and reserve are simply zero.
+        // Key the cap off the body store, not the WAL. A WAL I/O error drops
+        // the WAL (`fail_wal`) but leaves TOAST attached. Puts are refused
+        // after that anyway; when the WAL is gone its byte count and reserve
+        // are simply zero.
         let body_store = match self.body_store.as_ref() {
             Some(bs) => bs,
             None => return false,
@@ -1088,6 +1093,11 @@ impl ServerState {
         if self.drain_mode {
             return Response::Draining;
         }
+        // Persistence was configured and has failed: acking a put now would
+        // promise a durability nothing can deliver.
+        if self.wal_failed {
+            return Response::InternalError;
+        }
 
         let body = match body {
             Some(b) => b,
@@ -1377,6 +1387,13 @@ impl ServerState {
 
         if !self.waiters.is_empty() {
             self.process_queue();
+        }
+
+        // The write failed: the job is queued in memory but will never be
+        // persisted, so it isn't acked. Same shape as a failed strict-mode
+        // fsync (`fail_pending`): the in-memory state stands, the ack doesn't.
+        if self.wal_failed {
+            return Response::InternalError;
         }
 
         Response::Inserted(id)
@@ -2003,7 +2020,7 @@ impl ServerState {
         // flush-tube doesn't acquire/release the BodyStore mutex per job.
         //
         // Failure note: if `wal_write_state_change` fails mid-batch, the
-        // helper sets `self.wal = None` and the rest of the deletes proceed
+        // helper drops the WAL and the rest of the deletes proceed
         // against memory only. Those deletes won't survive a crash. This
         // is acceptable for a destructive command — flush-tube semantically
         // throws data away, and the alternative (abort the flush partway)
@@ -3664,25 +3681,32 @@ impl ServerState {
         }
     }
 
-    /// fsync TOAST then WAL. Disables the WAL on error (logged) so the
-    /// rest of the engine keeps serving in-memory state — same failure
-    /// shape as the existing `wal_write_*` helpers.
+    /// fsync TOAST then WAL. Drops the WAL on error (`fail_wal`); the engine
+    /// keeps serving existing jobs from memory but refuses new puts.
     ///
-    /// Returns `false` iff the fsync failed. In strict mode the caller must not
-    /// ack the just-flushed writes as success on a `false` return: their
-    /// durability contract (ack ⇒ durable) was violated, so they get
-    /// `INTERNAL_ERROR` instead. A no-op sync on a clean or absent WAL returns
-    /// `true`.
+    /// Returns `false` iff the WAL has failed — in this fsync, or in a write
+    /// earlier in the batch. In strict mode the caller must not ack the
+    /// batch's writes as success on a `false` return: their durability
+    /// contract (ack ⇒ durable) was violated, so they get `INTERNAL_ERROR`
+    /// instead. A no-op sync on a clean WAL, or with persistence never
+    /// configured, returns `true`.
     #[must_use]
     fn sync_wal(&mut self) -> bool {
         if let Some(wal) = self.wal.as_mut()
             && let Err(e) = wal.sync()
         {
-            tracing::error!("WAL sync error: {}, disabling WAL", e);
-            self.wal = None;
-            return false;
+            self.fail_wal("sync", e);
         }
-        true
+        !self.wal_failed
+    }
+
+    /// Drop the WAL after an I/O error and refuse puts until restart. The
+    /// fd isn't retried: after a failed fsync the kernel may have discarded
+    /// the dirty pages, so a later fsync on it can report success falsely.
+    fn fail_wal(&mut self, op: &str, e: io::Error) {
+        tracing::error!("WAL {op} error: {e}; persistence lost, refusing puts until restart");
+        self.wal = None;
+        self.wal_failed = true;
     }
 
     /// True iff the WAL is dirty AND its sync-staleness SLA has elapsed.
@@ -3707,8 +3731,7 @@ impl ServerState {
             if let Some(wal) = self.wal.as_mut()
                 && let Err(e) = wal.write_put(&mut job)
             {
-                tracing::error!("WAL write_put error: {}, disabling WAL", e);
-                self.wal = None;
+                self.fail_wal("write_put", e);
             }
             self.insert_job(job_id, job);
         }
@@ -3731,8 +3754,7 @@ impl ServerState {
                 && let Err(e) =
                     wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs, reason)
             {
-                tracing::error!("WAL write_state_change error: {}, disabling WAL", e);
-                self.wal = None;
+                self.fail_wal("write_state_change", e);
             }
             self.insert_job(job_id, job);
         }

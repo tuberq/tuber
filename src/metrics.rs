@@ -308,6 +308,16 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "mem-retained-bytes",
     );
+    // `stats` reports this as true/false; Prometheus needs a number. With
+    // `-b` set, 0 means a WAL write or fsync failed and puts are being
+    // refused until restart — alert on it.
+    if let Some(val) = stats.get("binlog-enabled") {
+        let val = u8::from(*val == "true");
+        out.push_str(&format!(
+            "# HELP tuber_binlog_enabled 1 while the WAL is persisting jobs; 0 without -b, or after a WAL I/O error\n\
+             # TYPE tuber_binlog_enabled gauge\ntuber_binlog_enabled {val}\n\n"
+        ));
+    }
     prom_gauge(
         &mut out,
         "tuber_binlog_file_count",
