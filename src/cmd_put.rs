@@ -2,6 +2,27 @@ use crate::client::TuberClient;
 use std::io;
 use tokio::io::AsyncBufReadExt;
 
+/// Puts sent, and how many the server turned down. A rejection doesn't stop a
+/// stdin run — the remaining lines are still put — but it fails the exit.
+#[derive(Default)]
+struct Tally {
+    sent: usize,
+    rejected: usize,
+}
+
+impl Tally {
+    fn record(&mut self, resp: &str) -> io::Result<()> {
+        self.sent += 1;
+        // Anything but INSERTED is the server refusing the job: JOB_TOO_BIG,
+        // DRAINING, OUT_OF_MEMORY, BAD_FORMAT, ... A dedup hit replies
+        // `INSERTED <id> <state>` and is the idempotency key working.
+        if !resp.starts_with("INSERTED ") {
+            self.rejected += 1;
+        }
+        crate::outln!("{resp}")
+    }
+}
+
 // One parameter per CLI flag of `tuber put`; clap already owns the grouping.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -30,11 +51,12 @@ pub async fn run(
     let aft = after_group.as_deref();
     let con = concurrency_key.as_deref();
 
+    let mut tally = Tally::default();
     if let Some(body) = body {
         let resp = client
             .put(priority, delay, ttr, body.as_bytes(), idp, grp, aft, con)
             .await?;
-        println!("{resp}");
+        tally.record(&resp)?;
     } else {
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
         let mut lines = stdin.lines();
@@ -45,9 +67,15 @@ pub async fn run(
             let resp = client
                 .put(priority, delay, ttr, line.as_bytes(), idp, grp, aft, con)
                 .await?;
-            println!("{resp}");
+            tally.record(&resp)?;
         }
     }
 
+    if tally.rejected > 0 {
+        return Err(io::Error::other(format!(
+            "{} of {} puts rejected",
+            tally.rejected, tally.sent
+        )));
+    }
     Ok(())
 }

@@ -548,7 +548,7 @@ tuber put [OPTIONS] [BODY]
 | `-g`, `--grp` | — | Group name (for job grouping) |
 | `--aft` | — | After-group dependency (wait for this group to complete) |
 | `-c`, `--con` | — | Concurrency key — `key` or `key:N` (N = max concurrent reservations, default 1) |
-| `-a`, `--addr` | `localhost:11300` | Server address |
+| `-a`, `--addr` | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address: `host:port`, `host`, or `:port` |
 
 ```bash
 # Put a job on a specific tube with priority
@@ -566,6 +566,17 @@ tuber put -g import "import-row-2"
 tuber put --aft import "send-summary"
 ```
 
+Each put prints the server's reply. If any is rejected (`JOB_TOO_BIG`,
+`DRAINING`, `OUT_OF_MEMORY`, …), the remaining stdin lines are still put and
+the command then exits 1. An idempotency dedup (`INSERTED <id> <state>`) is not
+a rejection.
+
+All client commands (`put`, `work`, `stats`, `tubes`) take the server address
+from `-a`, else the first of `TUBER_URL`, `TUBER_ADDR` and `BEANSTALKD_URL`
+that is set. `TUBER_URL` is the variable the Ruby gem reads and tuber-cli and
+tuber-tui read first, so one setting points every client at the same server.
+Despite the name it takes a bare address (`host:port`), not a URL.
+
 ### Work
 
 Reserve and execute jobs as shell commands.
@@ -578,12 +589,17 @@ tuber work [OPTIONS]
 |---|---|---|
 | `-t`, `--tube` | `default` | Tube to watch |
 | `-j`, `--parallel` | `1` | Number of parallel workers |
-| `-a`, `--addr` | `localhost:11300` | Server address |
+| `-a`, `--addr` | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address: `host:port`, `host`, or `:port` |
 
 ```bash
 # Process jobs from the "emails" tube with 4 workers
 tuber work -t emails -j 4
 ```
+
+A command that exits 0 deletes its job; any other exit buries it. Jobs inherit
+the worker's stdout, so don't pipe it into something that exits early (`| head`):
+once the reader is gone, a job that prints fails on the closed pipe and is
+buried. The worker's own log lines go to stderr and are safe to pipe.
 
 ### Tubes
 
@@ -595,7 +611,7 @@ tuber tubes [OPTIONS]
 
 | Option | Default | Description |
 |---|---|---|
-| `-a`, `--addr` | `localhost:11300` | Server address |
+| `-a`, `--addr` | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address: `host:port`, `host`, or `:port` |
 
 ```bash
 $ tuber tubes
@@ -614,7 +630,7 @@ tuber stats [OPTIONS]
 | Option | Default | Description |
 |---|---|---|
 | `-t`, `--tube` | — | Tube name (omit for global stats) |
-| `-a`, `--addr` | `localhost:11300` | Server address |
+| `-a`, `--addr` | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address: `host:port`, `host`, or `:port` |
 
 ```bash
 # Global stats

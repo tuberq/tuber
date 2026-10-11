@@ -19,7 +19,7 @@ pub async fn run(addr: &str, tube: &str, parallel: usize) -> io::Result<()> {
 
     tokio::spawn(async move {
         wait_for_signal().await;
-        eprintln!("\nShutting down gracefully...");
+        crate::errln!("\nShutting down gracefully...");
         let _ = shutdown_tx.send(true);
     });
 
@@ -44,12 +44,12 @@ pub async fn run(addr: &str, tube: &str, parallel: usize) -> io::Result<()> {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 failed += 1;
-                eprintln!("worker error: {e}");
+                crate::errln!("worker error: {e}");
             }
             Err(e) => {
                 // Join error (panic / cancellation) counts as a failure.
                 failed += 1;
-                eprintln!("worker task failed: {e}");
+                crate::errln!("worker task failed: {e}");
             }
         }
     }
@@ -111,7 +111,7 @@ async fn supervise_worker(
                         if *shutdown_rx.borrow() {
                             return Ok(());
                         }
-                        eprintln!("worker {worker_id}: session ended: {e}");
+                        crate::errln!("worker {worker_id}: session ended: {e}");
                     }
                 }
             }
@@ -119,7 +119,7 @@ async fn supervise_worker(
                 if *shutdown_rx.borrow() {
                     return Ok(());
                 }
-                eprintln!("worker {worker_id}: connect failed: {e}");
+                crate::errln!("worker {worker_id}: connect failed: {e}");
                 failures += 1;
                 if failures >= MAX_CONSECUTIVE_FAILURES {
                     return Err(io::Error::other(format!(
@@ -174,7 +174,7 @@ async fn worker_loop(
         match client.reserve_with_timeout(5).await? {
             ReserveResult::Reserved { id, body } => {
                 let body_str = String::from_utf8_lossy(&body).into_owned();
-                eprintln!("worker {worker_id}: executing job {id}: {body_str}");
+                crate::errln!("worker {worker_id}: executing job {id}: {body_str}");
 
                 let ttr = job_ttr(client, id).await;
                 let outcome = run_job(client, worker_id, id, &body_str, ttr, shutdown_rx).await?;
@@ -183,9 +183,9 @@ async fn worker_loop(
                         if status.success() {
                             let resp = client.delete(id).await?;
                             if resp.trim() == "DELETED" {
-                                eprintln!("worker {worker_id}: job {id} completed");
+                                crate::errln!("worker {worker_id}: job {id} completed");
                             } else {
-                                eprintln!(
+                                crate::errln!(
                                     "worker {worker_id}: job {id} finished OK but delete returned {resp:?} \
                                      — job may have timed out (TTR) and been reassigned"
                                 );
@@ -194,11 +194,11 @@ async fn worker_loop(
                             let code = status.code().unwrap_or(-1);
                             let resp = client.bury(id, 0).await?;
                             if resp.trim() == "BURIED" {
-                                eprintln!(
+                                crate::errln!(
                                     "worker {worker_id}: job {id} failed (exit {code}), buried"
                                 );
                             } else {
-                                eprintln!(
+                                crate::errln!(
                                     "worker {worker_id}: job {id} failed (exit {code}) but bury returned {resp:?} \
                                      — job may have timed out (TTR) and been reassigned"
                                 );
@@ -209,7 +209,7 @@ async fn worker_loop(
                         // Shutdown while the job was running: hand it back for
                         // another worker rather than burying it.
                         let resp = client.release(id, 0, 0).await?;
-                        eprintln!(
+                        crate::errln!(
                             "worker {worker_id}: shutdown — released job {id} ({})",
                             resp.trim()
                         );
@@ -221,7 +221,7 @@ async fn worker_loop(
             ReserveResult::Error(msg) => {
                 // Protocol-level error (e.g. DEADLINE_SOON). Pause briefly
                 // rather than hot-looping; honour shutdown while waiting.
-                eprintln!("worker {worker_id}: reserve error: {msg}");
+                crate::errln!("worker {worker_id}: reserve error: {msg}");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     _ = shutdown_rx.changed() => break,
@@ -230,7 +230,7 @@ async fn worker_loop(
         }
     }
 
-    eprintln!("worker {worker_id}: stopped");
+    crate::errln!("worker {worker_id}: stopped");
     Ok(())
 }
 
@@ -262,7 +262,7 @@ async fn run_job(
             _ = touch_interval.tick() => {
                 let resp = client.touch(id).await?;
                 if resp.trim() != "TOUCHED" {
-                    eprintln!(
+                    crate::errln!(
                         "worker {worker_id}: touch on job {id} returned {resp:?} \
                          — reservation may be lost (job could be reassigned)"
                     );

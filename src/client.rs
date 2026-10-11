@@ -271,9 +271,73 @@ impl TuberClient {
     }
 }
 
+/// Env vars that name the server for the client subcommands, most preferred
+/// first. `TUBER_URL` is what the Ruby gem reads, `TUBER_ADDR` what
+/// tuber-cli/tuber-tui read before they adopted `TUBER_URL`, and
+/// `BEANSTALKD_URL` the beanstalkd convention. Despite the names, each holds a
+/// bare `[host][:port]`, not a URL with a scheme.
+pub const ADDR_ENV_VARS: [&str; 3] = ["TUBER_URL", "TUBER_ADDR", "BEANSTALKD_URL"];
+
+/// The address a client subcommand dials: `flag` if given, else the first
+/// non-empty var in [`ADDR_ENV_VARS`] (looked up through `env`), else
+/// `localhost:11300`. Accepts `host:port`, `host` (port 11300), or `:port`
+/// (localhost) — the same forms as tuber-cli.
+pub fn resolve_addr(flag: Option<&str>, env: impl Fn(&str) -> Option<String>) -> String {
+    let given = flag.map(str::to_string).or_else(|| {
+        ADDR_ENV_VARS
+            .iter()
+            .find_map(|var| env(var).filter(|v| !v.trim().is_empty()))
+    });
+    let given = given.as_deref().unwrap_or("").trim();
+    if given.is_empty() {
+        "localhost:11300".to_string()
+    } else if let Some(port) = given.strip_prefix(':') {
+        format!("localhost:{port}")
+    } else if given.contains(':') {
+        given.to_string()
+    } else {
+        format!("{given}:11300")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_token;
+    use super::{resolve_addr, validate_token};
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn resolve_addr_accepts_the_tuber_cli_forms() {
+        let none = env(&[]);
+        assert_eq!(resolve_addr(None, &none), "localhost:11300");
+        assert_eq!(
+            resolve_addr(Some("q.internal:1234"), &none),
+            "q.internal:1234"
+        );
+        assert_eq!(resolve_addr(Some("q.internal"), &none), "q.internal:11300");
+        assert_eq!(resolve_addr(Some(":1234"), &none), "localhost:1234");
+    }
+
+    #[test]
+    fn resolve_addr_prefers_flag_then_env_in_order() {
+        let all = env(&[
+            ("TUBER_URL", "url:1"),
+            ("TUBER_ADDR", "addr:2"),
+            ("BEANSTALKD_URL", "bs:3"),
+        ]);
+        assert_eq!(resolve_addr(Some("flag:0"), &all), "flag:0");
+        assert_eq!(resolve_addr(None, &all), "url:1");
+        let no_url = env(&[("TUBER_ADDR", "addr:2"), ("BEANSTALKD_URL", "bs:3")]);
+        assert_eq!(resolve_addr(None, &no_url), "addr:2");
+        let blank_url = env(&[("TUBER_URL", "  "), ("BEANSTALKD_URL", "bs")]);
+        assert_eq!(resolve_addr(None, &blank_url), "bs:11300");
+    }
 
     #[test]
     fn validate_token_accepts_plain_and_colon_forms() {

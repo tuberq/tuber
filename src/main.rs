@@ -224,9 +224,10 @@ enum Commands {
         #[arg(short = 'c', long)]
         con: Option<String>,
 
-        /// Server address (host:port)
-        #[arg(short = 'a', long, default_value = "localhost:11300")]
-        addr: String,
+        /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+        /// $BEANSTALKD_URL, then localhost:11300]
+        #[arg(short = 'a', long)]
+        addr: Option<String>,
     },
 
     /// Show server or tube statistics
@@ -235,16 +236,18 @@ enum Commands {
         #[arg(short = 't', long)]
         tube: Option<String>,
 
-        /// Server address (host:port)
-        #[arg(short = 'a', long, default_value = "localhost:11300")]
-        addr: String,
+        /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+        /// $BEANSTALKD_URL, then localhost:11300]
+        #[arg(short = 'a', long)]
+        addr: Option<String>,
     },
 
     /// List all tubes with job counts
     Tubes {
-        /// Server address (host:port)
-        #[arg(short = 'a', long, default_value = "localhost:11300")]
-        addr: String,
+        /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+        /// $BEANSTALKD_URL, then localhost:11300]
+        #[arg(short = 'a', long)]
+        addr: Option<String>,
     },
 
     /// Worker mode - reserve and execute jobs as shell commands
@@ -257,9 +260,10 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = 1)]
         parallel: usize,
 
-        /// Server address (host:port)
-        #[arg(short = 'a', long, default_value = "localhost:11300")]
-        addr: String,
+        /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+        /// $BEANSTALKD_URL, then localhost:11300]
+        #[arg(short = 'a', long)]
+        addr: Option<String>,
     },
 }
 
@@ -274,7 +278,7 @@ fn main() {
     if std::env::var_os("TUBER_SYNC_INTERVAL").is_none()
         && let Some(old) = std::env::var_os("TUBER_WAL_SYNC_INTERVAL")
     {
-        eprintln!("tuber: TUBER_WAL_SYNC_INTERVAL is deprecated; use TUBER_SYNC_INTERVAL");
+        tuber::errln!("tuber: TUBER_WAL_SYNC_INTERVAL is deprecated; use TUBER_SYNC_INTERVAL");
         // SAFETY: no runtime and no other threads exist yet — single-threaded.
         unsafe { std::env::set_var("TUBER_SYNC_INTERVAL", old) };
     }
@@ -379,23 +383,24 @@ async fn run() {
             con,
             addr,
         } => {
+            let addr = server_addr(addr);
             if let Err(e) =
                 tuber::cmd_put::run(&addr, &tube, priority, delay, ttr, body, idp, grp, aft, con)
                     .await
             {
-                eprintln!("error: {e}");
+                tuber::errln!("error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::Stats { tube, addr } => {
-            if let Err(e) = tuber::cmd_stats::run(&addr, tube).await {
-                eprintln!("error: {e}");
+            if let Err(e) = tuber::cmd_stats::run(&server_addr(addr), tube).await {
+                tuber::errln!("error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::Tubes { addr } => {
-            if let Err(e) = tuber::cmd_tubes::run(&addr).await {
-                eprintln!("error: {e}");
+            if let Err(e) = tuber::cmd_tubes::run(&server_addr(addr)).await {
+                tuber::errln!("error: {e}");
                 std::process::exit(1);
             }
         }
@@ -404,10 +409,15 @@ async fn run() {
             parallel,
             addr,
         } => {
-            if let Err(e) = tuber::cmd_work::run(&addr, &tube, parallel).await {
-                eprintln!("error: {e}");
+            if let Err(e) = tuber::cmd_work::run(&server_addr(addr), &tube, parallel).await {
+                tuber::errln!("error: {e}");
                 std::process::exit(1);
             }
         }
     }
+}
+
+/// Where a client subcommand connects: `-a`, else the address env vars.
+fn server_addr(flag: Option<String>) -> String {
+    tuber::client::resolve_addr(flag.as_deref(), |var| std::env::var(var).ok())
 }

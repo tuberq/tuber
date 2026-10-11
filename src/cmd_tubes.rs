@@ -13,8 +13,7 @@ pub async fn run(addr: &str) -> io::Result<()> {
         .collect();
 
     if tubes.is_empty() {
-        println!("No tubes.");
-        return Ok(());
+        return crate::outln!("No tubes.");
     }
 
     // Fetch stats for each tube and display a summary
@@ -35,12 +34,12 @@ pub async fn run(addr: &str) -> io::Result<()> {
                 let delayed = get("current-jobs-delayed");
                 let buried = get("current-jobs-buried");
 
-                println!(
+                crate::outln!(
                     "{tube}: ready={ready} reserved={reserved} delayed={delayed} buried={buried}"
-                );
+                )?;
             }
             Err(e) => {
-                println!("{tube}: error fetching stats: {e}");
+                crate::outln!("{tube}: error fetching stats: {e}")?;
             }
         }
     }

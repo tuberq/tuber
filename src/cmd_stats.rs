@@ -10,6 +10,5 @@ pub async fn run(addr: &str, tube: Option<String>) -> io::Result<()> {
         client.stats().await?
     };
 
-    print!("{body}");
-    Ok(())
+    crate::cli_output::out(format_args!("{body}"))
 }
