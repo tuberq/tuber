@@ -257,6 +257,68 @@ fn put_deduplicated_against_a_buried_job_warns() {
     );
 }
 
+// --- schedules ---------------------------------------------------------------
+
+/// Sync `entries` — (name, tube, tags and spec) — for `owner`, over the
+/// protocol directly.
+fn sync_schedules(server: &Server, owner: &str, entries: &[(&str, &str, &str)]) {
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    let mut wire = format!("schedule-begin {owner}\r\n");
+    for (name, tube, rest) in entries {
+        wire.push_str(&format!(
+            "schedule-put {name} {tube} 1024 0 120 2 {rest}\r\n{{}}\r\n"
+        ));
+    }
+    wire.push_str("schedule-commit\r\n");
+    conn.write_all(wire.as_bytes()).unwrap();
+    let mut reader = BufReader::new(conn);
+    let mut last = String::new();
+    for _ in 0..entries.len() + 2 {
+        last.clear();
+        reader.read_line(&mut last).unwrap();
+    }
+    assert!(last.starts_with("SYNCED"), "{last:?}");
+}
+
+#[test]
+fn schedules_lists_entries_with_their_next_fire() {
+    let server = Server::start(&[]);
+    let none = run(&["schedules", "-a", &server.addr()], &[], None);
+    assert!(none.status.success(), "stderr: {}", stderr(&none));
+    assert_eq!(stdout(&none), "No schedules.\n");
+
+    sync_schedules(
+        &server,
+        "splat",
+        &[("retention", "maint", "con:1 0 2 * * * Australia/Melbourne")],
+    );
+    sync_schedules(&server, "booko", &[("ping", "jobs", "@hourly")]);
+
+    let all = run(&["schedules", "-a", &server.addr()], &[], None);
+    assert!(all.status.success(), "stderr: {}", stderr(&all));
+    let out = stdout(&all);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].starts_with("booko ping: @hourly -> jobs next="),
+        "{out}"
+    );
+    assert!(lines[0].contains(":00:00+00:00 last=-"), "{out}");
+    assert!(
+        lines[1].starts_with("splat retention: 0 2 * * * Australia/Melbourne -> maint next="),
+        "{out}"
+    );
+    // 02:00 Melbourne time, at +10:00 or +11:00 depending on the season.
+    assert!(lines[1].contains("T02:00:00+1"), "{out}");
+
+    let one = run(
+        &["schedules", "-o", "splat", "-a", &server.addr()],
+        &[],
+        None,
+    );
+    assert_eq!(stdout(&one).lines().count(), 1, "{}", stdout(&one));
+}
+
 // --- server address ----------------------------------------------------------
 
 #[test]

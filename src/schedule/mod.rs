@@ -1,6 +1,6 @@
 //! Recurring schedules: entries an app registers with a schedule sync, each
 //! put into its tube by the server at the times its spec names. See
-//! docs/future/scheduler.md for the design.
+//! docs/scheduler.md for the design.
 //!
 //! An entry is identified by (owner, name), both chosen by the app. A sync
 //! (`schedule-begin` / `schedule-put`… / `schedule-commit`) carries the

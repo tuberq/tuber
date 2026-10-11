@@ -3157,6 +3157,8 @@ impl ServerState {
              conn-idle-timeout: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
+             current-schedules: {}\n\
+             current-schedules-size: {}\n\
              draining: {}\n\
              id: {}\n\
              name: {}\n\
@@ -3249,6 +3251,9 @@ impl ServerState {
                 .map_or(0, |d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
+            self.schedules.len(),
+            // Counted against max-jobs-size alongside current-jobs-size.
+            self.schedules.bytes(),
             if self.drain_mode { "true" } else { "false" },
             self.instance_id,
             self.name.as_deref().unwrap_or(""),

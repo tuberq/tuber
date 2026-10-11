@@ -1,13 +1,16 @@
 # Recurring schedules inside tuber
 
-> **Status: proposed (2026-10-11), not started.** The three open decisions —
-> DST, missed ticks, crashes — were settled the same day; see
-> [Settled decisions](#settled-decisions). Prompted by
-> `NOTES-FROM-SPLAT-2026-10-11.md`. The one piece useful with or without a
-> scheduler has already landed: `idp:` dedups are counted per tube by the
-> state of the job matched (`total-idp-dedups-*` in `stats-tube`,
-> `tuber_tube_idp_dedups_total{tube,state}`), and `tuber put` warns on stderr
-> when a dedup hits a buried job.
+> **Status: implemented (2026-10-11).** Proposed and built the same day; the
+> three decisions left open in the proposal — DST, missed ticks, crashes —
+> are recorded under [Settled decisions](#settled-decisions). Prompted by
+> Splat's notes of 2026-10-11. The command reference is in
+> [protocol.md](protocol.md#schedule-commands) and the fields in
+> [statistics.md](statistics.md#schedule-stats-stats-schedule-owner-name);
+> this document is the reasoning behind them. The piece useful with or
+> without a scheduler landed first: `idp:` dedups are counted per tube by
+> the state of the job matched (`total-idp-dedups-*` in `stats-tube`,
+> `tuber_tube_idp_dedups_total{tube,state}`), and `tuber put` warns on
+> stderr when a dedup hits a buried job.
 
 ## Context
 
@@ -95,10 +98,16 @@ SYNCED 9 0 0 0
 
 Errors from `schedule-put`: `BAD_FORMAT` (malformed line, or a name staged
 twice in one sync), `BAD_SCHEDULE` (a spec or zone tuber can't use, or a cron
-that never matches, e.g. `0 0 30 2 *`), `JOB_TOO_BIG`. As with `put`, the
-data block is drained even when the line is rejected, so a bad entry can't
-desync the connection. `schedule-put`, `-commit` and `-abort` outside a sync
-reply `NOT_SYNCING`.
+that never matches, e.g. `0 0 30 2 *`), `JOB_TOO_BIG`, `OUT_OF_MEMORY` (the
+`--max-jobs-size` budget, or the 10,000-entry cap). Any of them makes the
+sync's commit reply `ABORTED`. As with `put`, the data block is drained even
+when the line is rejected, so a bad entry can't desync the connection; and
+a rejected line still reaches the engine, so that the sync knows. A second
+`schedule-begin` inside a sync is `BAD_FORMAT` and aborts it too.
+`schedule-commit` can also reply `OUT_OF_MEMORY` or `OUT_OF_STORAGE` (nothing
+changes), or `INTERNAL_ERROR` when the new set is live but couldn't be
+written to disk. `schedule-put`, `-commit` and `-abort` outside a sync reply
+`NOT_SYNCING`.
 
 **Line layout.** Everything up to `<bytes>` is positional, like `put`. After
 it come tags, then the spec, which runs to the end of the line. Every tag has a
@@ -150,8 +159,11 @@ last-fire: 2026-10-11T02:00:00+11:00
 last-result: "INSERTED 48213"
 total-fires: 38
 total-inserted: 38
-total-deduped: 0
+total-deduped-ready: 0
+total-deduped-reserved: 0
+total-deduped-delayed: 0
 total-deduped-buried: 0
+total-deduped-deleted: 0
 total-rejected: 0
 buried-streak: 0
 ```
@@ -165,6 +177,7 @@ cheapest way for someone to check tuber read their zone the way they meant.
 
 | Metric | |
 |---|---|
+| `tuber_schedules` | Entries held, across all owners (`current-schedules` in `stats`) |
 | `tuber_schedule_fires_total{owner,name,result}` | `result` is `inserted`, `deduped_ready`, `deduped_reserved`, `deduped_delayed`, `deduped_buried`, `deduped_deleted` or `rejected` |
 | `tuber_schedule_last_fire_timestamp_seconds{owner,name}` | For staleness alerts: `time() - last_fire > 2 × interval` |
 | `tuber_schedule_next_fire_timestamp_seconds{owner,name}` | |
@@ -174,7 +187,16 @@ The 09-09 failure becomes
 Cardinality is bounded by the number of entries.
 
 **CLI.** `tuber schedules [-o <owner>]` lists entries with spec, next fire and
-last result, like `tuber tubes`.
+last result, like `tuber tubes`:
+
+```
+splat data_retention: 0 2 * * * Australia/Melbourne -> splat.maintenance next=2026-10-12T02:00:00+11:00 last=INSERTED 48213
+splat histogram_rollup: 5 * * * * -> splat.maintenance next=2026-10-11T05:05:00+00:00 last=INSERTED 47101 BURIED (deduped against a buried job 70 times running)
+```
+
+`stats` also reports `current-schedules`, and `current-schedules-size`: the
+memory entries are charged against `--max-jobs-size`, beside
+`current-jobs-size`.
 
 ## Decisions
 
@@ -305,13 +327,19 @@ burst is what it asked to avoid. This needs the last fire stored (decision 6).
 The default is fire once whatever the age; skipping is opt-in per entry with
 `catchup:0`.
 
+A tick fired up to 5 seconds late counts as on time, not missed, so
+`catchup:` governs downtime and clock steps rather than a slow engine step
+— and a restart that takes a couple of seconds doesn't drop a `catchup:0`
+entry's tick that fell inside it. The same rule covers a forward clock step
+while running (decision 7).
+
 ### 4. Interval anchoring
 
 rufus-scheduler's `every '10m'` and robfig's `@every` count from when the job
 was added, so each Splat deploy shifts the phase. Temporal anchors intervals to
 the epoch: `epoch + n·interval + offset`.
 
-**Proposed: epoch-anchored**, with an optional `offset`. The next fire is then
+**Epoch-anchored**, with an optional `offset`. The next fire is then
 a function of the spec and the clock alone, so restarts and re-syncs never
 move it, and `every 10m` fires at :00, :10, :20. Intervals are real durations
 and ignore zones (`every 1d` is exactly 24 h, as EventBridge's `rate(1 days)`
@@ -339,16 +367,34 @@ offer an opt-in to fire anyway when the match is buried is left for later.
 
 ### 6. Persistence and crashes
 
-**Storage: a small `schedules` file in the binlog directory**, not WAL
-records. WAL segments are collected by tracking the live jobs each one holds,
-with compaction copying them forward (`Wal::compaction_target`, `Wal::gc`);
+**Storage: two small files in the binlog directory**, not WAL records. WAL
+segments are collected by tracking the live jobs each one holds, with
+compaction copying them forward (`Wal::compaction_target`, `Wal::gc`);
 schedule entries would have to join that, for state that changes a few times
-per deploy. The file is versioned and checksummed, and rewritten atomically
-(write `schedules.tmp`, fsync, rename, fsync the directory) on every commit and
-whenever entries fire — one rewrite per tick that fires anything, however many
-entries fired in it. It counts toward `--max-storage-bytes`. This is the
-same shape as systemd's per-timer stamp files. Nothing references across the
-two stores: a fired job is an ordinary job in the WAL.
+per deploy.
+
+- `schedules` holds every entry's definition, stored as its `schedule-put`
+  line plus body and parsed back through the protocol parser on load, so a
+  restored entry passes exactly the checks a synced one did. Rewritten on
+  every commit, before `SYNCED` is sent.
+- `schedules.fired` holds each entry's last fire. Rewritten whenever entries
+  fire — one rewrite per tick that fires anything, however many entries
+  fired in it — and kept apart so that rewrite is a few bytes per entry
+  rather than every entry's body.
+
+Both are versioned and checksummed, and replaced atomically (write
+`<name>.tmp`, fsync, rename, fsync the directory). They count toward
+`--max-storage-bytes`. This is the same shape as systemd's per-timer stamp
+files. Nothing references across the two stores: a fired job is an ordinary
+job in the WAL. On restart each entry resumes from the later of its last fire
+and its sync time.
+
+A damaged `schedules` file is moved to `schedules.damaged` and the server
+starts without schedules — the queue staying up matters more, and each app's
+next sync restores its own. A damaged `schedules.fired` only loses last
+fires, so missed ticks are judged from each entry's sync time. A stored entry
+that no longer parses (most likely a zone the system's tzdata dropped) is
+logged and skipped.
 
 Without `-b`, schedules live in memory like everything else, and the next app
 process to boot syncs them back.
@@ -366,7 +412,12 @@ ways:
 are the complaint. The stamp is durable before the put is attempted, so a
 crash in between loses that tick and nothing fires it later: on restart the
 entry's last fire already covers it, so missed-tick catch-up (decision 3)
-does not see it as missed either.
+does not see it as missed either. If the stamps can't be written, nothing
+fires that tick — recorded as `INTERNAL_ERROR` — for the same reason.
+
+A commit that can't be written replies `INTERNAL_ERROR` with the new set live
+in memory, the same contract as a put whose WAL write fails: the state stands,
+the durability promise doesn't, and the client is told.
 
 ### 7. Firing
 
@@ -374,14 +425,23 @@ A fire goes through the same code path as a client `put`: validation,
 idempotency, groups, concurrency keys, the memory and storage budgets, the WAL
 record. The tube is created if absent; a paused tube accepts the job (pause
 only holds reserves). Its result is recorded as `last-result`. A rejected fire
-(`DRAINING`, `OUT_OF_MEMORY`, `OUT_OF_STORAGE`) is counted and not retried —
-the next tick tries again.
+(`DRAINING`, `OUT_OF_MEMORY`, `OUT_OF_STORAGE`, `INTERNAL_ERROR`) is counted
+and not retried — the next tick tries again. A fire that dedups against a
+buried job is logged as a warning each time, with the streak.
 
-The scheduler runs in the existing 100 ms tick against a heap of next-fire
-times, comparing them with `SystemTime::now()` — wall clock, not `Instant`,
-because cron is defined on the wall clock. Fires are at most one tick late. A
-forward clock step is treated like downtime (one catch-up fire). After a
-backward step, nothing at or before an entry's last fire fires again.
+The scheduler runs in the existing 100 ms tick, comparing each entry's next
+fire with the wall clock (`jiff::Timestamp::now()`), not `Instant`, because
+cron is defined on the wall clock. With at most 10,000 entries a scan per
+tick is cheaper than keeping a heap in step with syncs. Fires are at most one
+tick late. A forward clock step is treated like downtime (one catch-up
+fire). After a backward step, nothing at or before an entry's last fire fires
+again.
+
+The next-fire search walks the zone's stretches of constant offset, taking
+each stretch's first match: within a stretch civil time and real time move
+together. A fixed-time entry's stretch also takes the times a forward jump at
+its end skips, read with its own offset, and skips the times a backward jump
+at its start repeats. It costs about 100 ns a call, `* * * * *` included.
 
 ### 8. Spec syntax
 
@@ -400,8 +460,10 @@ backward step, nothing at or before an entry's last fire fires again.
 ### 9. Limits
 
 Owner and name follow tube-name rules. The body is capped by
-`--max-job-size`. A total entry cap (say 10,000) keeps the file and the heap
-bounded; entries count toward the `--max-jobs-size` memory budget as jobs do.
+`--max-job-size`. A total entry cap of 10,000 keeps the files and the per-tick
+scan bounded; entries count toward the `--max-jobs-size` memory budget as jobs
+do (their body and strings plus 512 bytes each), reported as
+`current-schedules-size`.
 
 ## Settled decisions
 
@@ -418,15 +480,16 @@ Open when the proposal was written; settled 2026-10-11.
 
 ## Dependencies
 
-- **jiff** for zones, DST and civil-time arithmetic: `jiff` plus `jiff-core`.
-  Tuber has no date/time crate today. jiff reads the system zone database;
+- **jiff** (0.2) for zones, DST and civil-time arithmetic: two crates on
+  Linux, `jiff` and `jiff-core`. Tuber had no date/time crate before it.
+  jiff reads the system zone database;
   `debian:bookworm-slim` ships tzdata (checked: `tzdata 2026c`,
   `/usr/share/zoneinfo/Australia/Melbourne` present). Only a scratch or
   distroless image would need the `tzdb-bundle-always` feature, which adds
   `jiff-tzdb`.
 - **The cron parser and next-fire search, written here.** jiff has none. croner
   4.0 (2026-08-31) can now run on jiff and its DST rules are close to the
-  proposal, but it is six weeks old and its README contradicts the OCPS spec it
+  rule chosen here, but it is six weeks old and its README contradicts the OCPS spec it
   says it follows. The grammar is small, and the DST behaviour is the part
   worth owning and testing.
 

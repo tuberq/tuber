@@ -55,6 +55,8 @@ touches `cmd-touch`.
 | `max-job-size` | Maximum job body size in bytes |
 | `job-timeouts` | Cumulative TTR expirations |
 | `current-concurrency-keys` | Active concurrency keys |
+| `current-schedules` | Recurring schedule entries held, across all owners |
+| `current-schedules-size` | Memory those entries are charged against `--max-jobs-size`, beside `current-jobs-size` |
 | `draining` | Whether server is draining |
 | `hostname` | Server hostname |
 | `id` | Server instance ID (random hex) |
@@ -221,6 +223,31 @@ counter bookkeeping at every transition. Field names are intentionally
 bare (no `current-jobs-` prefix) since `stats-group` is a tuber
 extension and has no beanstalkd-client compatibility surface.
 
+## Schedule Stats (`stats-schedule <owner> <name>`)
+
+One recurring schedule entry, in YAML. `NOT_FOUND` if the owner has no
+entry of that name. Times are RFC 3339 in the entry's own zone (UTC for
+`every` specs), so a DST change shows in the offset; `""` when there is
+none yet. Counters live in memory and restart from 0 with the server;
+`last-fire` is persisted with the entry.
+
+| Field | Description |
+|---|---|
+| `owner`, `name` | The entry's identity |
+| `spec` | The schedule as the app wrote it |
+| `tube`, `pri`, `delay`, `ttr` | What each fire puts |
+| `tags` | `idp:`/`grp:`/`aft:`/`con:` tags each fire carries |
+| `catchup` | What a missed tick does: `once`, `once within <n>s` (`catchup:<n>`), or `never` (`catchup:0`) |
+| `synced-at` | When this definition took effect: added, or last changed |
+| `next-fire`, `next-fire-2`, `next-fire-3` | The next three fires. The quickest way to check tuber read a zone the way it was meant |
+| `last-fire` | When the entry last fired |
+| `last-result` | The reply a client would have got from the latest fire: `INSERTED <id>`, `INSERTED <id> <STATE>` for a dedup, or the refusal |
+| `total-fires` | Fires since server start: the sum of the next seven |
+| `total-inserted` | Fires that queued a job |
+| `total-deduped-ready`, `-reserved`, `-delayed`, `-buried`, `-deleted` | Fires whose `idp:` key matched a job in that state (`deleted`: a cooldown tombstone) and queued nothing |
+| `total-rejected` | Fires the put path refused: `DRAINING`, `OUT_OF_MEMORY`, `OUT_OF_STORAGE`, `INTERNAL_ERROR` |
+| `buried-streak` | Consecutive fires that deduped against a buried job; reset by any other result. Non-zero means the entry is queueing nothing until that job is kicked |
+
 ## Prometheus Metrics
 
 When `--metrics-port` is set, an HTTP endpoint at `/metrics` serves
@@ -273,3 +300,27 @@ Each has a `tube` label:
 | `tuber_tube_processing_time_p99{tube="..."}` | Processing time p99 |
 | `tuber_tube_queue_time_ewma{tube="..."}` | Queue time EWMA |
 | `tuber_tube_idp_dedups_total{tube="...",state="..."}` | `idp:` dedups by state of the job matched (`ready`, `reserved`, `delayed`, `buried`, `deleted`). Alert on `state="buried"` rising |
+
+### Per-schedule metrics
+
+`tuber_schedules` (gauge) counts entries. Each of these has `owner` and
+`name` labels:
+
+| Metric | Description |
+|---|---|
+| `tuber_schedule_fires_total{…,result="..."}` | Fires by result: `inserted`, `deduped_ready`, `deduped_reserved`, `deduped_delayed`, `deduped_buried`, `deduped_deleted`, `rejected` |
+| `tuber_schedule_last_fire_timestamp_seconds` | Unix time of the last fire; absent until the first |
+| `tuber_schedule_next_fire_timestamp_seconds` | Unix time of the next fire |
+
+An entry that has stopped queueing work because its `idp:` key matches a
+buried job:
+
+```
+increase(tuber_schedule_fires_total{result="deduped_buried"}[2h]) > 0
+```
+
+An entry that has stopped firing at all, for one that fires at least hourly:
+
+```
+time() - tuber_schedule_last_fire_timestamp_seconds > 2 * 3600
+```

@@ -2,7 +2,7 @@
 
 A simple, fast job queue server. One binary, zero dependencies. Running in production at [Booko.au](https://booko.au) where it's already processed jobs in the tens of millions, and newly available in [Splat](https://github.com/dkam/splat).
 
-Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, delayed jobs, job reservations, and named tubes — and adds unique jobs, concurrency control, job group pipelines, batch operations, weighted queues, and offloaded job bodies.
+Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, delayed jobs, job reservations, and named tubes — and adds unique jobs, concurrency control, job group pipelines, recurring schedules, batch operations, weighted queues, and offloaded job bodies.
 
 [![tuber-tui](screenshots/tuber-tui-server.png)](https://github.com/tuberq/tuber-rs)
 *[tuber-tui](https://github.com/tuberq/tuber-rs) — a terminal dashboard compatible with both Tuber and Beanstalkd.*
@@ -30,6 +30,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Weighted queues** | Yes | — | Yes | — | — | — | — |
 | **Per-job priority** | Yes (numeric) | Yes (numeric) | Queue-level ⁵ | Yes | Yes | Yes | Yes |
 | **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Yes | Via plugin |
+| **Recurring (cron) jobs** | Yes (in the server) | — | Enterprise ¹ | Yes | Yes | Yes | — |
 | **Batch reserve / delete** | Yes | — | — | — | — | — | Prefetch |
 | **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory alarms ¹² |
 | **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | Metrics events | In DB ⁸ | — | — |
@@ -37,7 +38,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Persistence** | WAL, ~100ms fsync | WAL, ~100ms fsync | Redis RDB/AOF | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
 | **Infrastructure** | None (single binary) | None (single binary) | Redis | Redis | PostgreSQL | DB ⁶ | Erlang runtime |
 
-<sub>¹ Sidekiq OSS has queue weights and basic job processing. Unique jobs and batches require [Pro](https://sidekiq.org/products/pro.html); concurrency controls require [Enterprise](https://sidekiq.org/products/enterprise.html).</sub>
+<sub>¹ Sidekiq OSS has queue weights and basic job processing. Unique jobs and batches require [Pro](https://sidekiq.org/products/pro.html); concurrency controls and periodic jobs require [Enterprise](https://sidekiq.org/products/enterprise.html) (the third-party sidekiq-cron gem covers the latter).</sub>
 <sub>² Solid Queue unique jobs available from Rails 7.2+.</sub>
 <sub>³ RabbitMQ has a community deduplication plugin, but no built-in uniqueness.</sub>
 <sub>⁴ GoodJob batches support single-level fan-out/fan-in (enqueue N jobs, fire a callback when all complete). Multi-stage pipelines require manually chaining batches inside callbacks. BullMQ flows support arbitrary DAGs natively.</sub>
@@ -73,7 +74,7 @@ The beanstalkd primitives, intact:
 - **Peek** — inspect jobs without reserving them.
 - **Pause** — temporarily stop a tube from serving jobs.
 
-Plus tuber's extensions — see [Unique Jobs](#unique-jobs-idempotency), [Job Dependencies](#job-dependencies-fan-out--fan-in), [Concurrency Keys](#concurrency-keys), [Weighted Reserve](#weighted-reserve), and [Batch Operations](#batch-operations).
+Plus tuber's extensions — see [Unique Jobs](#unique-jobs-idempotency), [Job Dependencies](#job-dependencies-fan-out--fan-in), [Concurrency Keys](#concurrency-keys), [Recurring Schedules](#recurring-schedules), [Weighted Reserve](#weighted-reserve), and [Batch Operations](#batch-operations).
 
 ### Operations
 
@@ -287,6 +288,34 @@ Up to 3 `con:api` jobs can be reserved simultaneously. `con:key` (no `:N`) defau
 
 Burying or releasing-with-delay a job frees its concurrency slot immediately — the slot is only held while the job is reserved. Delayed jobs don't occupy a slot until they become ready and are reserved. Use `stats-job <id>` to check a job's current state if reserves are unexpectedly blocked.
 
+### Recurring Schedules
+
+Tuber can put jobs on a timer itself, so an app doesn't need a scheduler process (whenever, rufus-scheduler, sidekiq-cron, a `bin/scheduler` container) beside its web and worker processes. At boot, each app process sends its whole schedule under a name of its choosing — the *owner* — and tuber replaces that owner's entries with it:
+
+```text
+schedule-begin splat
+SYNCING splat
+schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:1 5 * * * *
+{"class":"HistogramRollupJob","args":[]}
+STAGED
+schedule-put retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+{"class":"DataRetentionJob","args":[]}
+STAGED
+schedule-commit
+SYNCED 2 0 0 0
+```
+
+`schedule-put` is framed like `put`: the body is what every fire puts into the tube, with the same tags. The spec at the end is 5-field cron with an optional IANA zone, `@daily`-style macros, or `every 10m` (anchored to the epoch, so it fires at :00, :10, :20).
+
+- **Every replica can sync.** Entries are identified by owner and name, so a second process sending the same set changes nothing (`SYNCED 0 0 0 2`) and tuber fires each tick once. No single-replica rule, no leader election.
+- **The schedule follows the app's releases.** An edited entry is updated in place, and one missing from the set is removed. A bad entry (`BAD_SCHEDULE` for an unknown zone, say) aborts the whole sync and leaves the old schedule running.
+- **A fire is a put.** It goes through the same path as a client's `put`, so `idp:` skips a fire while the last one's job is still live, and `con:` serialises them.
+- **DST is handled.** An entry at a fixed time fires once a day: on spring-forward day a time the clock skips runs late by the skip, and on fall-back day a repeated time runs on its first pass. `*/15`-style entries follow the clock.
+- **Downtime costs at most one run.** A run of ticks missed while tuber was down fires once on restart, not as a burst; `catchup:<seconds>` bounds how stale that can be, and `catchup:0` skips it. A crash just as an entry fires loses that tick rather than firing it twice.
+- **It's visible.** `stats-schedule <owner> <name>` shows the next three fires in the entry's own zone and the last fire's reply. `buried-streak` and `tuber_schedule_fires_total{result="deduped_buried"}` catch an entry whose `idp:` key has been matching a buried job — the put "succeeds" and queues nothing.
+
+With `-b`, schedules persist beside the WAL. The design and its reasoning are in [docs/scheduler.md](docs/scheduler.md); the commands are in [docs/protocol.md](docs/protocol.md#schedule-commands).
+
 ### Batch Operations
 
 Reduce round trips when working with many jobs at once.
@@ -408,6 +437,8 @@ tuber put -i "nightly-report:86400" "./generate-report.sh"
 ```
 
 If the original job is buried, every later put dedups against it and nothing runs until it is kicked. `tuber put` warns on stderr when that happens (so cron mails it), and `tuber_tube_idp_dedups_total{state="buried"}` counts it.
+
+If the crontab only exists to put jobs, tuber can run the schedule itself — see [Recurring Schedules](#recurring-schedules).
 
 ### Rate-limited processing
 
@@ -621,6 +652,25 @@ default: ready=4 reserved=0 delayed=0 buried=0
 my-tube: ready=16 reserved=0 delayed=0 buried=0
 ```
 
+### Schedules
+
+List recurring schedule entries with their next fire and the last fire's reply.
+
+```bash
+tuber schedules [OPTIONS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `-o`, `--owner` | — | Only this owner's entries |
+| `-a`, `--addr` | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address: `host:port`, `host`, or `:port` |
+
+```bash
+$ tuber schedules
+splat retention: 0 2 * * * Australia/Melbourne -> splat.maintenance next=2026-10-12T02:00:00+11:00 last=INSERTED 48213
+splat rollup: 5 * * * * -> splat.maintenance next=2026-10-11T05:05:00+00:00 last=INSERTED 47101 BURIED (deduped against a buried job 70 times running)
+```
+
 ### Stats
 
 Show global server statistics or per-tube statistics. See [Statistics Reference](docs/statistics.md) for all available fields.
@@ -680,6 +730,19 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `touch <id>\r\n` | Reset the TTR timer on a reserved job. Returns `TOUCHED`. |
 | `watch <tube> [weight]\r\n` | Add a tube to the watch list. Optional **+** weight for weighted mode. Returns `WATCHING <count>`. |
 | `ignore <tube>\r\n` | Remove a tube from the watch list. Returns `WATCHING <count>` or `NOT_IGNORED`. |
+
+### Schedule commands
+
+| Command | Description |
+|---|---|
+| **+** `schedule-begin <owner>\r\n` | Start staging a replacement set of entries for `<owner>`. Returns `SYNCING <owner>`. |
+| **+** `schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>\r\n<body>\r\n` | Stage one entry. Returns `STAGED`, or `BAD_SCHEDULE`/`BAD_FORMAT`/…, which aborts the sync. |
+| **+** `schedule-commit\r\n` | Replace the owner's entries with the staged set. Returns `SYNCED <added> <changed> <removed> <unchanged>` or `ABORTED`. |
+| **+** `schedule-abort\r\n` | Discard the staged set. Returns `ABORTED`. |
+| **+** `list-schedules [<owner>]\r\n` | List entries in YAML, one `- <owner> <name>` per line. |
+| **+** `stats-schedule <owner> <name>\r\n` | Statistics for one entry in YAML. See [Statistics Reference](docs/statistics.md#schedule-stats-stats-schedule-owner-name). |
+
+See [Recurring Schedules](#recurring-schedules) and [docs/protocol.md](docs/protocol.md#schedule-commands).
 
 ### Peek / inspect commands
 

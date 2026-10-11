@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**Tuber runs recurring schedules itself, so an app no longer needs a scheduler process.** Almost every app ends up with one beside its web and workers — whenever, rufus-scheduler, sidekiq-cron, a `bin/scheduler` container — booting the whole app to put a job on a timer, limited to one replica because two would fire every tick twice. Now each app process sends its schedule at boot:
+
+```text
+schedule-begin splat
+schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:1 5 * * * *
+{"class":"HistogramRollupJob","args":[]}
+schedule-put retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+{"class":"DataRetentionJob","args":[]}
+schedule-commit                                       → SYNCED 2 0 0 0
+```
+
+and tuber puts each body into its tube at the times the spec names: 5-field cron with an optional IANA zone, `@daily`-style macros, or `every 10m` anchored to the epoch. A fire is an ordinary put, so `idp:`, `con:` and the memory and storage budgets apply as they do to any other.
+
+- **Any number of replicas can sync.** The commit replaces that owner's set as a whole: an identical set from another replica changes nothing, an edited entry is updated in place, and one the app dropped is removed. Owners don't touch each other's entries. A refused line (`BAD_SCHEDULE` for an unknown zone or a cron that never matches) makes the commit reply `ABORTED` and leaves the old schedule running.
+- **DST.** An entry at a fixed time fires once per day: a time the clock skips fires late by the skip (`0 2` ran at 03:00 in Melbourne on 4 October), a repeated one on its first pass. `*/15`-style entries follow the clock.
+- **Downtime.** Ticks missed while tuber was down fire once on restart, not as a burst; `catchup:<seconds>` limits how stale that run may be and `catchup:0` skips it. A fire is recorded on disk before its put, so a crash at that moment loses the tick rather than repeating it.
+- **Visibility.** `stats-schedule <owner> <name>` shows the next three fires in the entry's zone, the last fire's reply and counts by result, and `buried-streak` counts fires in a row that matched a buried job's `idp:` key and queued nothing. `list-schedules`, `tuber schedules`, `current-schedules` in `stats`, and `tuber_schedules`, `tuber_schedule_fires_total{owner,name,result}`, `tuber_schedule_last_fire_timestamp_seconds` and `tuber_schedule_next_fire_timestamp_seconds` in `/metrics`.
+
+With `-b`, schedules persist in two small files beside the WAL (`schedules`, `schedules.fired`) and count toward `--max-storage-bytes`; entries count toward `--max-jobs-size`. The reasoning behind each choice is in `docs/scheduler.md`. Adds the jiff crate for time zones.
+
 **A WAL write or fsync error no longer leaves the server acking puts it can't persist.** On a full disk or an I/O error the server dropped the WAL and carried on in memory: strict mode (`-i 0`) quietly became immediate acks, every later put got `INSERTED`, and a restart lost all of them — in a test with the disk full at put 675, the next 20 acked puts were gone after a crash. Only `stats` (`binlog-enabled: false`) and one log line showed it. Now puts get `INTERNAL_ERROR` from the failure until restart, and in strict mode the batch that hit the failure is answered `INTERNAL_ERROR` too, where a write error (rather than an fsync error) used to ack it. Existing jobs can still be reserved, deleted, released and buried; those changes apply in memory only, so a crash redelivers rather than loses. New gauge `tuber_binlog_enabled` (1/0) — with `-b` set, alert on 0. Free the space and restart to recover.
 
 **`idp:` dedups are counted, and a dedup against a buried job is no longer silent.** A put whose idempotency key matches a buried job replies `INSERTED <id> BURIED` and queues nothing — and nothing runs until that job is kicked. A recurring put that keeps hitting one drops its work every time: a client that reads `INSERTED` as success and ignores the state sees nothing wrong, and the only sign server-side was `current-jobs-buried: 1`. Splat lost about 70 hourly rollups over three days this way after one buried on lock contention.

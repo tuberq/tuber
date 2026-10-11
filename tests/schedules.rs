@@ -666,3 +666,104 @@ async fn a_damaged_schedules_file_is_set_aside_not_fatal() {
     c.schedule_put("a", "jobs", "@daily", "{}").await;
     c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
 }
+
+// ---------------------------------------------------------------------------
+// Visibility
+// ---------------------------------------------------------------------------
+
+async fn scrape(port: u16) -> String {
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mport = ml.local_addr().unwrap().port();
+    tokio::spawn(tuber::metrics::serve_with_listener(
+        ml,
+        format!("127.0.0.1:{port}"),
+    ));
+    let mut s = TcpStream::connect(("127.0.0.1", mport)).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    let resp = String::from_utf8(resp).unwrap();
+    resp.split_once("\r\n\r\n").unwrap().1.to_string()
+}
+
+#[tokio::test]
+async fn metrics_show_fires_by_result() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("rollup", "maint", "idp:rollup every 1s", "{}")
+        .await;
+    c.schedule_put("nightly", "maint", "0 2 * * * Australia/Melbourne", "{}")
+        .await;
+    c.ck("schedule-commit", "SYNCED 2 0 0 0").await;
+    c.ck("watch maint", "WATCHING 2").await;
+    let (id, _) = reserve(&mut c, 3).await;
+    c.ck(&format!("bury {id} 0"), "BURIED").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let body = scrape(srv.port).await;
+    let sample = |prefix: &str| -> Option<f64> {
+        body.lines()
+            .find_map(|l| l.strip_prefix(prefix)?.strip_prefix(' '))
+            .map(|v| v.parse().unwrap())
+    };
+    assert_eq!(sample("tuber_schedules"), Some(2.0), "{body}");
+    let rollup = "owner=\"app\",name=\"rollup\"";
+    assert_eq!(
+        sample(&format!(
+            "tuber_schedule_fires_total{{{rollup},result=\"inserted\"}}"
+        )),
+        Some(1.0),
+        "{body}"
+    );
+    assert!(
+        sample(&format!(
+            "tuber_schedule_fires_total{{{rollup},result=\"deduped_buried\"}}"
+        ))
+        .unwrap()
+            >= 1.0,
+        "{body}"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    let last = sample(&format!(
+        "tuber_schedule_last_fire_timestamp_seconds{{{rollup}}}"
+    ))
+    .unwrap();
+    assert!((now - 3.0..=now).contains(&last), "{last} vs {now}");
+    let nightly = "owner=\"app\",name=\"nightly\"";
+    let next = sample(&format!(
+        "tuber_schedule_next_fire_timestamp_seconds{{{nightly}}}"
+    ))
+    .unwrap();
+    assert!((now..now + 86_400.0 + 3_600.0).contains(&next), "{next}");
+    assert_eq!(
+        sample(&format!(
+            "tuber_schedule_last_fire_timestamp_seconds{{{nightly}}}"
+        )),
+        None,
+        "never fired: no sample"
+    );
+
+    // Each family's samples sit together under its TYPE line.
+    for family in [
+        "tuber_schedule_fires_total",
+        "tuber_schedule_last_fire_timestamp_seconds",
+        "tuber_schedule_next_fire_timestamp_seconds",
+    ] {
+        let lines: Vec<usize> = body
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with(&format!("{family}{{")))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            lines.windows(2).all(|w| w[1] == w[0] + 1),
+            "{family} samples not contiguous:\n{body}"
+        );
+    }
+}

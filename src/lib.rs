@@ -2,6 +2,7 @@ pub mod body_store;
 pub mod cli_output;
 pub mod client;
 pub mod cmd_put;
+pub mod cmd_schedules;
 pub mod cmd_stats;
 pub mod cmd_tubes;
 pub mod cmd_work;

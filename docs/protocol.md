@@ -137,6 +137,94 @@ When you receive `DEADLINE_SOON`, you should `touch`, `delete`, or `release` the
 
 The safety margin is 1 second. The minimum TTR is also 1 second, so a job with TTR=1 may trigger `DEADLINE_SOON` almost immediately after being reserved.
 
+## Schedule Commands
+
+Recurring schedules: entries tuber puts into a tube at the times a cron
+spec names, so an app needs no scheduler process of its own. An app
+registers its whole schedule at boot in one sync; the design and its
+decisions are in [scheduler.md](scheduler.md).
+
+```
+schedule-begin splat
+SYNCING splat
+schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:1 5 * * * *
+{"class":"HistogramRollupJob","args":[]}
+STAGED
+schedule-put retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+{"class":"DataRetentionJob","args":[]}
+STAGED
+schedule-commit
+SYNCED 2 0 0 0
+```
+
+### schedule-begin \<owner\>\r\n
+
+Start staging a replacement set of entries for `<owner>`, a name the app
+chooses (tube-name rules). Owners are namespaces: one owner's sync never
+touches another's entries. A second `schedule-begin` inside a sync is
+`BAD_FORMAT` and makes the sync abort.
+
+Response: `SYNCING <owner>\r\n`
+
+### schedule-put \<name\> \<tube\> \<pri\> \<delay\> \<ttr\> \<bytes\> [tags] \<spec\>\r\n\<body\>\r\n
+
+Stage one entry. Framed like `put`: `<body>` is what every fire puts into
+`<tube>`. After `<bytes>` come tags — every one has a `prefix:` — then the
+spec, which runs to the end of the line:
+
+- Tags: `idp:`, `grp:`, `aft:`, `con:` as on `put`, carried by every fire,
+  plus `catchup:<seconds>`: fire a missed tick only if it is at most that
+  old (`catchup:0`: never). Without it, a run of missed ticks fires once.
+- Spec: 5-field cron with an optional trailing IANA zone, or a `CRON_TZ=`
+  prefix; `@hourly`, `@daily`/`@midnight`, `@weekly`, `@monthly`,
+  `@yearly`/`@annually`, with an optional zone; or `every <n>(s|m|h|d)
+  [offset <n>(s|m|h|d)]`, anchored to the Unix epoch. Zones default to
+  UTC.
+
+```
+5 * * * *                                  hourly at :05, UTC
+0 2 * * * Australia/Melbourne              02:00 Melbourne time
+CRON_TZ=Australia/Melbourne 0 2 * * *      the same
+@daily Australia/Melbourne                 00:00 Melbourne time
+every 60s                                  :00 of every minute
+every 1h offset 5m                         :05 of every hour
+```
+
+Response: `STAGED\r\n`, or `BAD_FORMAT\r\n` (malformed line, or a name
+staged twice), `BAD_SCHEDULE\r\n` (a spec or zone tuber can't use, or a
+cron that never matches), `JOB_TOO_BIG\r\n`, `OUT_OF_MEMORY\r\n` (the
+`--max-jobs-size` budget, or more than 10,000 entries), `NOT_SYNCING\r\n`.
+Any refusal makes the sync abort. The body is consumed either way.
+
+### schedule-commit\r\n
+
+Replace the owner's entries with the staged set, in one step, durable
+before the reply. An entry with a new name is added; one whose definition
+changed is updated in place, keeping its last fire; one missing from the
+set is removed; one unchanged keeps everything, including its next fire.
+A commit never fires anything: new and changed entries start at their
+first tick after it. An empty set removes all the owner's entries.
+
+Response: `SYNCED <added> <changed> <removed> <unchanged>\r\n`, or
+`ABORTED\r\n` if any `schedule-put` in the sync was refused (nothing
+changes), `OUT_OF_MEMORY\r\n`, `OUT_OF_STORAGE\r\n`, `INTERNAL_ERROR\r\n`
+(the new set is live but couldn't be persisted), `NOT_SYNCING\r\n`.
+
+### schedule-abort\r\n
+
+Discard the staged set. Closing the connection does the same.
+
+Response: `ABORTED\r\n` or `NOT_SYNCING\r\n`
+
+### list-schedules [\<owner\>]\r\n
+
+Response: `OK <bytes>\r\n<yaml>\r\n`, one `- <owner> <name>` line per entry.
+
+### stats-schedule \<owner\> \<name\>\r\n
+
+Response: `OK <bytes>\r\n<yaml>\r\n` or `NOT_FOUND\r\n`. Fields are in
+[statistics.md](statistics.md#schedule-stats-stats-schedule-owner-name).
+
 ## Other Commands
 
 ### peek \<id\>\r\n / peek-ready\r\n / peek-delayed\r\n / peek-buried\r\n

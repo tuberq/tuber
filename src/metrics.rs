@@ -143,6 +143,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     );
     prom_gauge(
         &mut out,
+        "tuber_schedules",
+        "Recurring schedule entries held, across all owners",
+        &stats,
+        "current-schedules",
+    );
+    prom_gauge(
+        &mut out,
         "tuber_jobs_ready",
         "Current ready jobs",
         &stats,
@@ -605,7 +612,76 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         out.push('\n');
     }
 
+    schedule_metrics(&mut client, &mut out).await?;
+
     Ok(out)
+}
+
+/// Per-entry schedule metrics, from `list-schedules` and `stats-schedule`.
+/// Each family's samples are kept together, as the exposition format asks.
+async fn schedule_metrics(client: &mut TuberClient, out: &mut String) -> io::Result<()> {
+    let list = client.list_schedules(None).await?;
+    let entries: Vec<(String, String)> = parse_yaml_list(&list)
+        .iter()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(o, n)| (o.to_string(), n.to_string()))
+        .collect();
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    const RESULTS: [(&str, &str); 7] = [
+        ("inserted", "total-inserted"),
+        ("deduped_ready", "total-deduped-ready"),
+        ("deduped_reserved", "total-deduped-reserved"),
+        ("deduped_delayed", "total-deduped-delayed"),
+        ("deduped_buried", "total-deduped-buried"),
+        ("deduped_deleted", "total-deduped-deleted"),
+        ("rejected", "total-rejected"),
+    ];
+    let mut fires = String::new();
+    let mut last = String::new();
+    let mut next = String::new();
+    for (owner, name) in &entries {
+        let Ok(yaml) = client.stats_schedule(owner, name).await else {
+            continue;
+        };
+        let ss = parse_yaml_map(&yaml);
+        let labels = format!("owner=\"{}\",name=\"{}\"", escape_label(owner), escape_label(name));
+        for (result, key) in RESULTS {
+            if let Some(val) = ss.get(key) {
+                fires.push_str(&format!(
+                    "tuber_schedule_fires_total{{{labels},result=\"{result}\"}} {val}\n"
+                ));
+            }
+        }
+        for (buf, metric, key) in [
+            (&mut last, "tuber_schedule_last_fire_timestamp_seconds", "last-fire"),
+            (&mut next, "tuber_schedule_next_fire_timestamp_seconds", "next-fire"),
+        ] {
+            if let Some(t) = ss.get(key).and_then(|v| v.parse::<jiff::Timestamp>().ok()) {
+                buf.push_str(&format!("{metric}{{{labels}}} {}\n", t.as_second()));
+            }
+        }
+    }
+    out.push_str(
+        "# HELP tuber_schedule_fires_total Schedule fires by result. result=\"deduped_buried\": \
+         the fire matched a buried job's idp: key, nothing was queued\n\
+         # TYPE tuber_schedule_fires_total counter\n",
+    );
+    out.push_str(&fires);
+    out.push_str(
+        "\n# HELP tuber_schedule_last_fire_timestamp_seconds When the entry last fired\n\
+         # TYPE tuber_schedule_last_fire_timestamp_seconds gauge\n",
+    );
+    out.push_str(&last);
+    out.push_str(
+        "\n# HELP tuber_schedule_next_fire_timestamp_seconds When the entry fires next\n\
+         # TYPE tuber_schedule_next_fire_timestamp_seconds gauge\n",
+    );
+    out.push_str(&next);
+    out.push('\n');
+    Ok(())
 }
 
 fn prom_gauge(out: &mut String, name: &str, help: &str, stats: &HashMap<&str, &str>, key: &str) {

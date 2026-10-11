@@ -235,6 +235,25 @@ impl TuberClient {
         self.read_ok_body().await
     }
 
+    /// `list-schedules [<owner>]`: a YAML list of `- <owner> <name>`.
+    pub async fn list_schedules(&mut self, owner: Option<&str>) -> io::Result<String> {
+        match owner {
+            Some(owner) => {
+                validate_token("owner", owner)?;
+                self.send_line(&format!("list-schedules {owner}")).await?;
+            }
+            None => self.send_line("list-schedules").await?,
+        }
+        self.read_ok_body().await
+    }
+
+    pub async fn stats_schedule(&mut self, owner: &str, name: &str) -> io::Result<String> {
+        validate_token("owner", owner)?;
+        validate_token("schedule name", name)?;
+        self.send_line(&format!("stats-schedule {owner} {name}")).await?;
+        self.read_ok_body().await
+    }
+
     /// Read an `OK <bytes>\r\n<body>\r\n` response and return the body.
     async fn read_ok_body(&mut self) -> io::Result<String> {
         let line = self.read_line().await?;

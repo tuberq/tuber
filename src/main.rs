@@ -250,6 +250,18 @@ enum Commands {
         addr: Option<String>,
     },
 
+    /// List recurring schedule entries with their next fire and last result
+    Schedules {
+        /// Only this owner's entries
+        #[arg(short = 'o', long)]
+        owner: Option<String>,
+
+        /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+        /// $BEANSTALKD_URL, then localhost:11300]
+        #[arg(short = 'a', long)]
+        addr: Option<String>,
+    },
+
     /// Worker mode - reserve and execute jobs as shell commands
     Work {
         /// Tube to watch
@@ -400,6 +412,12 @@ async fn run() {
         }
         Commands::Tubes { addr } => {
             if let Err(e) = tuber::cmd_tubes::run(&server_addr(addr)).await {
+                tuber::errln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Schedules { owner, addr } => {
+            if let Err(e) = tuber::cmd_schedules::run(&server_addr(addr), owner).await {
                 tuber::errln!("error: {e}");
                 std::process::exit(1);
             }
