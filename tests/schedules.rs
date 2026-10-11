@@ -412,3 +412,81 @@ async fn entries_share_the_memory_budget() {
         .await;
     assert_eq!(c.readline().await, "OUT_OF_MEMORY");
 }
+
+// ---------------------------------------------------------------------------
+// Firing
+// ---------------------------------------------------------------------------
+
+/// `reserve-with-timeout`, returning (id, body) or panicking on TIMED_OUT.
+async fn reserve(c: &mut TestConn, timeout: u32) -> (u64, String) {
+    c.send(&format!("reserve-with-timeout {timeout}\r\n")).await;
+    let line = c.readline().await;
+    let id = line
+        .strip_prefix("RESERVED ")
+        .unwrap_or_else(|| panic!("expected RESERVED, got {line:?}"))
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    (id, c.readline().await)
+}
+
+#[tokio::test]
+async fn an_entry_puts_its_body_into_its_tube() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    assert_eq!(
+        c.schedule_put("tick", "ticks", "every 1s", r#"{"class":"TickJob"}"#)
+            .await,
+        "STAGED"
+    );
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
+
+    c.ck("watch ticks", "WATCHING 2").await;
+    c.ck("ignore default", "WATCHING 1").await;
+    let (id, body) = reserve(&mut c, 3).await;
+    assert_eq!(body, r#"{"class":"TickJob"}"#);
+
+    c.send(&format!("stats-job {id}\r\n")).await;
+    let job = c.read_ok_body().await;
+    assert_eq!(stat(&job, "tube"), "\"ticks\"");
+    assert_eq!(stat(&job, "pri"), "1024");
+    assert_eq!(stat(&job, "ttr"), "120");
+
+    let s = c.stats_schedule("app", "tick").await;
+    assert!(
+        stat(&s, "total-inserted").parse::<u64>().unwrap() >= 1,
+        "{s}"
+    );
+    assert!(stat(&s, "last-result").starts_with("\"INSERTED "), "{s}");
+    assert_ne!(stat(&s, "last-fire"), "\"\"");
+}
+
+#[tokio::test]
+async fn a_fire_deduped_against_a_buried_job_is_visible() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("rollup", "maint", "idp:rollup every 1s", "{}")
+        .await;
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
+
+    c.ck("watch maint", "WATCHING 2").await;
+    let (id, _) = reserve(&mut c, 3).await;
+    c.ck(&format!("bury {id} 0"), "BURIED").await;
+
+    // Let at least one more fire land on the buried job.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let s = c.stats_schedule("app", "rollup").await;
+    assert!(
+        stat(&s, "total-deduped-buried").parse::<u64>().unwrap() >= 1,
+        "{s}"
+    );
+    assert!(
+        stat(&s, "buried-streak").parse::<u64>().unwrap() >= 1,
+        "{s}"
+    );
+    assert_eq!(stat(&s, "last-result"), format!("\"INSERTED {id} BURIED\""));
+}

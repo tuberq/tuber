@@ -171,6 +171,10 @@ impl Schedules {
         self.entries.get(&(owner.to_string(), name.to_string()))
     }
 
+    pub fn get_mut(&mut self, owner: &str, name: &str) -> Option<&mut Entry> {
+        self.entries.get_mut(&(owner.to_string(), name.to_string()))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values()
     }

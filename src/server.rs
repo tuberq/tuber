@@ -1106,6 +1106,42 @@ impl ServerState {
         after_group: Option<String>,
         concurrency_key: Option<(String, u32)>,
     ) -> Response {
+        let tube_name = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.use_tube.clone())
+            .unwrap_or_else(|| "default".to_string());
+        self.put_job(
+            Some(conn_id),
+            tube_name,
+            pri,
+            delay,
+            ttr,
+            body,
+            idempotency_key,
+            group,
+            after_group,
+            concurrency_key,
+        )
+    }
+
+    /// Put a job into `tube_name`: a client's `put` into its `use` tube
+    /// (`producer` is its connection), or a schedule entry firing (`None`).
+    /// Both get the same checks, dedup and reply.
+    #[allow(clippy::too_many_arguments)]
+    fn put_job(
+        &mut self,
+        producer: Option<u64>,
+        tube_name: String,
+        pri: u32,
+        delay: u32,
+        ttr: u32,
+        body: Option<Vec<u8>>,
+        idempotency_key: Option<(String, u32)>,
+        group: Option<String>,
+        after_group: Option<String>,
+        concurrency_key: Option<(String, u32)>,
+    ) -> Response {
         if self.drain_mode {
             return Response::Draining;
         }
@@ -1155,18 +1191,12 @@ impl ServerState {
         }
 
         // Mark connection as producer
-        if let Some(conn) = self.conns.get_mut(&conn_id) {
+        if let Some(conn) = producer.and_then(|id| self.conns.get_mut(&id)) {
             conn.set_producer();
         }
 
         // Minimum TTR is 1 second
         let ttr = ttr.max(1);
-
-        let tube_name = self
-            .conns
-            .get(&conn_id)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(|| "default".to_string());
 
         self.ensure_tube(&tube_name);
 

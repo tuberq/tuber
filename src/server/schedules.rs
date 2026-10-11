@@ -1,10 +1,10 @@
 //! Schedule sync and inspection commands. See `crate::schedule`.
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 
 use super::*;
 use crate::schedule::spec::format_time;
-use crate::schedule::{self, Line, MAX_ENTRIES, Staging};
+use crate::schedule::{self, Catchup, Line, MAX_ENTRIES, Staging};
 
 impl ServerState {
     pub(super) fn cmd_schedule_begin(&mut self, conn_id: u64, owner: String) -> Response {
@@ -190,5 +190,116 @@ impl ServerState {
             s.buried_streak,
         );
         Response::Ok(yaml.into_bytes())
+    }
+}
+
+/// A tick fired at most this late is on time, not missed: `catchup:` governs
+/// downtime and forward clock steps, not a slow engine step.
+const ON_TIME: SignedDuration = SignedDuration::from_secs(5);
+
+impl ServerState {
+    /// Fire every entry whose next tick is at or before `now`, once however
+    /// many of its ticks have passed: a run of missed ticks (tuber down, or
+    /// the clock stepped forward) is caught up with one fire, subject to the
+    /// entry's `catchup:`. Called from the tick with the wall clock.
+    pub(super) fn fire_due_schedules(&mut self, now: Timestamp) {
+        let mut due: Vec<(String, String)> = Vec::new();
+        for e in self.schedules.iter_mut() {
+            let Some(tick) = e.next_fire.filter(|&t| t <= now) else {
+                continue;
+            };
+            let fire = match e.line.catchup {
+                Catchup::Once => true,
+                bound => {
+                    let since = tick
+                        .checked_sub(SignedDuration::from_nanos(1))
+                        .unwrap_or(tick);
+                    let latest = e.line.spec.latest_at_or_before(now, since).unwrap_or(tick);
+                    let age = now.duration_since(latest);
+                    let fire = age <= ON_TIME
+                        || matches!(bound, Catchup::Within(secs) if age <= SignedDuration::from_secs(secs.into()));
+                    if !fire {
+                        tracing::info!(
+                            owner = %e.owner,
+                            name = %e.line.name,
+                            missed = %format_time(latest, &e.line.spec.time_zone()),
+                            catchup = %e.line.catchup.describe(),
+                            "schedule skipping a missed tick",
+                        );
+                    }
+                    fire
+                }
+            };
+            e.next_fire = e.line.spec.next_after(now);
+            if fire {
+                e.last_fire = Some(now);
+                due.push((e.owner.clone(), e.line.name.clone()));
+            }
+        }
+
+        for (owner, name) in due {
+            let Some(e) = self.schedules.get(&owner, &name) else {
+                continue;
+            };
+            let line = e.line.clone();
+            let resp = self.put_job(
+                None,
+                line.tube,
+                line.pri,
+                line.delay,
+                line.ttr,
+                Some(e.body.clone()),
+                line.tags.idempotency_key,
+                line.tags.group,
+                line.tags.after_group,
+                line.tags.concurrency_key,
+            );
+            self.record_fire(&owner, &name, &resp);
+        }
+    }
+
+    fn record_fire(&mut self, owner: &str, name: &str, resp: &Response) {
+        let Some(e) = self.schedules.get_mut(owner, name) else {
+            return;
+        };
+        let reply = resp.serialize();
+        let reply = String::from_utf8_lossy(&reply).trim_end().to_string();
+        let s = &mut e.stats;
+        match resp {
+            Response::Inserted(_) => {
+                s.inserted += 1;
+                s.buried_streak = 0;
+            }
+            Response::InsertedDup(id, state, _) => {
+                let i = match *state {
+                    "READY" => 0,
+                    "RESERVED" => 1,
+                    "DELAYED" => 2,
+                    "BURIED" => 3,
+                    _ => 4,
+                };
+                s.deduped[i] += 1;
+                if i == 3 {
+                    s.buried_streak += 1;
+                    // The 09-09 failure: the put "succeeded", queued nothing,
+                    // and will keep doing so until that job is kicked.
+                    tracing::warn!(
+                        owner,
+                        name,
+                        job = id,
+                        streak = s.buried_streak,
+                        "schedule fire matched a buried job's idempotency key; nothing was queued",
+                    );
+                } else {
+                    s.buried_streak = 0;
+                }
+            }
+            _ => {
+                s.rejected += 1;
+                s.buried_streak = 0;
+                tracing::warn!(owner, name, result = %reply, "schedule fire refused");
+            }
+        }
+        s.last_result = Some(reply);
     }
 }

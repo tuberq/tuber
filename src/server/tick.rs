@@ -188,6 +188,10 @@ impl ServerState {
             self.deliver_waiter_failure(waiter, now);
         }
 
+        // Recurring schedules run on the wall clock, which is what cron is
+        // defined on, not on `Instant`.
+        self.fire_due_schedules(jiff::Timestamp::now());
+
         // Try to fulfill remaining waiters with newly ready jobs
         self.process_queue();
 

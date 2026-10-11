@@ -2212,3 +2212,165 @@ fn test_wal_failure_refuses_later_puts() {
     let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
     assert!(matches!(resp, Response::Deleted), "got {resp:?}");
 }
+
+// --- Recurring schedules: firing ---
+
+/// Sync `entries` — (name, tags and spec) — for owner "app" into tube "jobs".
+fn sync_schedules(s: &mut ServerState, c: u64, entries: &[(&str, &str)]) {
+    let resp = s.handle_command(c, Command::ScheduleBegin { owner: "app".into() }, None);
+    assert_eq!(resp, Response::Syncing("app".into()));
+    for (name, rest) in entries {
+        let line = format!("schedule-put {name} jobs 0 0 60 2 {rest}");
+        let cmd = protocol::parse_command(&line).unwrap();
+        assert_eq!(s.handle_command(c, cmd, Some(b"{}".to_vec())), Response::Staged);
+    }
+    let resp = s.handle_command(c, Command::ScheduleCommit, None);
+    assert!(matches!(resp, Response::Synced { .. }), "got {resp:?}");
+}
+
+fn next_fire(s: &ServerState, name: &str) -> jiff::Timestamp {
+    s.schedules.get("app", name).unwrap().next_fire.unwrap()
+}
+
+fn fired(s: &ServerState, name: &str) -> u64 {
+    let st = &s.schedules.get("app", name).unwrap().stats;
+    st.inserted + st.deduped.iter().sum::<u64>() + st.rejected
+}
+
+fn ready_in(s: &ServerState, tube: &str) -> usize {
+    s.tubes.get(tube).map_or(0, |t| t.ready.len())
+}
+
+fn mins(n: i64) -> jiff::SignedDuration {
+    jiff::SignedDuration::from_mins(n)
+}
+
+fn secs(n: i64) -> jiff::SignedDuration {
+    jiff::SignedDuration::from_secs(n)
+}
+
+#[test]
+fn schedule_fires_at_its_tick_and_not_before() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    s.fire_due_schedules(t - secs(1));
+    assert_eq!(ready_in(&s, "jobs"), 0, "a sync fires nothing, and nor does an early tick");
+
+    s.fire_due_schedules(t);
+    assert_eq!(ready_in(&s, "jobs"), 1);
+    assert_eq!(next_fire(&s, "ping"), t + mins(1));
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!(e.last_fire, Some(t));
+    assert_eq!(e.stats.last_result.as_deref(), Some("INSERTED 1"));
+
+    // The same tick again fires nothing more.
+    s.fire_due_schedules(t);
+    assert_eq!(ready_in(&s, "jobs"), 1);
+}
+
+#[test]
+fn missed_ticks_fire_once() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    // Ten ticks passed unfired: one fire, then the schedule carries on.
+    s.fire_due_schedules(t + mins(10) + secs(30));
+    assert_eq!(fired(&s, "ping"), 1);
+    assert_eq!(next_fire(&s, "ping"), t + mins(11));
+}
+
+#[test]
+fn catchup_zero_never_fires_a_missed_tick() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "catchup:0 every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    s.fire_due_schedules(t + mins(10) + secs(30));
+    assert_eq!(fired(&s, "ping"), 0);
+    assert_eq!(next_fire(&s, "ping"), t + mins(11));
+
+    // A tick fired a little late is on time, not missed.
+    s.fire_due_schedules(t + mins(11) + secs(2));
+    assert_eq!(fired(&s, "ping"), 1);
+}
+
+#[test]
+fn catchup_bound_fires_only_a_recent_missed_tick() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "catchup:30 every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    // The latest missed tick, t+10m, is 40 s old: past the bound.
+    s.fire_due_schedules(t + mins(10) + secs(40));
+    assert_eq!(fired(&s, "ping"), 0);
+
+    // The latest missed tick, t+12m, is 20 s old: within it.
+    s.fire_due_schedules(t + mins(12) + secs(20));
+    assert_eq!(fired(&s, "ping"), 1);
+}
+
+#[test]
+fn a_backward_clock_step_fires_nothing_again() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    s.fire_due_schedules(t + mins(10));
+    assert_eq!(fired(&s, "ping"), 1);
+    for back in [mins(5), mins(1), secs(1)] {
+        s.fire_due_schedules(t + mins(10) - back);
+    }
+    assert_eq!(fired(&s, "ping"), 1);
+}
+
+#[test]
+fn schedule_fire_records_dedups_and_buried_streak() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("rollup", "idp:rollup every 60s")]);
+    let t = next_fire(&s, "rollup");
+
+    s.fire_due_schedules(t);
+    s.fire_due_schedules(t + mins(1));
+    {
+        let st = &s.schedules.get("app", "rollup").unwrap().stats;
+        assert_eq!((st.inserted, st.deduped[0]), (1, 1));
+        assert_eq!(st.last_result.as_deref(), Some("INSERTED 1 READY"));
+    }
+
+    // The job buries; every fire after that queues nothing.
+    s.handle_command(c, Command::Watch { tube: "jobs".into(), weight: 1 }, None);
+    assert!(matches!(s.handle_command(c, Command::Reserve, None), Response::Reserved { id: 1, .. }));
+    assert_eq!(s.handle_command(c, Command::Bury { id: 1, pri: 0 }, None), Response::Buried);
+    s.fire_due_schedules(t + mins(2));
+    s.fire_due_schedules(t + mins(3));
+    let st = &s.schedules.get("app", "rollup").unwrap().stats;
+    assert_eq!(st.deduped[3], 2);
+    assert_eq!(st.buried_streak, 2);
+    assert_eq!(st.last_result.as_deref(), Some("INSERTED 1 BURIED"));
+    assert_eq!(s.tubes["jobs"].stat.idp_dedup_buried_ct, 2, "counted on the tube too");
+}
+
+#[test]
+fn schedule_fire_is_refused_like_any_put() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    s.handle_command(c, Command::Drain, None);
+    s.fire_due_schedules(t);
+    let st = &s.schedules.get("app", "ping").unwrap().stats;
+    assert_eq!((st.rejected, st.inserted), (1, 0));
+    assert_eq!(st.last_result.as_deref(), Some("DRAINING"));
+    // Not retried: the next attempt is the next tick.
+    assert_eq!(next_fire(&s, "ping"), t + mins(1));
+}
