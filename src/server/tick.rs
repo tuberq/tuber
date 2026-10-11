@@ -201,7 +201,7 @@ impl ServerState {
             .flat_map(|(tube_name, tube)| {
                 tube.idempotency_cooldowns
                     .iter()
-                    .filter(|(_, (_, expiry))| *expiry <= sys_now)
+                    .filter(|(_, cooldown)| cooldown.expires_at <= sys_now)
                     .map(|(k, _)| (tube_name.clone(), k.clone()))
                     .collect::<Vec<_>>()
             })
@@ -281,6 +281,49 @@ impl ServerState {
                         }
                     }
                     wal.record_migration();
+                }
+            }
+
+            // Live cooldowns in the target segment hold references on it
+            // too. Rewrite each into the current segment, then release the
+            // old record, so the segment can be collected.
+            let migrate_cooldowns: Vec<(String, String, Cooldown)> = self
+                .tubes
+                .iter()
+                .flat_map(|(tube_name, tube)| {
+                    tube.idempotency_cooldowns
+                        .iter()
+                        .filter(|(_, c)| c.record.is_some_and(|r| r.seq == target_seq))
+                        .map(|(key, c)| (tube_name.clone(), key.clone(), *c))
+                })
+                .take(count)
+                .collect();
+            for (tube_name, key, cooldown) in migrate_cooldowns {
+                let Some(wal) = self.wal.as_mut() else { break };
+                let expires_epoch_secs = cooldown
+                    .expires_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .max(1);
+                match wal.write_tombstone(&tube_name, &key, cooldown.job_id, expires_epoch_secs) {
+                    Ok(record) => {
+                        if let Some(old) = cooldown.record {
+                            wal.release_record(old);
+                        }
+                        wal.record_migration();
+                        if let Some(c) = self
+                            .tubes
+                            .get_mut(&tube_name)
+                            .and_then(|t| t.idempotency_cooldowns.get_mut(&key))
+                        {
+                            c.record = record;
+                        }
+                    }
+                    Err(e) => {
+                        self.fail_wal("compaction tombstone write", e);
+                        break;
+                    }
                 }
             }
         }
@@ -477,14 +520,18 @@ impl ServerState {
             }
         }
 
-        // Restore idempotency tombstones from WAL
+        // Restore idempotency tombstones from WAL. Ones from a pre-v8 WAL
+        // have no record yet; build_state writes them once the WAL is attached.
         for tombstone in tombstones {
             self.ensure_tube(&tombstone.tube_name);
             self.insert_tombstone(
                 &tombstone.tube_name,
                 tombstone.key,
-                tombstone.job_id,
-                tombstone.expires_at,
+                Cooldown {
+                    job_id: tombstone.job_id,
+                    expires_at: tombstone.expires_at,
+                    record: tombstone.record,
+                },
             );
         }
     }

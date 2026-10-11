@@ -32,7 +32,13 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 ///   second the change was applied). A release/kick-to-delayed job
 ///   replays with its remaining delay instead of resetting to the
 ///   full delay on every restart. Pre-v7 records replay full-delay.
-pub const WAL_VERSION: u32 = 7;
+/// - v8: two new record types. A tombstone record carries an `idp:`
+///   cooldown whole (tube, key, job id, expiry), so it no longer depends
+///   on the job's put record surviving, and holds a reference on its
+///   segment until it expires; compaction carries it forward. An id mark
+///   opens every segment with the highest job id assigned so far, so ids
+///   never go backwards when older segments are collected.
+pub const WAL_VERSION: u32 = 8;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 
 // v6 body_kind discriminant values
@@ -41,6 +47,12 @@ const BODY_KIND_EXTERNAL: u8 = 0x01;
 const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
+const RECORD_TYPE_TOMBSTONE: u8 = 0x03; // v8
+const RECORD_TYPE_ID_MARK: u8 = 0x04; // v8
+/// First version with tombstone and id-mark records.
+const WAL_VERSION_TOMBSTONES: u32 = 8;
+/// Size of an id-mark record: type(1) + high_water(8) + payload_len(4) + crc(4).
+const ID_MARK_RECORD_SIZE: usize = 1 + 8 + 4 + 4;
 const STATE_CHANGE_PAYLOAD_LEN_V3: u32 = 21;
 const STATE_CHANGE_PAYLOAD_LEN_V4: u32 = 22; // v4: added reason byte
 const STATE_CHANGE_PAYLOAD_LEN_V7: u32 = 30; // v7: added change_epoch_secs (u64)
@@ -173,6 +185,14 @@ impl std::fmt::Display for WalError {
 
 // --- WAL record types ---
 
+/// A record that holds a reference on its segment until it is released:
+/// the segment's seq and the record's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordRef {
+    pub seq: u64,
+    pub len: u32,
+}
+
 /// An idempotency tombstone recovered from WAL replay.
 #[derive(Debug)]
 pub struct IdpTombstone {
@@ -180,6 +200,9 @@ pub struct IdpTombstone {
     pub key: String,
     pub job_id: u64,
     pub expires_at: SystemTime,
+    /// Its v8 tombstone record. `None` for a cooldown rebuilt from a pre-v8
+    /// delete record, which holds no reference and must be rewritten.
+    pub record: Option<RecordRef>,
 }
 
 /// What [`Wal::replay`] returns: `(jobs, next_job_id, idempotency
@@ -207,6 +230,19 @@ pub enum WalRecord {
         // than resetting to the full delay on every restart. 0 = absent
         // (pre-v7 record) → fall back to full delay.
         change_epoch_secs: u64,
+    },
+    /// An `idp:` cooldown (v8+): `key` in `tube` stays taken by `job_id`
+    /// until `expires_epoch_secs`. Supersedes any earlier record for the
+    /// same tube and key; `expires_epoch_secs == 0` clears the cooldown.
+    Tombstone {
+        job_id: u64,
+        tube: String,
+        key: String,
+        expires_epoch_secs: u64,
+    },
+    /// The highest job id assigned when its segment was created (v8+).
+    IdMark {
+        high_water: u64,
     },
 }
 
@@ -318,6 +354,35 @@ pub fn serialize_state_change(
     record
 }
 
+/// Frame `payload` as a record: type(1) + job_id(8) + payload_len(4) +
+/// payload + crc(4), the CRC covering everything before it.
+fn frame_record(record_type: u8, job_id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
+    record.push(record_type);
+    record.extend_from_slice(&job_id.to_le_bytes());
+    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    record.extend_from_slice(payload);
+    let crc = crc32fast::hash(&record);
+    record.extend_from_slice(&crc.to_le_bytes());
+    record
+}
+
+/// A v8 tombstone record. `expires_epoch_secs == 0` clears the cooldown.
+pub fn serialize_tombstone(job_id: u64, tube: &str, key: &str, expires_epoch_secs: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + 2 + tube.len() + 2 + key.len());
+    payload.extend_from_slice(&expires_epoch_secs.to_le_bytes());
+    payload.extend_from_slice(&(tube.len() as u16).to_le_bytes());
+    payload.extend_from_slice(tube.as_bytes());
+    payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+    payload.extend_from_slice(key.as_bytes());
+    frame_record(RECORD_TYPE_TOMBSTONE, job_id, &payload)
+}
+
+/// A v8 id mark, carrying `high_water` in the job-id field.
+pub fn serialize_id_mark(high_water: u64) -> Vec<u8> {
+    frame_record(RECORD_TYPE_ID_MARK, high_water, &[])
+}
+
 /// On-wire size of the v6 body section for a FullJob record.
 /// `body_external == true` selects the BodyId encoding; otherwise the
 /// body rides inline as `len + bytes`.
@@ -382,8 +447,66 @@ pub fn deserialize_record(data: &[u8], version: u32) -> Result<(WalRecord, usize
     match record_type {
         RECORD_TYPE_FULL_JOB => deserialize_full_job(data, version),
         RECORD_TYPE_STATE_CHANGE => deserialize_state_change(data),
+        RECORD_TYPE_TOMBSTONE if version >= WAL_VERSION_TOMBSTONES => deserialize_tombstone(data),
+        RECORD_TYPE_ID_MARK if version >= WAL_VERSION_TOMBSTONES => deserialize_id_mark(data),
         _ => Err(WalError::UnknownRecordType(record_type)),
     }
+}
+
+/// Check a framed record's length and CRC. Returns its job-id field, its
+/// payload and its total size.
+fn unframe_record(data: &[u8]) -> Result<(u64, &[u8], usize), WalError> {
+    if data.len() < 13 {
+        return Err(WalError::Truncated);
+    }
+    let job_id = u64::from_le_bytes(data[1..9].try_into().map_err(|_| WalError::Truncated)?);
+    let payload_len =
+        u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?) as usize;
+    let total_len = 13 + payload_len + 4;
+    if data.len() < total_len {
+        return Err(WalError::Truncated);
+    }
+    let stored_crc = u32::from_le_bytes(
+        data[total_len - 4..total_len]
+            .try_into()
+            .map_err(|_| WalError::Truncated)?,
+    );
+    if crc32fast::hash(&data[..total_len - 4]) != stored_crc {
+        return Err(WalError::BadCrc);
+    }
+    Ok((job_id, &data[13..13 + payload_len], total_len))
+}
+
+fn deserialize_tombstone(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+    let (job_id, payload, total_len) = unframe_record(data)?;
+    let mut off = 0;
+    let mut take = |n: usize| -> Result<&[u8], WalError> {
+        let bytes = payload.get(off..off + n).ok_or(WalError::InvalidData)?;
+        off += n;
+        Ok(bytes)
+    };
+    let expires_epoch_secs =
+        u64::from_le_bytes(take(8)?.try_into().map_err(|_| WalError::InvalidData)?);
+    let mut take_str = || -> Result<String, WalError> {
+        let len = u16::from_le_bytes(take(2)?.try_into().map_err(|_| WalError::InvalidData)?);
+        String::from_utf8(take(len as usize)?.to_vec()).map_err(|_| WalError::InvalidData)
+    };
+    let tube = take_str()?;
+    let key = take_str()?;
+    Ok((
+        WalRecord::Tombstone {
+            job_id,
+            tube,
+            key,
+            expires_epoch_secs,
+        },
+        total_len,
+    ))
+}
+
+fn deserialize_id_mark(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+    let (high_water, _, total_len) = unframe_record(data)?;
+    Ok((WalRecord::IdMark { high_water }, total_len))
 }
 
 fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize), WalError> {
@@ -803,6 +926,9 @@ pub struct Wal {
     sync_interval: Duration,
     /// See [`WalConfig::skip_corrupt`].
     skip_corrupt: bool,
+    /// Highest job id replayed or written, stamped into each new segment's
+    /// id mark.
+    max_job_id: u64,
     last_sync_at: Instant,
     files: VecDeque<WalFile>,
     next_seq: u64,
@@ -930,6 +1056,7 @@ impl Wal {
             max_file_size: config.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
             sync_interval: config.sync_interval,
             skip_corrupt: config.skip_corrupt,
+            max_job_id: 0,
             last_sync_at: Instant::now(),
             files: VecDeque::new(),
             next_seq: 1,
@@ -1094,6 +1221,10 @@ impl Wal {
 
         let mut fd = BufWriter::with_capacity(BUF_CAPACITY, file);
         write_header(&mut fd)?;
+        // Open with the id high-water mark. GC never removes the newest
+        // segment, so the mark survives every older segment being collected,
+        // and replay can't hand out an id twice.
+        fd.write_all(&serialize_id_mark(self.max_job_id))?;
         // Make the header durable immediately. Without this, a crash any
         // time before the first sync leaves a 0-byte or partial file that
         // the next replay flags as corrupt ("bad header ... quarantined")
@@ -1101,15 +1232,16 @@ impl Wal {
         // then mints one spurious .corrupt sidecar per restart.
         Self::flush_and_fsync(&mut fd)?;
 
+        let opening_bytes = HEADER_SIZE + ID_MARK_RECORD_SIZE;
         self.files.push_back(WalFile {
             seq,
             path,
             fd: Some(fd),
             refs: 0,
-            bytes_written: HEADER_SIZE,
+            bytes_written: opening_bytes,
             zero_refs_at_op: 0,
         });
-        self.total_disk_bytes += HEADER_SIZE as u64;
+        self.total_disk_bytes += opening_bytes as u64;
 
         Ok(())
     }
@@ -1181,6 +1313,7 @@ impl Wal {
 
         let record = serialize_full_job(job);
         let record_len = record.len();
+        self.max_job_id = self.max_job_id.max(job.id);
 
         // Group commit: bytes go into the BufWriter and `dirty` is set, but
         // no fsync happens here. The engine task batches the fsync across
@@ -1293,6 +1426,55 @@ impl Wal {
         Ok(())
     }
 
+    /// Write an `idp:` cooldown record: `key` in `tube` stays taken by
+    /// `job_id` until `expires_epoch_secs`. A live cooldown's record holds a
+    /// reference on its segment, returned so the caller can release it when
+    /// the cooldown ends ([`Wal::release_record`]) and compaction can carry
+    /// it forward. `expires_epoch_secs == 0` clears the cooldown instead,
+    /// and holds no reference: it is only needed while an earlier record
+    /// for the key survives, and GC collects segments oldest first.
+    pub fn write_tombstone(
+        &mut self,
+        tube: &str,
+        key: &str,
+        job_id: u64,
+        expires_epoch_secs: u64,
+    ) -> io::Result<Option<RecordRef>> {
+        #[cfg(test)]
+        self.injected_failure()?;
+        self.rotate_if_needed()?;
+
+        let record = serialize_tombstone(job_id, tube, key, expires_epoch_secs);
+        let record_len = record.len();
+        self.max_job_id = self.max_job_id.max(job_id);
+        let file = self.current_file_mut()?;
+        let fd = file
+            .fd
+            .as_mut()
+            .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
+        fd.write_all(&record)?;
+        file.bytes_written += record_len;
+        let seq = file.seq;
+        self.total_disk_bytes += record_len as u64;
+        self.ops_written += 1;
+        self.dirty = true;
+
+        if expires_epoch_secs == 0 {
+            return Ok(None);
+        }
+        self.incref_file(seq, record_len);
+        Ok(Some(RecordRef {
+            seq,
+            len: record_len as u32,
+        }))
+    }
+
+    /// Drop the reference a record holds on its segment, once what it
+    /// records has ended (an expired cooldown) or been rewritten elsewhere.
+    pub fn release_record(&mut self, record: RecordRef) {
+        self.decref_file(record.seq, record.len as usize);
+    }
+
     fn incref_file(&mut self, seq: u64, used: usize) {
         for f in self.files.iter_mut() {
             if f.seq == seq {
@@ -1335,7 +1517,10 @@ impl Wal {
     pub fn replay(&mut self) -> io::Result<ReplayOutcome> {
         let mut jobs: HashMap<u64, Box<Job>> = HashMap::new();
         let mut max_id: u64 = 0;
-        let mut tombstones: Vec<IdpTombstone> = Vec::new();
+        // Live cooldowns by (tube, key), the latest record winning. Legacy
+        // ones, rebuilt from a pre-v8 delete record, have no record of their
+        // own (`record: None`).
+        let mut cooldowns: HashMap<(Arc<str>, String), IdpTombstone> = HashMap::new();
         // Every record that leaves a job buried, in WAL order. Stale
         // entries (job later kicked, deleted, or re-buried) are filtered
         // after the loop; keeping raw events avoids per-transition
@@ -1348,6 +1533,10 @@ impl Wal {
         // caller can drop them after rebuilding state.
         let mut orphan_bodies: Vec<BodyId> = Vec::new();
         let replay_time = SystemTime::now();
+        let replay_epoch = replay_time
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         // Read and process each file
         let file_infos: Vec<(u64, PathBuf)> =
@@ -1520,22 +1709,26 @@ impl Wal {
                                 }
                                 match new_state {
                                     None => {
-                                        // Deleted — check for idempotency tombstone
-                                        if expiry_epoch_secs > 0 {
-                                            let expires_at =
-                                                UNIX_EPOCH + Duration::from_secs(expiry_epoch_secs);
-                                            if expires_at > replay_time {
-                                                // Tombstone still active — extract idp info from job before removing
-                                                if let Some(job) = jobs.get(&job_id)
-                                                    && let Some((key, _)) = job.idempotency_key()
-                                                {
-                                                    tombstones.push(IdpTombstone {
-                                                        tube_name: job.tube_name.clone(),
-                                                        key: key.clone(),
-                                                        job_id,
-                                                        expires_at,
-                                                    });
-                                                }
+                                        // Deleted. A pre-v8 delete carries its
+                                        // cooldown's expiry; the key comes from
+                                        // the job's put record, if that survives.
+                                        if expiry_epoch_secs > replay_epoch
+                                            && let Some(job) = jobs.get(&job_id)
+                                            && let Some((key, _)) = job.idempotency_key()
+                                        {
+                                            let slot = (job.tube_name.clone(), key.clone());
+                                            let legacy = IdpTombstone {
+                                                tube_name: job.tube_name.clone(),
+                                                key: key.clone(),
+                                                job_id,
+                                                expires_at: UNIX_EPOCH
+                                                    + Duration::from_secs(expiry_epoch_secs),
+                                                record: None,
+                                            };
+                                            if let Some(old) = cooldowns.insert(slot, legacy)
+                                                && let Some(r) = old.record
+                                            {
+                                                self.release_record(r);
                                             }
                                         }
                                         if let Some(old_job) = jobs.remove(&job_id) {
@@ -1603,6 +1796,51 @@ impl Wal {
                                         }
                                     }
                                 }
+                            }
+                            WalRecord::Tombstone {
+                                job_id,
+                                tube,
+                                key,
+                                expires_epoch_secs,
+                            } => {
+                                max_id = max_id.max(job_id);
+                                let tube_name: Arc<str> = match tube_names.get(tube.as_str()) {
+                                    Some(interned) => Arc::clone(interned),
+                                    None => {
+                                        let name: Arc<str> = Arc::from(tube);
+                                        tube_names.insert(Arc::clone(&name));
+                                        name
+                                    }
+                                };
+                                let slot = (Arc::clone(&tube_name), key.clone());
+                                // This record supersedes any earlier one for
+                                // the key, live or cleared.
+                                if let Some(old) = cooldowns.remove(&slot)
+                                    && let Some(r) = old.record
+                                {
+                                    self.release_record(r);
+                                }
+                                if expires_epoch_secs > replay_epoch {
+                                    let record = RecordRef {
+                                        seq: *seq,
+                                        len: consumed as u32,
+                                    };
+                                    self.incref_file(*seq, consumed);
+                                    cooldowns.insert(
+                                        slot,
+                                        IdpTombstone {
+                                            tube_name,
+                                            key,
+                                            job_id,
+                                            expires_at: UNIX_EPOCH
+                                                + Duration::from_secs(expires_epoch_secs),
+                                            record: Some(record),
+                                        },
+                                    );
+                                }
+                            }
+                            WalRecord::IdMark { high_water } => {
+                                max_id = max_id.max(high_water);
                             }
                         }
                         offset += consumed;
@@ -1683,8 +1921,10 @@ impl Wal {
         // Reserve bytes for each live job's future delete
         self.reserved_bytes = jobs.len() as u64 * STATE_CHANGE_RECORD_SIZE as u64;
 
-        // Create new writable file
+        // Create new writable file, opening with the id high-water mark.
+        self.max_job_id = self.max_job_id.max(max_id);
         self.create_next_file()?;
+        let tombstones: Vec<IdpTombstone> = cooldowns.into_values().collect();
 
         // Filter orphans against the final job set: a job may have been
         // recreated under the same id within the same WAL, in which case
@@ -2358,6 +2598,165 @@ mod tests {
     }
 
     #[test]
+    fn test_tombstone_and_id_mark_records_round_trip() {
+        let record = serialize_tombstone(42, "emails", "nightly", 1_900_000_000);
+        match deserialize_record(&record, WAL_VERSION).unwrap() {
+            (
+                WalRecord::Tombstone {
+                    job_id,
+                    tube,
+                    key,
+                    expires_epoch_secs,
+                },
+                consumed,
+            ) => {
+                assert_eq!(
+                    (job_id, tube.as_str(), key.as_str()),
+                    (42, "emails", "nightly")
+                );
+                assert_eq!(expires_epoch_secs, 1_900_000_000);
+                assert_eq!(consumed, record.len());
+            }
+            other => panic!("expected a tombstone, got {other:?}"),
+        }
+        let mark = serialize_id_mark(99);
+        assert_eq!(mark.len(), ID_MARK_RECORD_SIZE);
+        assert!(matches!(
+            deserialize_record(&mark, WAL_VERSION).unwrap(),
+            (WalRecord::IdMark { high_water: 99 }, ID_MARK_RECORD_SIZE)
+        ));
+    }
+
+    #[test]
+    fn test_v7_segments_do_not_accept_v8_record_types() {
+        let record = serialize_tombstone(1, "default", "k", 1_900_000_000);
+        assert!(matches!(
+            deserialize_record(&record, 7),
+            Err(WalError::UnknownRecordType(RECORD_TYPE_TOMBSTONE))
+        ));
+        assert!(matches!(
+            deserialize_record(&serialize_id_mark(1), 7),
+            Err(WalError::UnknownRecordType(RECORD_TYPE_ID_MARK))
+        ));
+    }
+
+    fn epoch_in(secs: i64) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        (now + secs) as u64
+    }
+
+    #[test]
+    fn test_replay_keeps_the_latest_tombstone_for_each_key() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+            wal.write_tombstone("default", "a", 1, epoch_in(3600))
+                .unwrap();
+            wal.write_tombstone("default", "a", 2, epoch_in(7200))
+                .unwrap();
+            wal.write_tombstone("default", "b", 3, epoch_in(3600))
+                .unwrap();
+            wal.write_tombstone("default", "b", 3, 0).unwrap(); // cleared
+            wal.write_tombstone("default", "c", 4, epoch_in(-10))
+                .unwrap(); // expired
+            wal.write_tombstone("other", "a", 5, epoch_in(3600))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let (_, next_id, tombstones, ..) = wal.replay().unwrap();
+        let mut got: Vec<(String, String, u64)> = tombstones
+            .iter()
+            .map(|t| (t.tube_name.to_string(), t.key.clone(), t.job_id))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("default".to_string(), "a".to_string(), 2),
+                ("other".to_string(), "a".to_string(), 5)
+            ]
+        );
+        assert!(tombstones.iter().all(|t| t.record.is_some()));
+        assert_eq!(
+            next_id, 6,
+            "tombstone job ids count toward the high-water mark"
+        );
+    }
+
+    #[test]
+    fn test_live_tombstone_pins_its_segment_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1)).unwrap();
+        let record = wal
+            .write_tombstone("default", "k", 1, epoch_in(3600))
+            .unwrap()
+            .expect("a live tombstone holds a reference");
+        let mut job = make_test_job(2, b"x");
+        external_body(&mut job);
+        wal.write_put(&mut job).unwrap();
+        wal.write_state_change(
+            &mut job,
+            None,
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
+        wal.sync().unwrap();
+        wal.gc();
+        assert!(
+            segment(dir.path(), record.seq).exists(),
+            "pinned by the live tombstone"
+        );
+
+        wal.release_record(record);
+        wal.write_put(&mut make_test_job(3, b"y")).unwrap();
+        wal.sync().unwrap();
+        wal.gc();
+        assert!(
+            !segment(dir.path(), record.seq).exists(),
+            "collected once released"
+        );
+    }
+
+    #[test]
+    fn test_id_mark_keeps_the_next_id_once_older_segments_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+            let mut job = make_test_job(9, b"x");
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+            wal.write_state_change(
+                &mut job,
+                None,
+                0,
+                Duration::ZERO,
+                0,
+                StateChangeReason::None,
+            )
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        {
+            // Replay opens a new segment; every older one holds nothing live.
+            let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+            let (_, next_id, ..) = wal.replay().unwrap();
+            assert_eq!(next_id, 10);
+            wal.gc();
+            assert_eq!(wal.file_count(), 1, "only the new segment is left");
+        }
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let (_, next_id, ..) = wal.replay().unwrap();
+        assert_eq!(next_id, 10, "the id mark carries the high-water mark");
+    }
+
+    #[test]
     fn test_replay_refuses_truncated_older_segment() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
@@ -2473,7 +2872,9 @@ mod tests {
         let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
         let msg = replay_refusal(&mut wal);
         assert!(msg.contains("binlog.000003"), "{msg}");
-        assert!(msg.contains(&format!("offset {HEADER_SIZE}")), "{msg}");
+        // The record after the segment's opening id mark.
+        let offset = HEADER_SIZE + ID_MARK_RECORD_SIZE;
+        assert!(msg.contains(&format!("offset {offset}")), "{msg}");
         assert_eq!(fs::read(&seg3).unwrap(), data, "segment left as found");
         assert!(!corrupt_sidecar_path(&seg3).exists());
     }
@@ -2550,7 +2951,8 @@ mod tests {
             "job 1's delete was in the damaged record"
         );
         assert_eq!(fs::read(corrupt_sidecar_path(&seg3)).unwrap(), data);
-        assert_eq!(fs::metadata(&seg3).unwrap().len(), HEADER_SIZE as u64);
+        let kept = HEADER_SIZE + ID_MARK_RECORD_SIZE;
+        assert_eq!(fs::metadata(&seg3).unwrap().len(), kept as u64);
     }
 
     #[test]

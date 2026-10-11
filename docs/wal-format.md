@@ -55,7 +55,7 @@ space, never dangling references. Orphans are reclaimed on the next replay.
 | Offset | Size | Field     | Value                                      |
 |--------|------|-----------|--------------------------------------------|
 | 0      | 4    | magic     | `TWAL` (`0x5457414C`)                      |
-| 4      | 4    | version   | `6` (u32 LE) — current; v5, v4, and v3 still readable |
+| 4      | 4    | version   | `8` (u32 LE) — current; v3–v7 still readable |
 | 8      | 4    | flags     | `0` — reserved for future use              |
 
 **Total: 12 bytes**
@@ -65,7 +65,8 @@ zero and ignored on read.
 
 ## Record Types
 
-Two record types follow the header. Both share a common envelope:
+Four record types follow the header: FullJob and StateChange, plus
+Tombstone and IdMark from v8. All share a common envelope:
 
 ```
 +-----------+------------------+------------------+---------+----------+
@@ -190,6 +191,40 @@ The `reason` byte was added in v4 so replay can reconstruct per-job
 counters (`reserve_ct`, `release_ct`, `bury_ct`, `kick_ct`, `timeout_ct`).
 v3 records replay with `reason = None` and don't increment counters.
 
+v7 appended `change_epoch_secs` (u64) to the payload (30 bytes, record
+47 bytes): the wall-clock second the change was applied, so a delayed
+job replays with its remaining delay. From v8 a delete writes
+`expiry_epoch_secs = 0`; a cooldown gets a Tombstone record of its own.
+
+### 0x03 — Tombstone (v8+)
+
+An `idp:` cooldown, whole: once a job with `idp:<key>:<ttl>` is deleted, a
+put with the same key in the same tube is answered with the deleted job's
+id until the cooldown expires. `job_id` is the deleted job's id.
+
+| Offset* | Size | Field              | Notes                                   |
+|---------|------|--------------------|-----------------------------------------|
+| 0       | 8    | expires_epoch_secs | UNIX second the cooldown ends (u64); `0` clears it |
+| 8       | 2    | tube_len           | u16                                     |
+| 10      | N    | tube               | UTF-8                                   |
+| 10+N    | 2    | key_len            | u16                                     |
+| 12+N    | M    | key                | UTF-8                                   |
+
+A record supersedes every earlier one for the same tube and key. While its
+cooldown lasts it holds a reference on its segment, so GC keeps the
+segment, and compaction rewrites it into the current segment as it does
+live jobs. A clearing record (`expires_epoch_secs = 0`, written by
+`flush-tube`) holds no reference: it only matters while an earlier record
+for the key survives, and GC collects segments oldest first.
+
+### 0x04 — IdMark (v8+)
+
+The first record of every segment, written as the segment is created. Its
+`job_id` field holds the highest job id assigned so far; the payload is
+empty (`payload_len = 0`, record 17 bytes). GC never removes the newest
+segment, so replay always finds the mark, and job ids never go backwards
+when older segments are collected.
+
 ## Encoding Details
 
 ### State Encoding
@@ -228,10 +263,12 @@ Variable-length nullable string, used for extension fields.
 
 ### Idempotency Tombstones
 
-When a job with an `idp:` key and TTL is deleted, the StateChange record's
-`expiry_epoch_secs` is set to the UNIX timestamp when the tombstone expires.
-On replay, tombstones with `expiry_epoch_secs > now` are restored to prevent
-re-insertion of recently completed jobs.
+From v8 each cooldown is a Tombstone record (above). Before v8, the delete
+StateChange's `expiry_epoch_secs` carried the expiry and replay took the
+key from the job's FullJob record, so a cooldown was lost once GC
+collected the segment holding that record or the delete itself. Replay
+still rebuilds such cooldowns from v7-and-earlier records, and startup
+rewrites each as a Tombstone record and syncs it.
 
 ## Replay Semantics
 
@@ -250,9 +287,15 @@ On startup, files are read in sequence order. For each record:
   `HEAP_INLINE_MAX` into TOAST; smaller bodies stay inline and get
   rewritten as v6 inline records on the next put. v3/v4 reads require
   the `--migrate-wal` flag.
-- **StateChange (delete)**: Remove from job map. If `expiry_epoch_secs > now`,
-  extract the idempotency key and restore the tombstone. Track the body's
-  `BodyId` as a candidate orphan for the post-replay reclaim step.
+- **StateChange (delete)**: Remove from job map. If `expiry_epoch_secs > now`
+  (pre-v8) and the job's FullJob record survives, restore its cooldown.
+  Track the body's `BodyId` as a candidate orphan for the post-replay
+  reclaim step.
+- **Tombstone (v8)**: Replaces any cooldown for the same tube and key. If
+  `expires_epoch_secs > now` the cooldown is restored and the record's
+  segment gains a reference; otherwise (expired, or cleared) the key is
+  free.
+- **IdMark (v8)**: Raises the next job id to at least `job_id + 1`.
 - **StateChange (other)**: Update the job's state, priority, and delay.
   Increment the counter named by `reason` (v4+).
 
@@ -275,7 +318,9 @@ runtime `BodyStore::delete` self-healing.
 ### Legacy migration (`--migrate-wal`)
 
 When the server detects pre-current-version WAL records on startup it
-refuses to start unless `--migrate-wal` is set. With the flag, the replay
+refuses to start unless `--migrate-wal` is set, since older tuber
+versions can't read the segments the new one writes. From v5 on nothing
+is converted. For v3/v4, with the flag, the replay
 path lifts inline body bytes that exceed `HEAP_INLINE_MAX` from v3/v4
 FullJob records into TOAST (assigning fresh `BodyId`s), fsyncs TOAST, and
 proceeds. Smaller v3/v4 inline bodies stay inline and will be rewritten
@@ -352,17 +397,19 @@ avoids per-file balancing complexity while keeping segments roughly bounded.
 
 ### Garbage Collection
 
-Each WAL file tracks a reference count (`refs`) — the number of live jobs
-whose most recent FullJob record is in that file. On each server tick,
-head files with `refs == 0` are deleted. The current writable file is
-never removed.
+Each WAL file tracks a reference count (`refs`): the live jobs whose most
+recent FullJob record is in that file, plus the live cooldowns whose
+Tombstone record is. On each server tick, head files with `refs == 0`
+are deleted, oldest first. The current writable file is never removed;
+each opens with an IdMark, which keeps the job-id high-water mark.
 
 ### WAL compaction
 
 When the dead-to-live ratio across all WAL files reaches 2:1, the engine
 migrates jobs out of the oldest file into the current one (re-writing
-their FullJob records) at a rate of `ratio` jobs per tick. This frees the
-oldest file for GC. Self-regulating: more waste = more migration.
+their FullJob records) at a rate of `ratio` jobs per tick, and the same
+number of live cooldowns (re-writing their Tombstone records). This frees
+the oldest file for GC. Self-regulating: more waste = more migration.
 
 ### Storage budget
 
@@ -391,6 +438,8 @@ This prevents multiple tuber instances from writing to the same WAL.
 | 4       | 12 bytes    | Added `reason` (u8) byte to StateChange payload (21 → 22 bytes), enabling per-job counter reconstruction on replay. |
 | 5       | 12 bytes    | Replaced inline body bytes (`body_len u32` + raw bytes) in FullJob with `body_id (u64)` reference. Bodies live in TOAST. v3/v4 reads still supported via `--migrate-wal`. |
 | 6       | 12 bytes    | FullJob body field becomes a 1-byte `body_kind` discriminant followed by inline (`body_len u32` + bytes) or external (`body_id u64`). Small bodies stay inline; only larger bodies go to TOAST. Per-record kind decouples the on-disk format from the runtime threshold. v3–v5 reads still supported (v3/v4 via `--migrate-wal`). |
+| 7       | 12 bytes    | StateChange payload gains `change_epoch_secs` (u64), so a delayed job replays with its remaining delay. |
+| 8       | 12 bytes    | Tombstone (0x03) and IdMark (0x04) records. A cooldown no longer depends on its job's FullJob record surviving GC, and job ids never go backwards. Deletes write `expiry_epoch_secs = 0`. Startup on an older WAL needs `--migrate-wal`; an older tuber can't read v8 segments. |
 
 ---
 

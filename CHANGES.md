@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+**`idp:` cooldowns survive restarts, and job ids never go backwards (WAL v8).** A cooldown was rebuilt on restart from the delete record plus the job's own put record. Garbage collection removed both long before the cooldown ended, because neither counted as live. After two restarts the cooldown was gone and the key was free again, hours early, so a recurring put guarded by `idp:` ran twice. Separately, the next job id was one past the highest id left in the WAL. A compaction plus two restarts was enough for ids to go backwards: in a test, with jobs 2–5 deleted, the next put got id 2 again, and a client still holding the old id 2 could delete the new job. WAL v8 adds two record types. A tombstone record carries a cooldown whole, holds its segment until the cooldown ends, and is carried forward by compaction like a live job. An id mark opens every segment with the highest id assigned so far; the newest segment is never collected. `flush-tube` now records the cooldowns it clears, which a restart used to bring back. **Starting on an existing WAL needs `--migrate-wal` once.** Nothing is converted, but older tuber versions can't read the new segments. That one opt-in also covers TOAST format 2 below, which is only written after startup. Cooldowns from the old WAL are rewritten as tombstone records at startup.
+
 **Tuber runs recurring schedules itself, so an app no longer needs a scheduler process.** Almost every app ends up with one beside its web and workers — whenever, rufus-scheduler, sidekiq-cron, a `bin/scheduler` container — booting the whole app to put a job on a timer, limited to one replica because two would fire every tick twice. Now each app process sends its schedule at boot:
 
 ```text

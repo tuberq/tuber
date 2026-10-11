@@ -2219,3 +2219,193 @@ async fn test_wal_skip_corrupt_starts_on_a_damaged_older_toast_segment() {
     copy.push(".corrupt");
     assert_eq!(std::fs::read(copy).unwrap(), data);
 }
+
+/// Wait up to 5 s for WAL segment `seq` to be garbage-collected.
+async fn wal_segment_collected(dir: &Path, seq: u64) -> bool {
+    let seg = dir.join(format!("binlog.{seq:06}"));
+    for _ in 0..100 {
+        if !seg.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Start a server on `dir`, run `f` against one connection, and shut down.
+async fn with_wal_server<F, Fut>(dir: &Path, f: F)
+where
+    F: FnOnce(TestConn) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let srv = TestServer::start_with_wal(dir).await;
+    f(srv.connect().await).await;
+    let _ = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn test_idp_cooldown_survives_restarts_after_its_segment_is_collected() {
+    // The cooldown was rebuilt from the delete record plus the job's own put
+    // record. Once the segment holding them was collected, a restart lost
+    // the cooldown, and the key was free again before its TTL.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("delete 1\r\n").await;
+        c.ckresp("DELETED\r\n").await;
+    })
+    .await;
+
+    let d = dir.path().to_path_buf();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 1 DELETED\r\n").await;
+        assert!(
+            wal_segment_collected(&d, 1).await,
+            "the first segment was never collected"
+        );
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 1 DELETED\r\n").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_job_ids_never_go_backwards_after_wal_gc() {
+    // The next id was one past the highest id in the records left on disk.
+    // Compaction moved job 1 forward and collected the segment holding jobs
+    // 2-5, so the next put got id 2 again.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        for id in 1..=5 {
+            c.mustsend("put 0 0 60 1\r\na\r\n").await;
+            c.ckresp(&format!("INSERTED {id}\r\n")).await;
+        }
+        for id in 2..=5 {
+            c.mustsend(&format!("delete {id}\r\n")).await;
+            c.ckresp("DELETED\r\n").await;
+        }
+    })
+    .await;
+
+    let d = dir.path().to_path_buf();
+    with_wal_server(dir.path(), |_c| async move {
+        assert!(
+            wal_segment_collected(&d, 1).await,
+            "the first segment was never collected"
+        );
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1\r\na\r\n").await;
+        c.ckresp("INSERTED 6\r\n").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_flush_tube_cooldowns_stay_cleared_after_a_restart() {
+    // flush-tube cleared cooldowns in memory only. The delete record that
+    // made the cooldown was still in the WAL, so a restart brought it back.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("delete 1\r\n").await;
+        c.ckresp("DELETED\r\n").await;
+        c.mustsend("flush-tube default\r\n").await;
+        c.ckresp("FLUSHED 0\r\n").await;
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 2\r\n").await;
+    })
+    .await;
+}
+
+/// A v7 WAL, as tuber 0.15 wrote it: job `id` put with `idp:KEY:3600` and
+/// deleted, its delete record carrying the cooldown's expiry.
+fn write_v7_wal_with_cooldown(dir: &Path, id: u64) {
+    use tuber::job::{Job, JobExt};
+    use tuber::wal::{StateChangeReason, serialize_full_job, serialize_state_change};
+    let mut job = Job::new(
+        id,
+        0,
+        Duration::ZERO,
+        Duration::from_secs(60),
+        b"a".to_vec(),
+        "default",
+    );
+    job.set_ext(JobExt {
+        idempotency_key: Some(("KEY".to_string(), 3600)),
+        ..Default::default()
+    });
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let mut file = Vec::from(*b"TWAL");
+    file.extend_from_slice(&7u32.to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&serialize_full_job(&job));
+    file.extend_from_slice(&serialize_state_change(
+        id,
+        None,
+        0,
+        0,
+        expiry,
+        StateChangeReason::None,
+        0,
+    ));
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("binlog.000001"), file).unwrap();
+}
+
+#[tokio::test]
+async fn test_v7_cooldown_survives_the_upgrade_and_its_segment_being_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_v7_wal_with_cooldown(dir.path(), 1);
+
+    let d = dir.path().to_path_buf();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 1 DELETED\r\n").await;
+        assert!(
+            wal_segment_collected(&d, 1).await,
+            "the v7 segment was never collected"
+        );
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 idp:KEY:3600\r\na\r\n").await;
+        c.ckresp("INSERTED 1 DELETED\r\n").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_v7_wal_needs_migrate_wal_and_says_nothing_is_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    write_v7_wal_with_cooldown(dir.path(), 1);
+    let msg = match TestServer::try_start_with_migrate_wal(dir.path(), false).await {
+        Ok(_) => panic!("server must refuse a v7 WAL without --migrate-wal"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("v7") && msg.contains("--migrate-wal"), "{msg}");
+    assert!(msg.contains("No records are rewritten"), "{msg}");
+    assert!(
+        !msg.contains("TOAST"),
+        "the inline-body note is for pre-v5 WALs only: {msg}"
+    );
+}

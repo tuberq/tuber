@@ -45,7 +45,7 @@ The codebase mirrors the original C beanstalkd structure:
 
 Two on-disk stores side by side:
 
-- **WAL** (`binlog.NNNNNN` files): metadata records — `FullJob` carrying a `BodyId` reference and `StateChange` for delete/release/bury/kick/timeout. v7 is current; v3 and v4 inline-body records are still readable and migrated into TOAST on first replay.
+- **WAL** (`binlog.NNNNNN` files): metadata records — `FullJob` carrying a `BodyId` reference, `StateChange` for delete/release/bury/kick/timeout, `Tombstone` for an `idp:` cooldown (tube, key, job id, expiry; holds a segment reference until it expires, and compaction carries it forward like a live job), and `IdMark`, the first record of every segment, holding the job-id high-water mark. v8 is current; v3 and v4 inline-body records are still readable and migrated into TOAST on first replay. Starting on any older WAL needs `--migrate-wal`; pre-v8 cooldowns are rewritten as `Tombstone` records at startup (`persist_legacy_cooldowns`).
 - **TOAST** (`toast/body.NNNNNN`): append-only body segments. Per-body record header is `body_id u64 + len u32 + crc32 u32 + header_crc32 u32` followed by the bytes; `crc32` covers the body and is checked on read, `header_crc32` covers the 16 header bytes and is checked by the startup scan (v2; v1 segments have zero there and are read unchecked). File header is `"TBOD" + version + reserved`.
 
 **Sync ordering:** every WAL fsync is preceded by a TOAST fsync (`Wal::pre_sync_body_store`). A crash mid-sync leaves orphan bodies, never dangling references — orphans are detected on replay and reclaimed via `BodyStore::delete_many`.
@@ -77,7 +77,7 @@ structured `tracing` events on stderr; alerting belongs in the log pipeline.
 - `JOB_DATA_SIZE_LIMIT_MAX`: 1GB (1073741824)
 - `MAX_TUBE_WEIGHT`: 9999 (for weighted reserve mode)
 - Default port: 11300
-- WAL version: 7 (reads v3–v7; writes v7)
+- WAL version: 8 (reads v3–v8; writes v8)
 - TOAST version: 2 (reads v1–v2; writes v2)
 - TOAST default segment size: 64 MiB
 - TOAST compaction threshold: live ratio < 0.5

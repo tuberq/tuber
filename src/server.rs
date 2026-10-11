@@ -13,7 +13,7 @@ use crate::body_store::BodyStore;
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{BodyId, BodyRef, Job, JobExt, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, MAX_DELETE_BATCH, Response};
-use crate::tube::{Tube, TubeStats};
+use crate::tube::{Cooldown, Tube, TubeStats};
 use crate::wal::{IdpTombstone, StateChangeReason, Wal};
 
 /// EWMA smoothing factor for all timing stats (processing time, queue time).
@@ -751,46 +751,119 @@ impl ServerState {
         Some(job)
     }
 
-    fn insert_tombstone(
+    /// Put a cooldown in memory. `cooldown.record` is its WAL record, if it
+    /// has one; see [`ServerState::record_tombstone`] to write one.
+    fn insert_tombstone(&mut self, tube_name: &str, key: String, cooldown: Cooldown) {
+        let cost = Self::tombstone_memory_cost(&key);
+        self.total_job_bytes = self.total_job_bytes.saturating_add(cost);
+        let replaced = self
+            .tubes
+            .get_mut(tube_name)
+            .and_then(|tube| tube.idempotency_cooldowns.insert(key, cooldown));
+        // Replacing an existing tombstone is net-zero on memory; its record
+        // is superseded by the new one.
+        if let Some(old) = replaced {
+            self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            self.release_wal_record(old.record);
+        }
+    }
+
+    /// Start a cooldown for `key` and persist it as a WAL tombstone record,
+    /// which carries the key itself: the job's put record may be collected
+    /// long before the cooldown ends.
+    fn record_tombstone(
         &mut self,
         tube_name: &str,
         key: String,
         job_id: u64,
         expires_at: SystemTime,
     ) {
-        let cost = Self::tombstone_memory_cost(&key);
-        // Replacing an existing tombstone is net-zero. Decrement first so the
-        // subsequent add doesn't double-count.
-        let replacing = self
-            .tubes
-            .get(tube_name)
-            .is_some_and(|t| t.idempotency_cooldowns.contains_key(&key));
-        if replacing {
-            self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+        let expires_epoch_secs = expires_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .max(1);
+        let mut record = None;
+        if let Some(wal) = self.wal.as_mut() {
+            match wal.write_tombstone(tube_name, &key, job_id, expires_epoch_secs) {
+                Ok(r) => record = r,
+                Err(e) => self.fail_wal("write_tombstone", e),
+            }
         }
-        self.total_job_bytes = self.total_job_bytes.saturating_add(cost);
-        if let Some(tube) = self.tubes.get_mut(tube_name) {
-            tube.idempotency_cooldowns.insert(key, (job_id, expires_at));
+        self.insert_tombstone(
+            tube_name,
+            key,
+            Cooldown {
+                job_id,
+                expires_at,
+                record,
+            },
+        );
+    }
+
+    /// Release the reference a cooldown's WAL record holds on its segment.
+    fn release_wal_record(&mut self, record: Option<crate::wal::RecordRef>) {
+        if let (Some(record), Some(wal)) = (record, self.wal.as_mut()) {
+            wal.release_record(record);
         }
     }
 
+    /// End a cooldown that has expired. Its WAL record needs no successor:
+    /// replay ignores an expired tombstone.
     fn remove_tombstone(&mut self, tube_name: &str, key: &str) {
-        if let Some(tube) = self.tubes.get_mut(tube_name)
-            && tube.idempotency_cooldowns.remove(key).is_some()
-        {
+        let removed = self
+            .tubes
+            .get_mut(tube_name)
+            .and_then(|tube| tube.idempotency_cooldowns.remove(key));
+        if let Some(cooldown) = removed {
             let cost = Self::tombstone_memory_cost(key);
             self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            self.release_wal_record(cooldown.record);
         }
     }
 
-    /// Drain every tombstone from a tube, updating accounting.
+    /// Clear every cooldown in a tube before it expires (`flush-tube`),
+    /// updating accounting. Each one gets a WAL record clearing it, or
+    /// replay would bring it back from the record that started it.
     fn drain_tombstones_in_tube(&mut self, tube_name: &str) {
-        if let Some(tube) = self.tubes.get_mut(tube_name) {
-            let drained: Vec<String> = tube.idempotency_cooldowns.drain().map(|(k, _)| k).collect();
-            for k in drained {
-                let cost = Self::tombstone_memory_cost(&k);
-                self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+        let drained: Vec<(String, Cooldown)> = match self.tubes.get_mut(tube_name) {
+            Some(tube) => tube.idempotency_cooldowns.drain().collect(),
+            None => return,
+        };
+        for (key, cooldown) in drained {
+            let cost = Self::tombstone_memory_cost(&key);
+            self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            if let Some(wal) = self.wal.as_mut()
+                && let Err(e) = wal.write_tombstone(tube_name, &key, cooldown.job_id, 0)
+            {
+                self.fail_wal("write_tombstone", e);
             }
+            self.release_wal_record(cooldown.record);
+        }
+    }
+
+    /// Give every cooldown replayed from a pre-v8 delete record a tombstone
+    /// record of its own, and sync it. Until then it depends on the old
+    /// segment holding its job's put record, which GC may collect at once.
+    fn persist_legacy_cooldowns(&mut self) {
+        let legacy: Vec<(String, String, Cooldown)> = self
+            .tubes
+            .iter()
+            .flat_map(|(tube_name, tube)| {
+                tube.idempotency_cooldowns
+                    .iter()
+                    .filter(|(_, c)| c.record.is_none())
+                    .map(|(key, c)| (tube_name.clone(), key.clone(), *c))
+            })
+            .collect();
+        if legacy.is_empty() || self.wal.is_none() {
+            return;
+        }
+        for (tube_name, key, cooldown) in legacy {
+            self.record_tombstone(&tube_name, key, cooldown.job_id, cooldown.expires_at);
+        }
+        if !self.sync_wal() {
+            tracing::error!("WAL: failed to persist cooldowns replayed from a pre-v8 WAL");
         }
     }
 
@@ -1300,7 +1373,12 @@ impl ServerState {
                 .tubes
                 .get(&tube_name)
                 .and_then(|t| t.idempotency_cooldowns.get(&key_tuple.0).copied());
-            if let Some((original_id, expiry)) = cooldown {
+            if let Some(Cooldown {
+                job_id: original_id,
+                expires_at: expiry,
+                ..
+            }) = cooldown
+            {
                 if SystemTime::now() < expiry {
                     if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                         tube.stat.idp_dedups.count(None);
@@ -1900,18 +1978,13 @@ impl ServerState {
         self.stats.total_delete_ct += 1;
 
         // Remove idempotency key from tube index (with optional cooldown)
-        let mut expiry_epoch_secs: u64 = 0;
         if let Some(ref key_tuple) = idempotency_key {
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.idempotency_keys.remove(&key_tuple.0);
             }
             if key_tuple.1 > 0 {
                 let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
-                expiry_epoch_secs = expires_at
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                self.insert_tombstone(&tube_name, key_tuple.0.clone(), id, expires_at);
+                self.record_tombstone(&tube_name, key_tuple.0.clone(), id, expires_at);
             }
         }
         if let Some(ref grp) = group_name
@@ -1928,15 +2001,8 @@ impl ServerState {
             gs.remove_waiting_job(id);
         }
 
-        // WAL: write delete state change (with tombstone expiry if applicable)
-        self.wal_write_state_change(
-            id,
-            None,
-            0,
-            Duration::ZERO,
-            expiry_epoch_secs,
-            StateChangeReason::None,
-        );
+        // WAL: write delete state change. A cooldown has its own record.
+        self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
 
         self.delete_job(id);
 
@@ -2155,18 +2221,13 @@ impl ServerState {
 
             // Idempotency key: drop the index entry, optionally leave a cooldown
             // tombstone (mirror cmd_delete:1452-1466).
-            let mut expiry_epoch_secs: u64 = 0;
             if let Some(ref key_tuple) = idempotency_key {
                 if let Some(tube) = self.tubes.get_mut(tube_name) {
                     tube.idempotency_keys.remove(&key_tuple.0);
                 }
                 if key_tuple.1 > 0 {
                     let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
-                    expiry_epoch_secs = expires_at
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    self.insert_tombstone(tube_name, key_tuple.0.clone(), id, expires_at);
+                    self.record_tombstone(tube_name, key_tuple.0.clone(), id, expires_at);
                 }
             }
 
@@ -2186,14 +2247,7 @@ impl ServerState {
 
             // WAL delete record, then drop the job from memory and collect its
             // external body for a single batched release.
-            self.wal_write_state_change(
-                id,
-                None,
-                0,
-                Duration::ZERO,
-                expiry_epoch_secs,
-                StateChangeReason::None,
-            );
+            self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
             if let Some(job) = self.take_job(id)
                 && let BodyRef::External(body_id) = job.body
             {
@@ -3999,11 +4053,16 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             .filter(|v| *v < crate::wal::WAL_VERSION);
         if let Some(min_version) = legacy_version {
             if !migrate_wal {
+                let what = if min_version < 5 {
+                    "Re-run with --migrate-wal to convert (small inline bodies stay \
+                     inline; large bodies are promoted into TOAST)."
+                } else {
+                    "Re-run with --migrate-wal to upgrade. No records are rewritten, \
+                     but older tuber versions can't read the files this one writes."
+                };
                 return Err(io::Error::other(format!(
                     "WAL contains v{min_version} records, but this binary writes \
-                     v{}. Re-run with --migrate-wal to convert (small inline bodies \
-                     stay inline; large bodies are promoted into TOAST). Back up \
-                     {} first if you want a rollback option.",
+                     v{}. {what} Back up {} first if you want a rollback option.",
                     crate::wal::WAL_VERSION,
                     dir.display(),
                 )));
@@ -4206,6 +4265,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         wal.set_body_store(Arc::clone(&body_store));
         state.wal = Some(wal);
         state.body_store = Some(body_store);
+        state.persist_legacy_cooldowns();
         tracing::info!(
             "WAL: replayed {} jobs and {} idempotency tombstones from {:?}",
             job_count,

@@ -345,6 +345,17 @@ impl ReadyQueue {
     }
 }
 
+/// An `idp:` key's cooldown after its job was deleted: a put with the key
+/// is answered with `job_id` until `expires_at`.
+#[derive(Debug, Clone, Copy)]
+pub struct Cooldown {
+    pub job_id: u64,
+    pub expires_at: SystemTime,
+    /// Its WAL tombstone record, which holds a reference on its segment
+    /// until the cooldown ends. `None` without persistence.
+    pub record: Option<crate::wal::RecordRef>,
+}
+
 #[derive(Debug)]
 pub struct Tube {
     /// Shared with every job in the tube via `Job.tube_name` — the
@@ -355,7 +366,7 @@ pub struct Tube {
     pub buried: VecDeque<u64>,
     pub stat: TubeStats,
     pub idempotency_keys: HashMap<String, u64>,
-    pub idempotency_cooldowns: HashMap<String, (u64, SystemTime)>,
+    pub idempotency_cooldowns: HashMap<String, Cooldown>,
     pub using_ct: u32,
     pub watching_ct: u32,
     pub pause: Duration,
