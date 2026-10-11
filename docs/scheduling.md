@@ -36,10 +36,10 @@ tuber = Tuber.new   # reads TUBER_URL
 result = tuber.schedules.sync("splat") do |s|
   s.add "histogram_rollup", tube: "splat.maintenance", cron: "5 * * * *",
         body: { class: "HistogramRollupJob", args: [] }.to_json,
-        idp: "histogram_rollup", con: 1, pri: 1024, ttr: 120
+        idp: "histogram_rollup", con: "maintenance", pri: 1024, ttr: 120
   s.add "data_retention", tube: "splat.maintenance",
         cron: "0 2 * * *", zone: "Australia/Melbourne",
-        body: { class: "DataRetentionJob", args: [] }.to_json, con: 1, pri: 1024, ttr: 120
+        body: { class: "DataRetentionJob", args: [] }.to_json, con: "maintenance", pri: 1024, ttr: 120
   s.add "monitor_evaluation", tube: "splat.checkins", every: 60,
         body: { class: "MonitorEvaluationJob", args: [] }.to_json,
         idp: "monitor_evaluation", pri: 1024, ttr: 120
@@ -54,10 +54,10 @@ byte length.
 ```
 schedule-begin splat
 SYNCING splat
-schedule-put histogram_rollup splat.maintenance 1024 0 120 40 idp:histogram_rollup con:1 5 * * * *
+schedule-put histogram_rollup splat.maintenance 1024 0 120 40 idp:histogram_rollup con:maintenance 5 * * * *
 {"class":"HistogramRollupJob","args":[]}
 STAGED
-schedule-put data_retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+schedule-put data_retention splat.maintenance 1024 0 120 38 con:maintenance 0 2 * * * Australia/Melbourne
 {"class":"DataRetentionJob","args":[]}
 STAGED
 schedule-put monitor_evaluation splat.checkins 1024 0 120 42 idp:monitor_evaluation every 60s
@@ -112,12 +112,15 @@ Where to sync:
 
 - **A release step** (Kamal `pre-deploy` hook, Heroku `release`, a Kubernetes
   Job) runs once per deploy with the new code. That's the natural fit when
-  tuber runs with `-b`, which persists the schedule across tuber restarts.
+  tuber runs with `-b`, which persists the schedule across tuber restarts. It
+  also has no rolling-deploy window at all, since app processes never sync.
 - **Process boot** (an initializer, or your worker's start hook) also works.
   Every replica sending the same set is harmless: an identical sync changes
   nothing, not even when entries next fire (`SYNCED 0 0 0 n`). Prefer this if
   tuber runs without `-b`: then a tuber restart forgets every schedule until
-  something syncs again.
+  something syncs again. One gap remains: an *old* process that crashes and
+  restarts during a rollout syncs the old set back until the next new
+  process boots.
 
 Avoid syncing from processes that don't run the app, such as a Rails console
 or one-off rake tasks. Those are harmless while they run the same release,
@@ -194,7 +197,7 @@ a priority, delay and TTR just like a put.
 | Tag | Use it to |
 |---|---|
 | `idp:<key>` | **Skip a fire while the previous fire's job is still in the tube.** Recommended for most recurring jobs: a slow run or a worker outage doesn't pile up copies. |
-| `con:<key>` | Run fires one at a time (`con:1` across entries serialises a maintenance tube) |
+| `con:<key>` | Run them one at a time. The value is a key, not a number: every job with `con:maintenance` shares one slot, so entries that share it run one after another. `con:<key>:<n>` allows `n` at once. (`con:1` is a key named `1`, shared with every other `con:1` job.) |
 | `catchup:<secs>` | Bound catch-up after downtime (below). `catchup:0` never catches up. |
 | `grp:`, `aft:` | As on `put` |
 
@@ -289,7 +292,7 @@ A deploy that switches over:
 - **Refuse an empty set by default** (rule 3).
 - **Don't sync on reconnect** (rule 4). Make syncing an explicit call the app
   makes at boot.
-- **`stats-schedule` values** contain `:`, `-` and quotes (times, `con:1`,
+- **`stats-schedule` values** contain `:`, `-` and quotes (times, `con:maintenance`,
   specs). Parse `key: value` lines by splitting on the first `": "` and
   stripping surrounding `"`. Don't run them through a YAML layer that rewrites
   values.

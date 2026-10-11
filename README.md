@@ -295,10 +295,10 @@ Tuber can put jobs on a timer itself, so an app doesn't need a scheduler process
 ```text
 schedule-begin splat
 SYNCING splat
-schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:1 5 * * * *
+schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:maintenance 5 * * * *
 {"class":"HistogramRollupJob","args":[]}
 STAGED
-schedule-put retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+schedule-put retention splat.maintenance 1024 0 120 38 con:maintenance 0 2 * * * Australia/Melbourne
 {"class":"DataRetentionJob","args":[]}
 STAGED
 schedule-commit

@@ -55,7 +55,7 @@ tuber.schedule_sync("splat") do |sync|
   YAML.load_file("config/schedule.yml").each do |name, e|
     sync.put(name,
              tube: e["tube"], pri: 1024, delay: 0, ttr: 120,
-             tags: e["tags"],                      # e.g. "idp:histogram_rollup con:1"
+             tags: e["tags"],                      # e.g. "idp:histogram_rollup con:maintenance"
              spec: e["cron"] || "every #{e['every']}",
              body: { class: e["class"], args: e["args"] || [] }.to_json)
   end
@@ -77,10 +77,10 @@ SYNCING splat
 schedule-put monitor_evaluation splat.checkins 1024 0 120 42 idp:monitor_evaluation every 60s
 {"class":"MonitorEvaluationJob","args":[]}
 STAGED
-schedule-put histogram_rollup splat.maintenance 1024 0 120 40 idp:histogram_rollup con:1 5 * * * *
+schedule-put histogram_rollup splat.maintenance 1024 0 120 40 idp:histogram_rollup con:maintenance 5 * * * *
 {"class":"HistogramRollupJob","args":[]}
 STAGED
-schedule-put data_retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+schedule-put data_retention splat.maintenance 1024 0 120 38 con:maintenance 0 2 * * * Australia/Melbourne
 {"class":"DataRetentionJob","args":[]}
 STAGED
   … six more …
@@ -150,7 +150,7 @@ tube: "splat.maintenance"
 pri: 1024
 delay: 0
 ttr: 120
-tags: "con:1"
+tags: "con:maintenance"
 catchup: "once"
 synced-at: 2026-10-11T15:02:11+11:00
 next-fire: 2026-10-12T02:00:00+11:00
@@ -261,8 +261,13 @@ exited. Syncing only at boot means the newest boot wins, which is right in
 both directions: a rollback boots v1 processes, and their sync restores v1's
 schedule. Because tuber persists schedules (decision 6), nothing needs
 re-sending after a reconnect. A tuber running without `-b` loses them on
-restart and gets them back from the next app process to boot; see
-[Later](#later) for a guard that would make reconnect re-syncs safe.
+restart and gets them back from the next app process to boot.
+
+Syncing at boot narrows the window but doesn't close it: an old process that
+crashes and restarts mid-rollout boots the old release and syncs the old set
+back, until the next new process boots. Syncing from a release step instead
+(once per deploy, with the new code) closes it, since no app process syncs
+at all. [Later](#later) has a guard that would close it for boot syncs too.
 
 ### 2. DST
 
@@ -517,7 +522,13 @@ Open when the proposal was written; settled 2026-10-11.
 | `storage_stats` | `splat.maintenance` | `7 * * * *` | `idp:storage_stats con:1` |
 | `storage_stats_deep` | `splat.maintenance` | `40 3 * * 0 Australia/Melbourne` | `idp:storage_stats_deep con:1` |
 
-All at pri 1024, delay 0, ttr 120. One visible change: the two intervals become
+All at pri 1024, delay 0, ttr 120. `con:1` is Splat's config as it stands: a
+concurrency *key* named `1`, not a limit, so the seven maintenance entries
+share one slot and run one at a time — with each other and with any other
+`con:1` job. That may well be the intent, but a named key
+(`con:maintenance`) says so; the examples elsewhere use one.
+
+One visible change: the two intervals become
 epoch-anchored, so `monitor_evaluation` fires at :00 of each minute rather than
 at an offset set by when the scheduler last booted.
 
@@ -535,10 +546,12 @@ Splat's seven asks, against this design:
 
 ## Later
 
-- **A generation on `schedule-begin`** (e.g. the app process's boot time), with
+- **A generation on `schedule-begin`** (a release number or deploy time), with
   tuber refusing a sync older than the one it holds. That would make
-  re-syncing on reconnect safe in a rolling deploy, for tubers run without
-  `-b`.
+  re-syncing on reconnect safe in a rolling deploy, and stop an old process
+  that restarts mid-rollout from syncing the old set back. The cost: a
+  rollback would then have to be done on purpose, by syncing with a newer
+  generation, rather than happening by itself.
 - Single-entry upsert and delete outside a sync, for hand-managed entries.
   Until then, hand-managed entries are just another owner (`ops`) synced from a
   file.

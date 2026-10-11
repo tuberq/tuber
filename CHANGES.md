@@ -6,9 +6,9 @@
 
 ```text
 schedule-begin splat
-schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:1 5 * * * *
+schedule-put rollup splat.maintenance 1024 0 120 40 idp:rollup con:maintenance 5 * * * *
 {"class":"HistogramRollupJob","args":[]}
-schedule-put retention splat.maintenance 1024 0 120 38 con:1 0 2 * * * Australia/Melbourne
+schedule-put retention splat.maintenance 1024 0 120 38 con:maintenance 0 2 * * * Australia/Melbourne
 {"class":"DataRetentionJob","args":[]}
 schedule-commit                                       → SYNCED 2 0 0 0
 ```
