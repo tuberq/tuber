@@ -2225,7 +2225,7 @@ fn sync_schedules(s: &mut ServerState, c: u64, entries: &[(&str, &str)]) {
         assert_eq!(s.handle_command(c, cmd, Some(b"{}".to_vec())), Response::Staged);
     }
     let resp = s.handle_command(c, Command::ScheduleCommit, None);
-    assert!(matches!(resp, Response::Synced { .. }), "got {resp:?}");
+    assert!(matches!(resp, Response::Synced(_)), "got {resp:?}");
 }
 
 fn next_fire(s: &ServerState, name: &str) -> jiff::Timestamp {

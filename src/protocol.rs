@@ -1,8 +1,6 @@
-use std::fmt;
-
-use crate::job::MAX_TUBE_NAME_LEN;
+use crate::job::{JobExt, MAX_TUBE_NAME_LEN};
 use crate::schedule::spec::Spec;
-use crate::schedule::{Catchup, Line};
+use crate::schedule::{Catchup, Line, SyncCounts};
 
 /// Commands parsed from the beanstalkd text protocol.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,95 +128,6 @@ pub enum Command {
     Quit,
 }
 
-/// The tuber tags a put can carry after `<bytes>`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PutTags {
-    pub idempotency_key: Option<(String, u32)>,
-    pub group: Option<String>,
-    pub after_group: Option<String>,
-    pub concurrency_key: Option<(String, u32)>,
-}
-
-impl PutTags {
-    /// Parse one `idp:`/`grp:`/`aft:`/`con:` tag into `self`. `Ok(false)`
-    /// when `part` is none of them.
-    fn parse_tag(&mut self, part: &str) -> Result<bool, Response> {
-        if let Some(val) = part.strip_prefix("idp:") {
-            // Parse idp:key or idp:key:N
-            if let Some(colon_pos) = val.rfind(':') {
-                let key_part = &val[..colon_pos];
-                let ttl_part = &val[colon_pos + 1..];
-                if !is_valid_key(key_part) {
-                    return Err(Response::BadFormat);
-                }
-                let ttl: u32 = ttl_part.parse().map_err(|_| Response::BadFormat)?;
-                self.idempotency_key = Some((key_part.to_string(), ttl));
-            } else {
-                if !is_valid_key(val) {
-                    return Err(Response::BadFormat);
-                }
-                self.idempotency_key = Some((val.to_string(), 0));
-            }
-        } else if let Some(val) = part.strip_prefix("grp:") {
-            if !is_valid_key(val) {
-                return Err(Response::BadFormat);
-            }
-            self.group = Some(val.to_string());
-        } else if let Some(val) = part.strip_prefix("aft:") {
-            if !is_valid_key(val) {
-                return Err(Response::BadFormat);
-            }
-            self.after_group = Some(val.to_string());
-        } else if let Some(val) = part.strip_prefix("con:") {
-            // Parse con:key or con:key:N
-            if let Some(colon_pos) = val.rfind(':') {
-                let key_part = &val[..colon_pos];
-                let limit_part = &val[colon_pos + 1..];
-                if !is_valid_key(key_part) {
-                    return Err(Response::BadFormat);
-                }
-                let limit: u32 = limit_part.parse().map_err(|_| Response::BadFormat)?;
-                if limit == 0 {
-                    return Err(Response::BadFormat);
-                }
-                self.concurrency_key = Some((key_part.to_string(), limit));
-            } else {
-                if !is_valid_key(val) {
-                    return Err(Response::BadFormat);
-                }
-                self.concurrency_key = Some((val.to_string(), 1));
-            }
-        } else {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-}
-
-/// The tags as a put line would carry them, defaults left out.
-impl fmt::Display for PutTags {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut tags = Vec::new();
-        match &self.idempotency_key {
-            Some((key, 0)) => tags.push(format!("idp:{key}")),
-            Some((key, ttl)) => tags.push(format!("idp:{key}:{ttl}")),
-            None => {}
-        }
-        if let Some(group) = &self.group {
-            tags.push(format!("grp:{group}"));
-        }
-        if let Some(after) = &self.after_group {
-            tags.push(format!("aft:{after}"));
-        }
-        match &self.concurrency_key {
-            Some((key, 1)) => tags.push(format!("con:{key}")),
-            Some((key, limit)) => tags.push(format!("con:{key}:{limit}")),
-            None => {}
-        }
-        f.write_str(&tags.join(" "))
-    }
-}
-
 /// Responses sent back to the client.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
@@ -260,12 +169,7 @@ pub enum Response {
     JobTooBig,
     Syncing(String),
     Staged,
-    Synced {
-        added: u32,
-        changed: u32,
-        removed: u32,
-        unchanged: u32,
-    },
+    Synced(SyncCounts),
     Aborted,
     BadSchedule,
     NotSyncing,
@@ -332,8 +236,8 @@ impl Response {
             Response::JobTooBig => buf.extend_from_slice(b"JOB_TOO_BIG\r\n"),
             Response::Syncing(owner) => { let _ = write!(buf, "SYNCING {owner}\r\n"); }
             Response::Staged => buf.extend_from_slice(b"STAGED\r\n"),
-            Response::Synced { added, changed, removed, unchanged } => {
-                let _ = write!(buf, "SYNCED {added} {changed} {removed} {unchanged}\r\n");
+            Response::Synced(c) => {
+                let _ = write!(buf, "SYNCED {} {} {} {}\r\n", c.added, c.changed, c.removed, c.unchanged);
             }
             Response::Aborted => buf.extend_from_slice(b"ABORTED\r\n"),
             Response::BadSchedule => buf.extend_from_slice(b"BAD_SCHEDULE\r\n"),
@@ -508,6 +412,60 @@ fn is_valid_key(s: &str) -> bool {
     is_valid_tube_name(s)
 }
 
+/// Parse one `idp:`/`grp:`/`aft:`/`con:` tag into `tags`. `Ok(false)`
+/// when `part` is none of them.
+fn parse_tag(tags: &mut JobExt, part: &str) -> Result<bool, Response> {
+    if let Some(val) = part.strip_prefix("idp:") {
+        // Parse idp:key or idp:key:N
+        if let Some(colon_pos) = val.rfind(':') {
+            let key_part = &val[..colon_pos];
+            let ttl_part = &val[colon_pos + 1..];
+            if !is_valid_key(key_part) {
+                return Err(Response::BadFormat);
+            }
+            let ttl: u32 = ttl_part.parse().map_err(|_| Response::BadFormat)?;
+            tags.idempotency_key = Some((key_part.to_string(), ttl));
+        } else {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            tags.idempotency_key = Some((val.to_string(), 0));
+        }
+    } else if let Some(val) = part.strip_prefix("grp:") {
+        if !is_valid_key(val) {
+            return Err(Response::BadFormat);
+        }
+        tags.group = Some(val.to_string());
+    } else if let Some(val) = part.strip_prefix("aft:") {
+        if !is_valid_key(val) {
+            return Err(Response::BadFormat);
+        }
+        tags.after_group = Some(val.to_string());
+    } else if let Some(val) = part.strip_prefix("con:") {
+        // Parse con:key or con:key:N
+        if let Some(colon_pos) = val.rfind(':') {
+            let key_part = &val[..colon_pos];
+            let limit_part = &val[colon_pos + 1..];
+            if !is_valid_key(key_part) {
+                return Err(Response::BadFormat);
+            }
+            let limit: u32 = limit_part.parse().map_err(|_| Response::BadFormat)?;
+            if limit == 0 {
+                return Err(Response::BadFormat);
+            }
+            tags.concurrency_key = Some((key_part.to_string(), limit));
+        } else {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            tags.concurrency_key = Some((val.to_string(), 1));
+        }
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn parse_put(rest: &str) -> Result<Command, Response> {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 4 {
@@ -518,9 +476,9 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
     let ttr = parts[2].parse::<u32>().map_err(|_| Response::BadFormat)?;
     let bytes = parts[3].parse::<u32>().map_err(|_| Response::BadFormat)?;
 
-    let mut tags = PutTags::default();
+    let mut tags = JobExt::default();
     for part in &parts[4..] {
-        if !tags.parse_tag(part)? {
+        if !parse_tag(&mut tags, part)? {
             return Err(Response::BadFormat);
         }
     }
@@ -595,7 +553,7 @@ fn parse_schedule_line(parts: &[&str]) -> Result<Line, Response> {
     let ttr = ttr.parse::<u32>().map_err(|_| Response::BadFormat)?;
     bytes.parse::<u32>().map_err(|_| Response::BadFormat)?;
 
-    let mut tags = PutTags::default();
+    let mut tags = JobExt::default();
     let mut catchup = Catchup::Once;
     let spec_at = rest.iter().position(|t| !t.contains(':')).unwrap_or(rest.len());
     for part in &rest[..spec_at] {
@@ -604,7 +562,7 @@ fn parse_schedule_line(parts: &[&str]) -> Result<Line, Response> {
                 0 => Catchup::Never,
                 secs => Catchup::Within(secs),
             };
-        } else if !tags.parse_tag(part)? {
+        } else if !parse_tag(&mut tags, part)? {
             return Err(Response::BadFormat);
         }
     }
@@ -1523,7 +1481,7 @@ mod tests {
     fn test_serialize_schedule_responses() {
         assert_eq!(Response::Syncing("splat".into()).serialize(), b"SYNCING splat\r\n");
         assert_eq!(Response::Staged.serialize(), b"STAGED\r\n");
-        let synced = Response::Synced { added: 1, changed: 2, removed: 3, unchanged: 4 };
+        let synced = Response::Synced(SyncCounts { added: 1, changed: 2, removed: 3, unchanged: 4 });
         assert_eq!(synced.serialize(), b"SYNCED 1 2 3 4\r\n");
         assert_eq!(Response::Aborted.serialize(), b"ABORTED\r\n");
         assert_eq!(Response::BadSchedule.serialize(), b"BAD_SCHEDULE\r\n");

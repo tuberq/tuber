@@ -28,66 +28,24 @@ impl ServerState {
         line: Result<Box<Line>, Response>,
         body: Option<Vec<u8>>,
     ) -> Response {
-        // Taken out only to stage into; its bytes stay counted meanwhile.
-        let Some(mut sync) = self
+        let (limit, in_use) = (self.max_job_bytes, self.memory_in_use());
+        let Some(sync) = self
             .conns
             .get_mut(&conn_id)
-            .and_then(|c| c.schedule_sync.take())
+            .and_then(|c| c.schedule_sync.as_mut())
         else {
             return Response::NotSyncing;
         };
-        let resp = self.stage(&mut sync, line, body);
-        if resp != Response::Staged {
-            sync.poisoned = true;
+        match sync.stage(line, body, limit, in_use) {
+            Ok(cost) => {
+                self.staged_schedule_bytes += cost;
+                Response::Staged
+            }
+            Err(resp) => {
+                sync.poisoned = true;
+                resp
+            }
         }
-        if let Some(conn) = self.conns.get_mut(&conn_id) {
-            conn.schedule_sync = Some(sync);
-        }
-        resp
-    }
-
-    fn stage(
-        &mut self,
-        sync: &mut Staging,
-        line: Result<Box<Line>, Response>,
-        body: Option<Vec<u8>>,
-    ) -> Response {
-        let line = match line {
-            Ok(line) => *line,
-            Err(resp) => return resp,
-        };
-        let Some(body) = body else {
-            return Response::InternalError;
-        };
-        if sync.entries.contains_key(&line.name) {
-            return Response::BadFormat;
-        }
-        let cost = schedule::memory_cost(&sync.owner, &line, &body);
-        if sync.entries.len() >= MAX_ENTRIES || self.staging_exceeds_budget(sync, cost) {
-            return Response::OutOfMemory;
-        }
-        sync.bytes += cost;
-        self.staged_schedule_bytes += cost;
-        sync.entries.insert(line.name.clone(), (line, body));
-        Response::Staged
-    }
-
-    /// Whether staging `cost` more bytes into `sync` would take memory past
-    /// `--max-jobs-size`. Staging on every connection counts — it is all held
-    /// in memory — but this sync is credited with the owner's current
-    /// entries, since its commit replaces them: resyncing an unchanged set
-    /// needs no room beyond what the set already has.
-    fn staging_exceeds_budget(&self, sync: &Staging, cost: u64) -> bool {
-        let Some(limit) = self.max_job_bytes else {
-            return false;
-        };
-        let other_syncs = self.staged_schedule_bytes.saturating_sub(sync.bytes);
-        let growth = (sync.bytes + cost).saturating_sub(sync.held_bytes);
-        self.total_job_bytes
-            .saturating_add(self.schedules.bytes())
-            .saturating_add(other_syncs)
-            .saturating_add(growth)
-            > limit
     }
 
     /// End `conn_id`'s sync, if it has one, releasing what it staged from
@@ -141,12 +99,7 @@ impl ServerState {
             unchanged = counts.unchanged,
             "schedule sync committed",
         );
-        Response::Synced {
-            added: counts.added,
-            changed: counts.changed,
-            removed: counts.removed,
-            unchanged: counts.unchanged,
-        }
+        Response::Synced(counts)
     }
 
     pub(super) fn cmd_schedule_abort(&mut self, conn_id: u64) -> Response {
@@ -333,19 +286,9 @@ impl ServerState {
             let Some(e) = self.schedules.get(&owner, &name) else {
                 continue;
             };
-            let line = e.line.clone();
-            let resp = self.put_job(
-                None,
-                line.tube,
-                line.pri,
-                line.delay,
-                line.ttr,
-                Some(e.body.clone()),
-                line.tags.idempotency_key,
-                line.tags.group,
-                line.tags.after_group,
-                line.tags.concurrency_key,
-            );
+            let (tube, tags, body) = (e.line.tube.clone(), e.line.tags.clone(), e.body.clone());
+            let (pri, delay, ttr) = (e.line.pri, e.line.delay, e.line.ttr);
+            let resp = self.put_job(None, tube, pri, delay, ttr, Some(body), tags);
             self.record_fire(&owner, &name, &resp);
         }
     }

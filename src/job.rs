@@ -164,12 +164,41 @@ impl JobState {
 /// Extension keys carried by `idp:`/`grp:`/`aft:`/`con:` put tags. Most
 /// jobs have none, so `Job` holds these behind `Option<Box<JobExt>>` —
 /// see the field comment there. Allocate only when a tag is present.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobExt {
     pub idempotency_key: Option<(String, u32)>,
     pub group: Option<String>,
     pub after_group: Option<String>,
     pub concurrency_key: Option<(String, u32)>,
+}
+
+/// The tags as a put line would carry them, defaults left out.
+impl std::fmt::Display for JobExt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        let mut tag = |f: &mut std::fmt::Formatter<'_>, args: std::fmt::Arguments<'_>| {
+            let r = write!(f, "{sep}{args}");
+            sep = " ";
+            r
+        };
+        match &self.idempotency_key {
+            Some((key, 0)) => tag(f, format_args!("idp:{key}"))?,
+            Some((key, ttl)) => tag(f, format_args!("idp:{key}:{ttl}"))?,
+            None => {}
+        }
+        if let Some(group) = &self.group {
+            tag(f, format_args!("grp:{group}"))?;
+        }
+        if let Some(after) = &self.after_group {
+            tag(f, format_args!("aft:{after}"))?;
+        }
+        match &self.concurrency_key {
+            Some((key, 1)) => tag(f, format_args!("con:{key}"))?,
+            Some((key, limit)) => tag(f, format_args!("con:{key}:{limit}"))?,
+            None => {}
+        }
+        Ok(())
+    }
 }
 
 impl JobExt {

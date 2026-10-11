@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 
 use jiff::Timestamp;
 
-use crate::protocol::PutTags;
+use crate::job::JobExt;
+use crate::protocol::Response;
 use spec::Spec;
 
 /// Most entries held across all owners. Keeps the schedule files and the
@@ -56,7 +57,7 @@ pub struct Line {
     pub pri: u32,
     pub delay: u32,
     pub ttr: u32,
-    pub tags: PutTags,
+    pub tags: JobExt,
     pub catchup: Catchup,
     pub spec: Spec,
     /// The spec as the app wrote it, for display.
@@ -140,10 +141,39 @@ impl Staging {
             held_bytes,
         }
     }
+
+    /// Stage one entry, returning its memory cost. `in_use` is everything
+    /// already counted against `limit` (`--max-jobs-size`), this sync's
+    /// staging included. The sync is credited with the owner's current
+    /// entries, since its commit replaces them: resyncing an unchanged set
+    /// needs no room beyond what the set already has.
+    pub fn stage(
+        &mut self,
+        line: Result<Box<Line>, Response>,
+        body: Option<Vec<u8>>,
+        limit: Option<u64>,
+        in_use: u64,
+    ) -> Result<u64, Response> {
+        let line = *line?;
+        let body = body.ok_or(Response::InternalError)?;
+        if self.entries.contains_key(&line.name) {
+            return Err(Response::BadFormat);
+        }
+        let cost = memory_cost(&self.owner, &line, &body);
+        let growth = (self.bytes + cost).saturating_sub(self.held_bytes);
+        let over_budget =
+            limit.is_some_and(|limit| in_use.saturating_sub(self.bytes) + growth > limit);
+        if self.entries.len() >= MAX_ENTRIES || over_budget {
+            return Err(Response::OutOfMemory);
+        }
+        self.bytes += cost;
+        self.entries.insert(line.name.clone(), (line, body));
+        Ok(cost)
+    }
 }
 
 /// Reply counts for `schedule-commit`.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyncCounts {
     pub added: u32,
     pub changed: u32,
@@ -281,7 +311,7 @@ mod tests {
             pri: 1024,
             delay: 0,
             ttr: 120,
-            tags: PutTags::default(),
+            tags: JobExt::default(),
             catchup: Catchup::Once,
             spec: Spec::parse(spec).unwrap(),
             spec_text: spec.to_string(),

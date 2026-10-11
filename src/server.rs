@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::body_store::BodyStore;
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
-use crate::job::{BodyId, BodyRef, Job, JobState, URGENT_THRESHOLD};
+use crate::job::{BodyId, BodyRef, Job, JobExt, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, MAX_DELETE_BATCH, Response};
 use crate::tube::{Tube, TubeStats};
 use crate::wal::{IdpTombstone, StateChangeReason, Wal};
@@ -586,22 +586,20 @@ impl ServerState {
         key.len() as u64 + TOMBSTONE_OVERHEAD_BYTES
     }
 
+    /// Everything counted against `--max-jobs-size`: jobs, and schedule
+    /// entries committed and staged. Schedule bytes are kept apart from
+    /// `total_job_bytes` so its drift detector stays about jobs alone.
+    fn memory_in_use(&self) -> u64 {
+        self.total_job_bytes
+            .saturating_add(self.schedules.bytes())
+            .saturating_add(self.staged_schedule_bytes)
+    }
+
     /// True iff adding `additional` bytes would exceed the configured budget.
-    /// Returns false (allow) when `max_job_bytes` is `None`. Schedule entries,
-    /// committed and staged, share the budget with jobs; their bytes are kept
-    /// apart from `total_job_bytes` so its drift detector stays about jobs
-    /// alone.
+    /// Returns false (allow) when `max_job_bytes` is `None`.
     fn memory_limit_exceeded(&self, additional: u64) -> bool {
-        match self.max_job_bytes {
-            Some(limit) => {
-                self.total_job_bytes
-                    .saturating_add(self.schedules.bytes())
-                    .saturating_add(self.staged_schedule_bytes)
-                    .saturating_add(additional)
-                    > limit
-            }
-            None => false,
-        }
+        self.max_job_bytes
+            .is_some_and(|limit| self.memory_in_use().saturating_add(additional) > limit)
     }
 
     /// True iff a put of `body_len` bytes would push WAL + TOAST disk usage
@@ -1126,18 +1124,13 @@ impl ServerState {
             .get(&conn_id)
             .map(|c| c.use_tube.clone())
             .unwrap_or_else(|| "default".to_string());
-        self.put_job(
-            Some(conn_id),
-            tube_name,
-            pri,
-            delay,
-            ttr,
-            body,
+        let ext = JobExt {
             idempotency_key,
             group,
             after_group,
             concurrency_key,
-        )
+        };
+        self.put_job(Some(conn_id), tube_name, pri, delay, ttr, body, ext)
     }
 
     /// Put a job into `tube_name`: a client's `put` into its `use` tube
@@ -1152,10 +1145,7 @@ impl ServerState {
         delay: u32,
         ttr: u32,
         body: Option<Vec<u8>>,
-        idempotency_key: Option<(String, u32)>,
-        group: Option<String>,
-        after_group: Option<String>,
-        concurrency_key: Option<(String, u32)>,
+        ext: JobExt,
     ) -> Response {
         if self.drain_mode {
             return Response::Draining;
@@ -1181,7 +1171,8 @@ impl ServerState {
         // When persistence is on, body bytes leave RAM and live in the
         // external body store, so they don't count toward the in-memory
         // budget. The disk side is enforced separately just below.
-        let tombstone_cost = idempotency_key
+        let tombstone_cost = ext
+            .idempotency_key
             .as_ref()
             .filter(|(_, ttl)| *ttl > 0)
             .map(|(k, _)| k.len() as u64 + TOMBSTONE_OVERHEAD_BYTES)
@@ -1217,7 +1208,7 @@ impl ServerState {
 
         // Idempotency dedup: if key already exists for a live job, return original ID + state.
         // If the new put has a higher priority (lower number), upgrade the existing job's priority.
-        if let Some(ref key_tuple) = idempotency_key
+        if let Some(ref key_tuple) = ext.idempotency_key
             && let Some(&existing_id) = self
                 .tubes
                 .get(&tube_name)
@@ -1273,7 +1264,7 @@ impl ServerState {
         }
 
         // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
-        if let Some(ref key_tuple) = idempotency_key {
+        if let Some(ref key_tuple) = ext.idempotency_key {
             let cooldown = self
                 .tubes
                 .get(&tube_name)
@@ -1299,10 +1290,10 @@ impl ServerState {
                 crate::job::should_externalize(body.len(), self.body_store.is_some());
             let est_size = crate::wal::estimate_full_job_size_raw(
                 &tube_name,
-                idempotency_key.as_ref().map(|(k, _)| k.as_str()),
-                group.as_deref(),
-                after_group.as_deref(),
-                concurrency_key.as_ref().map(|(k, _)| k.as_str()),
+                ext.idempotency_key.as_ref().map(|(k, _)| k.as_str()),
+                ext.group.as_deref(),
+                ext.after_group.as_deref(),
+                ext.concurrency_key.as_ref().map(|(k, _)| k.as_str()),
                 body.len(),
                 will_externalize,
             );
@@ -1361,12 +1352,7 @@ impl ServerState {
 
         // Set extension fields before inserting (no allocation when the
         // put carried no tags — the common case)
-        job.set_ext(crate::job::JobExt {
-            idempotency_key,
-            group,
-            after_group,
-            concurrency_key,
-        });
+        job.set_ext(ext);
 
         // Concurrency limit is registered lazily in `acquire_concurrency_key`
         // (on reserve), not here. Registering eagerly at put time leaked the
@@ -4132,7 +4118,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // the actual in-memory cost.
         // Restored schedule entries share the budget.
         if let Some(max) = max_job_bytes
-            && state.total_job_bytes + state.schedules.bytes() > max
+            && state.memory_in_use() > max
         {
             let jobs = state.total_job_bytes;
             let schedules = state.schedules.bytes();
