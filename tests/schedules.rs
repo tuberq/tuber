@@ -273,6 +273,11 @@ async fn a_malformed_line_aborts_the_sync() {
     c.ck("schedule-put a maint", "BAD_FORMAT").await;
     c.ck("schedule-commit", "ABORTED").await;
 
+    // No arguments at all.
+    c.ck("schedule-begin splat", "SYNCING splat").await;
+    c.ck("schedule-put", "BAD_FORMAT").await;
+    c.ck("schedule-commit", "ABORTED").await;
+
     // Same name twice in one sync.
     c.ck("schedule-begin splat", "SYNCING splat").await;
     assert_eq!(

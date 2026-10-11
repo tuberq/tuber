@@ -446,6 +446,10 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_schedule_begin(rest)
     } else if let Some(rest) = line.strip_prefix("schedule-put ") {
         Ok(parse_schedule_put(rest))
+    } else if line == "schedule-put" {
+        // Still a schedule-put, however malformed: it must reach the
+        // engine, or the sync it was meant for could commit without it.
+        Ok(parse_schedule_put(""))
     } else if line == "schedule-commit" {
         Ok(Command::ScheduleCommit)
     } else if line == "schedule-abort" {
