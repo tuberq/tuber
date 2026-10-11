@@ -681,6 +681,28 @@ fn quarantine_corrupt_segment(path: &Path) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// The error that stops a replay at a damaged segment. `damage` completes
+/// "WAL segment <path> ...". `older` says a newer segment exists, which a
+/// crash can't explain: rotation fsyncs a segment before creating the next.
+fn damaged_segment_error(path: &Path, damage: &str, older: bool) -> io::Error {
+    let why = if older {
+        "It is not the newest segment, so this is not a write cut short by a crash: \
+         its records were fsynced. "
+    } else {
+        ""
+    };
+    io::Error::other(format!(
+        "WAL segment {} {damage}. {why}Replaying past the damage would lose the \
+         changes recorded there: a lost delete brings its job back, and a lost put \
+         loses its job. \
+         Restore the WAL directory from a backup, or start with --wal-skip-corrupt \
+         (env TUBER_WAL_SKIP_CORRUPT) to replay what remains, keeping the damaged \
+         segment as {}.",
+        path.display(),
+        corrupt_sidecar_path(path).display(),
+    ))
+}
+
 fn write_header(w: &mut impl Write) -> io::Result<()> {
     w.write_all(WAL_MAGIC)?;
     w.write_all(&WAL_VERSION.to_le_bytes())?;
@@ -749,6 +771,10 @@ pub struct WalConfig {
     /// (blocking the caller until durable). Positive values bound how much committed
     /// state can be lost on crash.
     pub sync_interval: Duration,
+    /// Let replay carry on past a damaged segment, setting it aside as
+    /// `.corrupt` (`--wal-skip-corrupt`). Without it, damage that a crash
+    /// can't explain stops the replay with an error; see [`Wal::replay`].
+    pub skip_corrupt: bool,
 }
 
 impl Default for WalConfig {
@@ -756,6 +782,7 @@ impl Default for WalConfig {
         WalConfig {
             max_file_size: None,
             sync_interval: DEFAULT_SYNC_INTERVAL,
+            skip_corrupt: false,
         }
     }
 }
@@ -765,7 +792,7 @@ impl WalConfig {
     pub fn with_max_file_size(max: usize) -> Self {
         WalConfig {
             max_file_size: Some(max),
-            sync_interval: DEFAULT_SYNC_INTERVAL,
+            ..WalConfig::default()
         }
     }
 }
@@ -774,6 +801,8 @@ pub struct Wal {
     dir: PathBuf,
     max_file_size: usize,
     sync_interval: Duration,
+    /// See [`WalConfig::skip_corrupt`].
+    skip_corrupt: bool,
     last_sync_at: Instant,
     files: VecDeque<WalFile>,
     next_seq: u64,
@@ -900,6 +929,7 @@ impl Wal {
             dir: dir.to_path_buf(),
             max_file_size: config.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
             sync_interval: config.sync_interval,
+            skip_corrupt: config.skip_corrupt,
             last_sync_at: Instant::now(),
             files: VecDeque::new(),
             next_seq: 1,
@@ -1295,6 +1325,13 @@ impl Wal {
     /// the WAL order of its last bury event — callers use it to rebuild
     /// each tube's buried FIFO oldest-first, which a bare iteration over
     /// the returned map cannot (hash order loses bury order).
+    ///
+    /// A crash can only damage the newest segment, by cutting its last
+    /// writes short, and replay truncates that quietly. Anything else — a
+    /// corrupt record or bad header in an older segment, or any segment
+    /// that can't be read — means records that were once durable are lost,
+    /// so replay returns an error before touching the disk, unless
+    /// `skip_corrupt` lets it set the segment aside as `.corrupt` and go on.
     pub fn replay(&mut self) -> io::Result<ReplayOutcome> {
         let mut jobs: HashMap<u64, Box<Job>> = HashMap::new();
         let mut max_id: u64 = 0;
@@ -1346,9 +1383,17 @@ impl Wal {
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
         for (idx, (seq, path)) in file_infos.iter().enumerate() {
+            let older = *seq != newest_seq;
             let data = match fs::read(path) {
                 Ok(d) => d,
                 Err(e) => {
+                    if !self.skip_corrupt {
+                        return Err(damaged_segment_error(
+                            path,
+                            &format!("is unreadable ({e})"),
+                            older,
+                        ));
+                    }
                     match quarantine_corrupt_segment(path) {
                         Ok(dest) => tracing::error!(
                             "WAL: unreadable segment {:?} ({}); quarantined to {:?}",
@@ -1399,6 +1444,13 @@ impl Wal {
                         }
                         removed_seqs.push(*seq);
                         continue;
+                    }
+                    if older && !self.skip_corrupt {
+                        return Err(damaged_segment_error(
+                            path,
+                            &format!("has a bad header ({e})"),
+                            older,
+                        ));
                     }
                     match quarantine_corrupt_segment(path) {
                         Ok(dest) => tracing::error!(
@@ -1556,6 +1608,13 @@ impl Wal {
                         offset += consumed;
                     }
                     Err(e) => {
+                        if older && !self.skip_corrupt {
+                            let damage = format!(
+                                "has a corrupt record at offset {offset} of {} bytes ({e})",
+                                data.len()
+                            );
+                            return Err(damaged_segment_error(path, &damage, older));
+                        }
                         tracing::error!(
                             "WAL: corrupt record in {:?} at offset {}: {}; preserving a .corrupt copy then truncating",
                             path,
@@ -2299,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_quarantines_truncated_older_segment() {
+    fn test_replay_refuses_truncated_older_segment() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
 
@@ -2333,16 +2392,213 @@ mod tests {
             f.set_len(3).unwrap();
         }
 
-        // The truncated middle segment is data loss: it must be preserved
-        // as .corrupt evidence, never silently deleted.
+        // The truncated older segment is data loss: replay must stop, and
+        // leave it exactly as found.
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, _, _, _, _) = wal.replay().unwrap();
-        assert!(jobs.is_empty());
+        let msg = replay_refusal(&mut wal);
+        assert!(msg.contains("binlog.000001"), "{msg}");
+        assert_eq!(
+            fs::metadata(&seg1).unwrap().len(),
+            3,
+            "segment left as found"
+        );
+        assert!(!corrupt_sidecar_path(&seg1).exists());
+    }
+
+    /// Four segments of one record each: put 1, put 2, delete 1, put 3. A
+    /// clean replay leaves jobs 2 and 3.
+    fn write_one_record_per_segment(dir: &Path) {
+        let mut wal = Wal::open(dir, WalConfig::with_max_file_size(1)).unwrap();
+        let mut jobs: Vec<Job> = (1..=3)
+            .map(|id| {
+                let mut job = Job::new(
+                    id,
+                    10,
+                    Duration::ZERO,
+                    Duration::from_secs(60),
+                    b"body".to_vec(),
+                    "default".to_string(),
+                );
+                external_body(&mut job);
+                job
+            })
+            .collect();
+        wal.write_put(&mut jobs[0]).unwrap();
+        wal.write_put(&mut jobs[1]).unwrap();
+        wal.write_state_change(
+            &mut jobs[0],
+            None,
+            10,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
+        wal.write_put(&mut jobs[2]).unwrap();
+        wal.sync().unwrap();
+        assert_eq!(wal.file_count(), 4, "one record per segment");
+    }
+
+    fn segment(dir: &Path, seq: u64) -> PathBuf {
+        dir.join(format!("{}{:06}", FILE_PREFIX, seq))
+    }
+
+    /// Replay `wal`, which must refuse; the refusal's message.
+    fn replay_refusal(wal: &mut Wal) -> String {
+        match wal.replay() {
+            Ok((jobs, ..)) => panic!("replay went ahead, with jobs {:?}", jobs.keys()),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--wal-skip-corrupt"),
+                    "names the way out: {msg}"
+                );
+                msg
+            }
+        }
+    }
+
+    #[test]
+    fn test_replay_refuses_corrupt_record_in_older_segment() {
+        // Segment 3 holds job 1's delete. Skipping it would bring job 1
+        // back, so replay must stop rather than truncate and carry on.
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg3 = segment(dir.path(), 3);
+        let mut data = fs::read(&seg3).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 0xFF;
+        fs::write(&seg3, &data).unwrap();
+
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let msg = replay_refusal(&mut wal);
+        assert!(msg.contains("binlog.000003"), "{msg}");
+        assert!(msg.contains(&format!("offset {HEADER_SIZE}")), "{msg}");
+        assert_eq!(fs::read(&seg3).unwrap(), data, "segment left as found");
+        assert!(!corrupt_sidecar_path(&seg3).exists());
+    }
+
+    #[test]
+    fn test_replay_refuses_bad_header_in_older_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg1 = segment(dir.path(), 1);
+        let mut data = fs::read(&seg1).unwrap();
+        data[..4].copy_from_slice(b"XXXX");
+        fs::write(&seg1, &data).unwrap();
+
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let msg = replay_refusal(&mut wal);
+        assert!(msg.contains("binlog.000001"), "{msg}");
+        assert_eq!(fs::read(&seg1).unwrap(), data, "segment left as found");
+        assert!(!corrupt_sidecar_path(&seg1).exists());
+    }
+
+    #[test]
+    fn test_crash_recovery_then_a_new_segment_does_not_refuse_the_next_restart() {
+        // A torn tail in the newest segment is truncated on replay. The next
+        // write starts a new segment, so the repaired one becomes an older
+        // segment, and the restart after that must not mistake it for damage.
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg4 = segment(dir.path(), 4);
+        OpenOptions::new()
+            .append(true)
+            .open(&seg4)
+            .unwrap()
+            .write_all(&[0xDE, 0xAD, 0xBE])
+            .unwrap();
+
+        {
+            let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+            let (mut jobs, ..) = wal.replay().unwrap();
+            let job = jobs.get_mut(&3).unwrap();
+            wal.write_state_change(job, None, 10, Duration::ZERO, 0, StateChangeReason::None)
+                .unwrap();
+            wal.sync().unwrap();
+            assert_eq!(wal.file_count(), 5, "the write started segment 5");
+        }
+
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let (jobs, ..) = wal.replay().unwrap();
+        assert_eq!(jobs.keys().copied().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn test_replay_skip_corrupt_keeps_a_copy_and_truncates_older_segment() {
+        // The override restores the old behaviour, with its cost: job 1's
+        // delete is lost, so job 1 comes back.
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg3 = segment(dir.path(), 3);
+        let mut data = fs::read(&seg3).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 0xFF;
+        fs::write(&seg3, &data).unwrap();
+
+        let config = WalConfig {
+            skip_corrupt: true,
+            ..WalConfig::default()
+        };
+        let mut wal = Wal::open(dir.path(), config).unwrap();
+        let (jobs, ..) = wal.replay().unwrap();
+        let mut ids: Vec<u64> = jobs.keys().copied().collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "job 1's delete was in the damaged record"
+        );
+        assert_eq!(fs::read(corrupt_sidecar_path(&seg3)).unwrap(), data);
+        assert_eq!(fs::metadata(&seg3).unwrap().len(), HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn test_replay_skip_corrupt_quarantines_truncated_older_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg1 = segment(dir.path(), 1);
+        OpenOptions::new()
+            .write(true)
+            .open(&seg1)
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+
+        let config = WalConfig {
+            skip_corrupt: true,
+            ..WalConfig::default()
+        };
+        let mut wal = Wal::open(dir.path(), config).unwrap();
+        let (jobs, ..) = wal.replay().unwrap();
+        let mut ids: Vec<u64> = jobs.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3]);
         assert!(!seg1.exists(), "truncated segment must be renamed away");
         assert!(
             corrupt_sidecar_path(&seg1).exists(),
             "truncated older segment must be quarantined, not deleted"
         );
+        // GC must not choke on the (now untracked) quarantined file.
+        wal.gc();
+    }
+
+    #[test]
+    fn test_replay_refuses_unreadable_segment() {
+        // A directory where segment 2 should be fails the read, standing in
+        // for EIO or a permissions mistake. Neither is a crash artifact, and
+        // setting the segment aside would drop records that are fine.
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg2 = segment(dir.path(), 2);
+        fs::remove_file(&seg2).unwrap();
+        fs::create_dir(&seg2).unwrap();
+
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        let msg = replay_refusal(&mut wal);
+        assert!(msg.contains("binlog.000002"), "{msg}");
+        assert!(seg2.is_dir(), "segment left as found");
+        assert!(!corrupt_sidecar_path(&seg2).exists());
     }
 
     #[test]
@@ -3316,6 +3572,7 @@ mod tests {
         WalConfig {
             max_file_size: Some(max),
             sync_interval: interval,
+            skip_corrupt: false,
         }
     }
 

@@ -193,6 +193,15 @@ enum Commands {
         #[arg(long, env = "TUBER_MIGRATE_WAL")]
         migrate_wal: bool,
 
+        /// Start even when an older WAL segment is damaged (a corrupt record
+        /// or bad header) or a segment can't be read, replaying what remains
+        /// and keeping the damaged segment as `<segment>.corrupt`. Without
+        /// this the server refuses to start, since replaying past a lost
+        /// delete brings its job back. A write cut short at the end of the
+        /// newest segment is what a crash leaves, and is truncated either way.
+        #[arg(long, env = "TUBER_WAL_SKIP_CORRUPT")]
+        wal_skip_corrupt: bool,
+
         /// Increase verbosity (-V for info, -VV for debug)
         #[arg(short = 'V', action = clap::ArgAction::Count, env = "TUBER_VERBOSE")]
         verbose: u8,
@@ -332,6 +341,7 @@ async fn run() {
             tcp_keepalive,
             max_storage_bytes,
             migrate_wal,
+            wal_skip_corrupt,
             verbose,
             metrics_port,
             name,
@@ -359,6 +369,11 @@ async fn run() {
                         "--migrate-wal / TUBER_MIGRATE_WAL is ignored without --binlog-dir (running in-memory)"
                     );
                 }
+                if wal_skip_corrupt {
+                    tracing::warn!(
+                        "--wal-skip-corrupt / TUBER_WAL_SKIP_CORRUPT is ignored without --binlog-dir (running in-memory)"
+                    );
+                }
                 if max_storage_bytes.is_some() {
                     tracing::warn!(
                         "--max-storage-bytes / TUBER_MAX_STORAGE_BYTES is ignored without --binlog-dir (running in-memory)"
@@ -379,6 +394,7 @@ async fn run() {
                 binlog_dir.as_deref(),
                 sync_interval,
                 migrate_wal,
+                wal_skip_corrupt,
                 metrics_port,
                 name,
                 max_connections,

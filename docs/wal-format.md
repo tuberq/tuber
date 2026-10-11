@@ -287,10 +287,29 @@ you want a rollback option.
 
 ### Corruption handling
 
-Corrupt or truncated records terminate processing of that file (with a
-warning). Valid records before the corruption point are preserved. The
-file is truncated at the corrupt offset to prevent repeated warnings on
-future restarts.
+A crash can only damage the **newest** segment: it cuts the last writes
+short. A corrupt or truncated record there ends processing of that file;
+the valid records before it are kept, a copy of the whole segment is kept
+as `<segment>.corrupt`, and the file is truncated at the bad offset so the
+next restart doesn't trip on it again. A newest segment shorter than its
+header (a crash between creating it and fsyncing the header) holds no
+records and is removed.
+
+Damage anywhere else stops the server from starting:
+
+- a corrupt or truncated record, or a bad header, in an **older**
+  segment. Rotation fsyncs a segment before creating the next one, and
+  creating a segment fsyncs its header, so a crash can't explain it.
+  Records there were durable.
+- any segment, newest included, that can't be read (EIO, permissions).
+
+Replaying past either would lose the changes recorded there. A lost
+delete brings its job back, and a lost put loses its job. The error
+names the segment and the damage, and nothing on disk is changed. Restore the WAL
+directory from a backup, or start with `--wal-skip-corrupt` (env
+`TUBER_WAL_SKIP_CORRUPT`) to replay what remains. A segment with a bad
+header or a read error is then renamed to `<segment>.corrupt`, and one
+with a corrupt record is copied there and truncated at the bad offset.
 
 ## Durability
 

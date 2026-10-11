@@ -2397,8 +2397,8 @@ fn test_reserve_batch_partial_wins_over_body_store_error() {
 fn make_wal_state(dir: &std::path::Path, sync_interval: Duration) -> ServerState {
     let mut s = make_state();
     let config = crate::wal::WalConfig {
-        max_file_size: None,
         sync_interval,
+        ..Default::default()
     };
     s.wal = Some(crate::wal::Wal::open(dir, config).unwrap());
     s

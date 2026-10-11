@@ -50,6 +50,8 @@ Two on-disk stores side by side:
 
 **Disk budget:** `--max-storage-bytes` caps WAL + TOAST combined. Puts return `OUT_OF_STORAGE` once the budget minus a one-WAL-segment reserve (≤10 MiB) would be exceeded; state changes (delete/release/bury/kick/touch) always succeed.
 
+**WAL corruption at startup:** replay truncates a torn tail in the newest segment quietly (what a crash leaves). A corrupt record or bad header in an older segment, or any unreadable segment, makes `Wal::replay` return an error before touching the disk; `--wal-skip-corrupt` (`WalConfig::skip_corrupt`) replays past it, keeping the segment as `.corrupt`.
+
 **WAL I/O failure:** a WAL write or fsync error drops the WAL for good (`ServerState::fail_wal`; the fd is never retried). Puts get `INTERNAL_ERROR` until restart, as do strict-mode acks for the batch that failed; state changes on existing jobs still apply in memory. `binlog-enabled` / `tuber_binlog_enabled` go false/0.
 
 **Sync interval:** `--sync-interval` (env `TUBER_SYNC_INTERVAL`, default 100 ms) drives both stores. `--wal-sync-interval` is accepted as a hidden alias for backwards compatibility.

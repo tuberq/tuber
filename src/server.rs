@@ -3877,6 +3877,7 @@ struct StateConfig<'a> {
     wal_dir: Option<&'a Path>,
     sync_interval: Duration,
     migrate_wal: bool,
+    wal_skip_corrupt: bool,
     name: Option<String>,
     fd_budget: Arc<FdBudget>,
 }
@@ -3899,6 +3900,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         wal_dir,
         sync_interval,
         migrate_wal,
+        wal_skip_corrupt,
         name,
         fd_budget,
     } = cfg;
@@ -3932,6 +3934,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             crate::wal::WalConfig {
                 max_file_size: None,
                 sync_interval,
+                skip_corrupt: wal_skip_corrupt,
             },
         )?;
 
@@ -4158,6 +4161,7 @@ pub async fn run(
     wal_dir: Option<&str>,
     sync_interval: Duration,
     migrate_wal: bool,
+    wal_skip_corrupt: bool,
     metrics_port: Option<u16>,
     name: Option<String>,
     max_connections: Option<usize>,
@@ -4177,6 +4181,7 @@ pub async fn run(
         wal_dir: wal_path,
         sync_interval,
         migrate_wal,
+        wal_skip_corrupt,
         name: name.clone(),
         fd_budget: Arc::clone(&fd_budget),
     })?;
@@ -4294,6 +4299,7 @@ pub async fn run_with_listener_limited(
         wal_dir,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal,
+        wal_skip_corrupt: false,
         name,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
     })?;
@@ -4317,6 +4323,7 @@ pub async fn run_with_listener_sync_zero(
         wal_dir: Some(wal_dir),
         sync_interval: Duration::ZERO,
         migrate_wal: true,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
     })?;
@@ -4338,6 +4345,7 @@ pub async fn run_with_listener_max_connections(
         wal_dir: None,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal: false,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(max_connections))),
     })?;
@@ -4359,6 +4367,7 @@ pub async fn run_with_listener_idle_timeout(
         wal_dir: None,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal: false,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_idle_timeout(Some(idle_timeout))),
     })?;
@@ -4379,6 +4388,7 @@ pub async fn run_with_listener_tcp_keepalive(
         wal_dir: None,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal: false,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_tcp_keepalive(idle)),
     })?;

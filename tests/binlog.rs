@@ -1955,3 +1955,155 @@ async fn test_wal_disk_full_refuses_puts_and_loses_no_acked_job() {
     assert_eq!(enabled_before.as_deref(), Some("1"));
     assert_eq!(enabled_after.as_deref(), Some("0"));
 }
+
+/// Four WAL segments of one record each: put 1, put 2, delete 1, put 3.
+/// Bodies are small enough to stay inline, so no TOAST is involved.
+fn write_wal_one_record_per_segment(dir: &Path) {
+    use tuber::job::Job;
+    use tuber::wal::{StateChangeReason, Wal, WalConfig};
+    let mut wal = Wal::open(dir, WalConfig::with_max_file_size(1)).unwrap();
+    let mut jobs: Vec<Job> = (1..=3)
+        .map(|id| {
+            Job::new(
+                id,
+                0,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                b"x".to_vec(),
+                "default",
+            )
+        })
+        .collect();
+    wal.write_put(&mut jobs[0]).unwrap();
+    wal.write_put(&mut jobs[1]).unwrap();
+    wal.write_state_change(
+        &mut jobs[0],
+        None,
+        0,
+        Duration::ZERO,
+        0,
+        StateChangeReason::None,
+    )
+    .unwrap();
+    wal.write_put(&mut jobs[2]).unwrap();
+    wal.sync().unwrap();
+}
+
+/// Flip the last byte of segment `seq`, inside its only record.
+fn corrupt_wal_segment(dir: &Path, seq: u64) -> PathBuf {
+    let seg = dir.join(format!("binlog.{seq:06}"));
+    let mut data = std::fs::read(&seg).unwrap();
+    let last = data.len() - 1;
+    data[last] ^= 0xFF;
+    std::fs::write(&seg, &data).unwrap();
+    seg
+}
+
+/// Start `tuber server -b <dir>` with `extra` args; its exit status and log
+/// if it exits within 10 s, or None if it is still running (and is killed).
+async fn server_exit(dir: &Path, extra: &[&str]) -> Option<(std::process::ExitStatus, String)> {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_tuber"));
+    cmd.args([
+        "server",
+        "-l",
+        "127.0.0.1",
+        "-p",
+        "0",
+        "-b",
+        dir.to_str().unwrap(),
+    ])
+    .args(["--max-storage-bytes", "1g"])
+    .args(extra)
+    .env_remove("TUBER_WAL_SKIP_CORRUPT")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+    let child = cmd.spawn().expect("failed to start tuber subprocess");
+    let out = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .ok()?
+        .unwrap();
+    Some((
+        out.status,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+#[tokio::test]
+async fn test_server_refuses_to_start_on_a_damaged_older_wal_segment() {
+    // Segment 3 of 4 holds job 1's delete. Replaying past it would bring
+    // job 1 back, so the server must refuse to start and touch nothing.
+    let dir = tempfile::tempdir().unwrap();
+    write_wal_one_record_per_segment(dir.path());
+    let seg = corrupt_wal_segment(dir.path(), 3);
+    let damaged = std::fs::read(&seg).unwrap();
+
+    let (status, log) = server_exit(dir.path(), &[])
+        .await
+        .expect("the server started on a damaged WAL instead of refusing");
+    assert!(!status.success(), "{status:?}\n{log}");
+    assert!(log.contains("binlog.000003"), "{log}");
+    assert!(log.contains("--wal-skip-corrupt"), "{log}");
+    assert_eq!(
+        std::fs::read(&seg).unwrap(),
+        damaged,
+        "segment left as found"
+    );
+}
+
+#[tokio::test]
+async fn test_wal_skip_corrupt_starts_on_a_damaged_older_segment() {
+    // The override replays what remains and keeps the damaged segment. Its
+    // cost shows: job 1's delete was in the damaged record, so job 1 is back.
+    let dir = tempfile::tempdir().unwrap();
+    write_wal_one_record_per_segment(dir.path());
+    let seg = corrupt_wal_segment(dir.path(), 3);
+
+    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp_listener.local_addr().unwrap().port();
+    drop(tmp_listener);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tuber"))
+        .args(["server", "-l", "127.0.0.1", "-p", &port.to_string()])
+        .args([
+            "-b",
+            dir.path().to_str().unwrap(),
+            "--max-storage-bytes",
+            "1g",
+        ])
+        .arg("--wal-skip-corrupt")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to start tuber subprocess");
+
+    let mut stream = None;
+    for _ in 0..40 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut c = BufReader::new(stream.expect("the server never started listening"));
+    let mut found = Vec::new();
+    for id in 1..=3 {
+        c.get_mut()
+            .write_all(format!("peek {id}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).await.unwrap();
+        if line.starts_with("FOUND") {
+            let mut body = String::new();
+            c.read_line(&mut body).await.unwrap();
+            found.push(id);
+        }
+    }
+    child.kill().await.unwrap();
+
+    assert_eq!(found, vec![1, 2, 3]);
+    let mut sidecar = seg.into_os_string();
+    sidecar.push(".corrupt");
+    assert!(Path::new(&sidecar).exists(), "the damaged segment is kept");
+}
