@@ -20,6 +20,11 @@
 //! str/bytes = len:u32 + bytes;  time = seconds:i64 nanos:i32
 //! ```
 //!
+//! Every format version must keep the magic, the version field and the
+//! trailing crc32 over the rest: a file whose checksum fails is damage and is
+//! set aside, while a checksummed file of another version is a newer tuber's
+//! schedules and stops startup rather than being thrown away.
+//!
 //! A definition is stored as its `schedule-put` line and parsed back through
 //! the protocol parser on load, so a stored entry passes exactly the checks a
 //! synced one did.
@@ -72,6 +77,7 @@ impl ScheduleFiles {
                 })
             }
             Ok(None) => HashMap::new(),
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(e),
             Err(e) => {
                 tracing::error!("{STAMPS_FILE}: {e}; last fires lost");
                 HashMap::new()
@@ -144,6 +150,20 @@ impl ScheduleFiles {
     }
 }
 
+/// Move a damaged definitions file out of the way, to the first free
+/// `schedules.damaged[.N]`, so an earlier one is never overwritten.
+pub fn set_aside_damaged(dir: &Path) -> io::Result<PathBuf> {
+    let aside = (0..)
+        .map(|n| match n {
+            0 => dir.join(format!("{DEFS_FILE}.damaged")),
+            n => dir.join(format!("{DEFS_FILE}.damaged.{n}")),
+        })
+        .find(|p| !p.exists())
+        .expect("an unbounded range has a free name");
+    fs::rename(dir.join(DEFS_FILE), &aside)?;
+    Ok(aside)
+}
+
 /// `line` as the `schedule-put` arguments that would recreate it.
 fn wire_line(line: &Line, body_len: usize) -> String {
     let mut s = format!(
@@ -188,15 +208,24 @@ fn read(dir: &Path, name: &str, magic: &[u8; 4]) -> io::Result<Option<Vec<u8>>> 
     if bytes.len() < 16 || &bytes[..4] != magic {
         return Err(bad("not a tuber schedule file"));
     }
-    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    if version != VERSION {
-        return Err(bad(&format!(
-            "version {version}, this binary reads {VERSION}"
-        )));
-    }
+    // Checksum before version, so a damaged version field reads as damage
+    // rather than as a format this binary doesn't know.
     let (body, crc) = bytes.split_at(bytes.len() - 4);
     if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
         return Err(bad("checksum mismatch"));
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != VERSION {
+        // Not damage: schedules a different tuber wrote, most likely a newer
+        // one before a downgrade. Refuse rather than discard them.
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{name}: format version {version}, this binary reads {VERSION}. Run the \
+                 tuber that wrote it, or move {name} aside to start without schedules \
+                 until apps re-sync"
+            ),
+        ));
     }
     Ok(Some(bytes))
 }

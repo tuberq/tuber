@@ -389,9 +389,14 @@ files. Nothing references across the two stores: a fired job is an ordinary
 job in the WAL. On restart each entry resumes from the later of its last fire
 and its sync time.
 
-A damaged `schedules` file is moved to `schedules.damaged` and the server
-starts without schedules — the queue staying up matters more, and each app's
-next sync restores its own. A damaged `schedules.fired` only loses last
+A damaged `schedules` file is moved to `schedules.damaged` (or
+`schedules.damaged.N`, never over an earlier one) and the server starts
+without schedules — the queue staying up matters more, and each app's next
+sync restores its own. A checksummed file of another format version is not
+damage but a newer tuber's schedules, after a downgrade say: that stops
+startup with an explanation rather than being thrown away. Every format
+version keeps the magic, version field and trailing CRC-32, so the two can be
+told apart. A damaged `schedules.fired` only loses last
 fires, so missed ticks are judged from each entry's sync time. A stored entry
 that no longer parses (most likely a zone the system's tzdata dropped) is
 logged and skipped.

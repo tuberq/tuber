@@ -853,6 +853,65 @@ async fn a_damaged_schedules_file_is_set_aside_not_fatal() {
     c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
 }
 
+#[tokio::test]
+async fn a_second_damaged_file_does_not_overwrite_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("schedules"), b"TSCH first damage").unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    srv.connect().await;
+    srv.kill().await;
+
+    std::fs::write(dir.path().join("schedules"), b"TSCH second damage").unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    srv.connect().await;
+
+    let mut kept: Vec<Vec<u8>> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("schedules.damaged")
+        })
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            b"TSCH first damage".to_vec(),
+            b"TSCH second damage".to_vec()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_schedules_file_from_a_newer_tuber_stops_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    // A well-formed, checksummed file of format version 2. Not damage: good
+    // schedules this binary can't read, which it mustn't throw away.
+    let mut newer = b"TSCH".to_vec();
+    newer.extend_from_slice(&2u32.to_le_bytes());
+    newer.extend_from_slice(&[0; 4]);
+    let crc = crc32fast::hash(&newer);
+    newer.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(dir.path().join("schedules"), &newer).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let started = tokio::time::timeout(
+        Duration::from_secs(2),
+        tuber::server::run_with_listener(listener, 65535, Some(dir.path()), None),
+    )
+    .await;
+    match started {
+        Ok(Err(e)) => assert!(e.to_string().contains("version 2"), "{e}"),
+        Ok(Ok(())) => panic!("server exited cleanly"),
+        Err(_) => panic!("server started without the newer schedules"),
+    }
+    assert_eq!(std::fs::read(dir.path().join("schedules")).unwrap(), newer);
+}
+
 // ---------------------------------------------------------------------------
 // Visibility
 // ---------------------------------------------------------------------------

@@ -4112,11 +4112,10 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 // A damaged schedule file mustn't keep the queue down. Set
                 // it aside and start without schedules: each app's next sync
-                // restores its own.
-                let damaged = dir.join(crate::schedule::store::DEFS_FILE);
-                let aside = dir.join("schedules.damaged");
+                // restores its own. (One from a different tuber version is
+                // `Unsupported`, not damage, and stops startup below.)
+                let aside = crate::schedule::store::set_aside_damaged(dir)?;
                 tracing::error!("{e}; moved to {aside:?}, no schedules until apps re-sync");
-                std::fs::rename(&damaged, &aside)?;
                 crate::schedule::store::ScheduleFiles::open(dir)?
             }
             other => other?,
