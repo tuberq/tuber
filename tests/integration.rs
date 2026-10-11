@@ -5120,6 +5120,138 @@ async fn test_fuzz_very_long_line_no_newline() {
 }
 
 // ---------------------------------------------------------------------------
+// Hanging up while parked in reserve
+// ---------------------------------------------------------------------------
+
+/// Poll global `stats` until `pred` holds; false if it still doesn't after 2 s.
+/// A disconnect is handled asynchronously, so counters settle a moment after
+/// the client goes.
+async fn stats_settle(c: &mut TestConn, mut pred: impl FnMut(&str) -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        c.mustsend("stats\r\n").await;
+        if pred(&c.read_ok_body().await) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Open `n` connections watching only `tube`, each parked in a blocking
+/// `reserve`. Dropping one is what a worker killed mid-wait looks like.
+async fn park_workers(srv: &TestServer, tube: &str, n: usize) -> Vec<TestConn> {
+    let mut conns = Vec::new();
+    for _ in 0..n {
+        let mut c = srv.connect().await;
+        c.mustsend(&format!("watch {tube}\r\nignore default\r\n")).await;
+        c.ckresp("WATCHING 2\r\n").await;
+        c.ckresp("WATCHING 1\r\n").await;
+        c.mustsend("reserve\r\n").await;
+        conns.push(c);
+    }
+    conns
+}
+
+/// A worker that dies while parked in `reserve` must not stay registered. The
+/// connection task used to await the engine's reply without reading the
+/// socket, so it never saw the EOF: each such client kept its connection slot,
+/// fd and waiter entry until a job came along. Idle pruning exempts parked
+/// waiters, so nothing else reclaimed them either.
+#[tokio::test]
+async fn test_hangup_while_parked_frees_the_connection() {
+    let srv = TestServer::start().await;
+    let ghosts = park_workers(&srv, "ghost", 5).await;
+    let mut obs = srv.connect().await;
+    assert!(
+        stats_settle(&mut obs, |b| b.contains("current-waiting: 5")).await,
+        "all five should park"
+    );
+
+    drop(ghosts);
+    let mut last = String::new();
+    let settled = stats_settle(&mut obs, |b| {
+        last = b.to_string();
+        b.contains("current-waiting: 0") && b.contains("current-connections: 1")
+    })
+    .await;
+    assert!(settled, "hung-up waiters are still registered:\n{last}");
+}
+
+/// The job that arrives after the hang-ups must reach the live worker on its
+/// first reserve. It used to be handed to each dead waiter in turn: the write
+/// into the closed socket succeeded, the next read saw EOF, and the job went
+/// back to ready for the next one.
+#[tokio::test]
+async fn test_job_after_hangups_goes_straight_to_a_live_worker() {
+    let srv = TestServer::start().await;
+    let ghosts = park_workers(&srv, "ghost", 5).await;
+    let mut obs = srv.connect().await;
+    assert!(stats_settle(&mut obs, |b| b.contains("current-waiting: 5")).await);
+
+    drop(ghosts);
+    let mut worker = park_workers(&srv, "ghost", 1).await.pop().unwrap();
+    // Not asserted: with the bug the five never leave, and the job's reserve
+    // count below is the clearer failure.
+    stats_settle(&mut obs, |b| b.contains("current-waiting: 1")).await;
+
+    obs.mustsend("use ghost\r\n").await;
+    obs.ckresp("USING ghost\r\n").await;
+    let id = obs.put_job(0, 0, 60, "x").await;
+    worker.ckresp(&format!("RESERVED {id} 1\r\n")).await;
+    worker.ckresp("x\r\n").await;
+
+    obs.mustsend(&format!("stats-job {id}\r\n")).await;
+    let body = obs.read_ok_body().await;
+    assert!(body.contains("reserves: 1\n"), "{body}");
+}
+
+/// A client that half-closes while parked can still read, and gets TIMED_OUT
+/// at once, as beanstalkd answers it — not after the full timeout. This is
+/// `printf 'reserve-with-timeout 30\r\n' | nc -N`.
+#[tokio::test]
+async fn test_half_close_while_parked_times_out_at_once() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.mustsend("reserve-with-timeout 30\r\n").await;
+    c.writer.shutdown().await.unwrap();
+    c.ckresp("TIMED_OUT\r\n").await;
+    c.expect_closed(Duration::from_secs(2)).await;
+}
+
+/// The same for a long-polling `reserve-batch`, whose empty answer is
+/// `RESERVED_BATCH 0`.
+#[tokio::test]
+async fn test_half_close_while_parked_in_reserve_batch_returns_empty_batch() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.mustsend("reserve-batch 5 30\r\n").await;
+    c.writer.shutdown().await.unwrap();
+    c.ckresp("RESERVED_BATCH 0\r\n").await;
+    c.expect_closed(Duration::from_secs(2)).await;
+}
+
+/// Bytes a client sends while parked are its next command, not a hang-up:
+/// they stay buffered and run once the reserve is answered.
+#[tokio::test]
+async fn test_command_sent_while_parked_runs_after_the_reserve() {
+    let srv = TestServer::start().await;
+    let mut w = srv.connect().await;
+    w.mustsend("reserve\r\n").await;
+    let mut obs = srv.connect().await;
+    assert!(stats_settle(&mut obs, |b| b.contains("current-waiting: 1")).await);
+
+    w.mustsend("use foo\r\n").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let id = obs.put_job(0, 0, 60, "x").await;
+    w.ckresp(&format!("RESERVED {id} 1\r\n")).await;
+    w.ckresp("x\r\n").await;
+    w.ckresp("USING foo\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency limit > 1, group+concurrency combos, idempotency+group combos
 // ---------------------------------------------------------------------------
 

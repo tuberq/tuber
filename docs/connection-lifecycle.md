@@ -165,9 +165,9 @@ random worker deaths whenever the queue is quiet.
 
 Not as a sweep over `ConnState` in the engine tick, for three reasons:
 
-- **A parked `reserve` is excluded structurally.** That task is blocked awaiting
-  the engine's reply, not reading, so its timer cannot fire at all — no
-  predicate to remember and get right. (The predicate that suggests itself,
+- **A parked `reserve` is excluded structurally.** That task is awaiting the
+  engine's reply, watching the socket only for a hang-up (below), so its idle
+  timer cannot fire at all — no predicate to remember and get right. (The predicate that suggests itself,
   `!ConnState::is_waiting()`, would not have worked anyway: `CONN_TYPE_WAITING`
   is defined but never set anywhere, so `is_waiting()` is always false. The
   authoritative source for "parked" is the engine's `waiters` list.)
@@ -187,6 +187,28 @@ Pruning closes with no reply, for the same reason a refused connection does: the
 client is not waiting on anything, so an unsolicited line would be read as the
 response to whatever it sends next. Clients see a clean EOF. Each close
 increments `connections-pruned`.
+
+### A worker that hangs up while parked
+
+Pruning never closes a parked worker, so something else has to notice when one
+dies mid-wait — killed, OOM-killed, restarted by a deploy. While a `reserve`,
+`reserve-with-timeout` or `reserve-batch` is parked, its connection task watches
+the socket as well as the engine's reply. On EOF or a read error it sends the
+engine `Hangup`, which ends the wait with the reserve's empty answer
+(`TIMED_OUT`, or `RESERVED_BATCH 0`). The reply is still written, because a
+half-closed client (`nc -N`) can read it. The next read then sees EOF and the
+connection closes as usual. This matches beanstalkd.
+
+Before this, a dead parked worker kept its slot, fd and waiter entry until a job
+arrived. The job was then handed to each dead waiter in turn, and bounced back to
+ready from each, before reaching a live worker. Every worker restart left one
+such ghost per parked connection.
+
+Bytes that arrive during the wait are the client's next command, not a hang-up.
+They stay buffered and run once the reserve is answered.
+
+Not covered: a peer that vanishes without closing (host crash, network
+partition). No FIN or RST arrives, so there is nothing to notice.
 
 ### Choosing a period
 

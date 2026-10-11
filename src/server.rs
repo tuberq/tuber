@@ -259,6 +259,10 @@ enum EnginePayload {
     IdleCheck {
         reply_tx: oneshot::Sender<bool>,
     },
+    /// The client hung up, or half-closed, while a reserve was parked
+    /// awaiting its reply. See [`await_parked_reply`] and
+    /// [`ServerState::end_wait`].
+    Hangup,
     Disconnect,
     Shutdown,
 }
@@ -3633,6 +3637,25 @@ impl ServerState {
         waiter
     }
 
+    /// The client hung up, or half-closed, while parked. End the wait the way
+    /// beanstalkd does, with the reserve's empty answer — TIMED_OUT, or
+    /// `RESERVED_BATCH 0` for a batch — since a half-closed client can still
+    /// read it. A no-op once the reserve has been answered: commands from one
+    /// connection arrive in order, so a job handed over before the hang-up is
+    /// replied to normally, and goes back to ready on the disconnect if the
+    /// client really has gone.
+    fn end_wait(&mut self, conn_id: u64) {
+        if let Some(i) = self.waiters.iter().position(|w| w.conn_id == conn_id) {
+            let waiter = self.remove_waiter_at(i);
+            let resp = if waiter.batch_count.is_some() {
+                Response::ReservedBatch(Vec::new())
+            } else {
+                Response::TimedOut
+            };
+            let _ = waiter.reply_tx.send(resp);
+        }
+    }
+
     fn remove_waiter(&mut self, conn_id: u64) {
         let mut i = 0;
         while i < self.waiters.len() {
@@ -4403,6 +4426,10 @@ fn process_message(
             let _ = reply_tx.send(prune);
             ProcessResult::Continue
         }
+        EnginePayload::Hangup => {
+            state.end_wait(msg.conn_id);
+            ProcessResult::Continue
+        }
         EnginePayload::Disconnect => {
             state.unregister_conn(msg.conn_id);
             ProcessResult::Continue
@@ -4998,6 +5025,49 @@ async fn drain_bytes(
 /// Closing is silent, for the same reason a refused connection is: the client is
 /// not awaiting a reply, so an unsolicited line would be read as the response to
 /// whatever it sends next.
+/// Await the reply to a reserve that may park in the engine, while watching the
+/// socket for the client going away.
+///
+/// A plain `reply_rx.await` reads nothing while it waits, so a client that died
+/// mid-reserve was never noticed: its slot, fd and waiter entry stayed until a
+/// job arrived, and that job then bounced through every such ghost before
+/// reaching a live worker. Idle pruning can't help, as it exempts waiters.
+///
+/// On EOF or a read error this sends the engine `Hangup`, which ends the wait
+/// with the reserve's empty answer. The reply is still awaited and written —
+/// a half-closed client can read it — and the next read sees EOF and
+/// disconnects as usual. beanstalkd does the same (`prot.c`, `STATE_WAIT`).
+///
+/// Bytes that arrive instead are the client's next command, pipelined: they
+/// stay in `reader`'s buffer and the wait carries on unwatched, as it does
+/// when the buffer already held some.
+async fn await_parked_reply(
+    conn_id: u64,
+    engine_tx: &mpsc::Sender<EngineMsg>,
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut reply_rx: oneshot::Receiver<Response>,
+) -> Result<Response, oneshot::error::RecvError> {
+    if !reader.buffer().is_empty() {
+        return reply_rx.await;
+    }
+    tokio::select! {
+        biased;
+        reply = &mut reply_rx => return reply,
+        read = reader.fill_buf() => {
+            let hung_up = read.map_or(true, |buf| buf.is_empty());
+            if hung_up {
+                let _ = engine_tx
+                    .send(EngineMsg {
+                        conn_id,
+                        payload: EnginePayload::Hangup,
+                    })
+                    .await;
+            }
+        }
+    }
+    reply_rx.await
+}
+
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     engine_tx: mpsc::Sender<EngineMsg>,
@@ -5178,7 +5248,12 @@ async fn handle_connection(
             None
         };
 
-        // Send to engine and await response
+        // Send to engine and await response. A reserve can park in the engine
+        // indefinitely, so its wait also watches the socket.
+        let can_park = matches!(
+            cmd,
+            Command::Reserve | Command::ReserveWithTimeout { .. } | Command::ReserveBatch { .. }
+        );
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = engine_tx
             .send(EngineMsg {
@@ -5191,7 +5266,12 @@ async fn handle_connection(
             })
             .await;
 
-        match reply_rx.await {
+        let reply = if can_park {
+            await_parked_reply(conn_id, &engine_tx, &mut reader, reply_rx).await
+        } else {
+            reply_rx.await
+        };
+        match reply {
             Ok(resp) => {
                 resp_buf.clear();
                 resp.serialize_into(&mut resp_buf);
