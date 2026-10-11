@@ -145,13 +145,13 @@ Response: `FOUND <id> <bytes>\r\n<body>\r\n` or `NOT_FOUND\r\n`
 
 ### kick \<bound\>\r\n
 
-Kick up to `<bound>` buried/delayed jobs in the use tube.
+Kick up to `<bound>` buried/delayed jobs in the use tube. Buried jobs are kicked if any can be, otherwise delayed ones. An `aft:` job whose group is incomplete is passed over.
 
 Response: `KICKED <count>\r\n`
 
 ### kick-job \<id\>\r\n
 
-Kick a specific job.
+Kick a specific job. `NOT_FOUND` also covers a job that isn't buried or delayed, and an `aft:` job whose group is incomplete.
 
 Response: `KICKED\r\n` or `NOT_FOUND\r\n`
 

@@ -226,7 +226,7 @@ put 0 0 60 14 aft:import
 send-summary
 ```
 
-The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish. If an `aft:` job isn't running and you're not sure why, use `stats-group <name>` to check whether the group still has pending or buried members.
+The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish. Kicking can't hurry an `aft:` job itself: while its group is incomplete, `kick` passes over it and `kick-job` returns `NOT_FOUND`, as `reserve-job` does. If an `aft:` job isn't running and you're not sure why, use `stats-group <name>` to check whether the group still has pending or buried members.
 
 Chain stages together by combining `aft:` and `grp:` on the same job — the job waits on one group while belonging to another:
 

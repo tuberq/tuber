@@ -858,6 +858,15 @@ impl ServerState {
         true
     }
 
+    /// True for an `aft:` job whose group still has members outstanding. Such
+    /// a job must not become ready: the tick holds it when its delay runs
+    /// out, and `reserve-job`, `kick` and `kick-job` pass it over.
+    fn held_by_group(&self, job: &Job) -> bool {
+        job.after_group()
+            .and_then(|ag| self.groups.get(ag))
+            .is_some_and(|gs| !gs.is_complete())
+    }
+
     /// Check if a job's concurrency key already has an active reservation.
     /// The answer depends only on the key, never on the job: `ReadyQueue`
     /// relies on that to pass over all of a blocked key's jobs at once.
@@ -1499,13 +1508,7 @@ impl ServerState {
             return Response::NotFound;
         }
 
-        // Check after_group dependency
-        let hold_for_group = job
-            .after_group()
-            .and_then(|ag| self.groups.get(ag))
-            .map(|gs| !gs.is_complete())
-            .unwrap_or(false);
-        if hold_for_group {
+        if self.held_by_group(job) {
             return Response::NotFound;
         }
 
@@ -2499,39 +2502,92 @@ impl ServerState {
 
         let mut kicked = 0u32;
 
-        // Kick buried first, then delayed
-        let has_buried = self
-            .tubes
-            .get(&tube_name)
-            .map(|t| !t.buried.is_empty())
-            .unwrap_or(false);
+        // Kick buried first, then delayed. An after-job whose group is
+        // incomplete is passed over in both, keeping its place; if every
+        // buried job is passed over, the delayed ones are kicked instead.
+        let mut passed_over = Vec::new();
+        while kicked < bound {
+            let Some(job_id) = self
+                .tubes
+                .get_mut(&*tube_name)
+                .and_then(|t| t.buried.pop_front())
+            else {
+                break;
+            };
+            if self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|j| self.held_by_group(j))
+            {
+                passed_over.push(job_id);
+                continue;
+            }
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
+            }
+            self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
 
-        if has_buried {
-            for _ in 0..bound {
-                let job_id = {
-                    let tube = match self.tubes.get_mut(&*tube_name) {
-                        Some(t) => t,
-                        None => break,
-                    };
-                    match tube.buried.pop_front() {
-                        Some(id) => {
-                            tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
-                            id
-                        }
-                        None => break,
+            // Group tracking: un-bury decrements buried count
+            if let Some(job) = self.jobs.get(&job_id)
+                && let Some(grp) = job.group()
+                && let Some(gs) = self.groups.get_mut(grp)
+            {
+                gs.buried = gs.buried.saturating_sub(1);
+            }
+
+            // Re-enqueue as ready
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                job.state = JobState::Ready;
+                job.deadline_at = None;
+                job.kick_ct += 1;
+                let key = job.ready_key();
+                let tn = job.tube_name.clone();
+                if let Some(tube) = self.tubes.get_mut(&*tn) {
+                    tube.ready.insert(job);
+                }
+                self.ready_ct += 1;
+                if key.0 < URGENT_THRESHOLD {
+                    self.stats.urgent_ct += 1;
+                    if let Some(tube) = self.tubes.get_mut(&*tn) {
+                        tube.stat.urgent_ct += 1;
                     }
-                };
-                self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
+                }
+            }
+            // WAL: write kick state change
+            let pri = self.job_pri(job_id);
+            self.wal_write_state_change(
+                job_id,
+                Some(JobState::Ready),
+                pri,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Kick,
+            );
+            kicked += 1;
+        }
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+            for &id in passed_over.iter().rev() {
+                tube.buried.push_front(id);
+            }
+        }
 
-                // Group tracking: un-bury decrements buried count
-                if let Some(job) = self.jobs.get(&job_id)
-                    && let Some(grp) = job.group()
-                    && let Some(gs) = self.groups.get_mut(grp)
+        if kicked == 0 {
+            let mut passed_over = Vec::new();
+            while kicked < bound {
+                let Some((deadline, job_id)) =
+                    self.tubes.get_mut(&*tube_name).and_then(|t| t.delay.pop())
+                else {
+                    break;
+                };
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|j| self.held_by_group(j))
                 {
-                    gs.buried = gs.buried.saturating_sub(1);
+                    passed_over.push((deadline, job_id));
+                    continue;
                 }
 
-                // Re-enqueue as ready
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.state = JobState::Ready;
                     job.deadline_at = None;
@@ -2561,48 +2617,10 @@ impl ServerState {
                 );
                 kicked += 1;
             }
-        } else {
-            // Kick delayed
-            for _ in 0..bound {
-                let job_id = {
-                    let tube = match self.tubes.get_mut(&*tube_name) {
-                        Some(t) => t,
-                        None => break,
-                    };
-                    match tube.delay.pop() {
-                        Some((_, id)) => id,
-                        None => break,
-                    }
-                };
-
-                if let Some(job) = self.jobs.get_mut(&job_id) {
-                    job.state = JobState::Ready;
-                    job.deadline_at = None;
-                    job.kick_ct += 1;
-                    let key = job.ready_key();
-                    let tn = job.tube_name.clone();
-                    if let Some(tube) = self.tubes.get_mut(&*tn) {
-                        tube.ready.insert(job);
-                    }
-                    self.ready_ct += 1;
-                    if key.0 < URGENT_THRESHOLD {
-                        self.stats.urgent_ct += 1;
-                        if let Some(tube) = self.tubes.get_mut(&*tn) {
-                            tube.stat.urgent_ct += 1;
-                        }
-                    }
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                for (deadline, id) in passed_over {
+                    tube.delay.insert(deadline, id);
                 }
-                // WAL: write kick state change
-                let pri = self.job_pri(job_id);
-                self.wal_write_state_change(
-                    job_id,
-                    Some(JobState::Ready),
-                    pri,
-                    Duration::ZERO,
-                    0,
-                    StateChangeReason::Kick,
-                );
-                kicked += 1;
             }
         }
 
@@ -2615,6 +2633,9 @@ impl ServerState {
             Some(j) => j,
             None => return Response::NotFound,
         };
+        if self.held_by_group(job) {
+            return Response::NotFound;
+        }
 
         let state = job.state;
         let tube_name = job.tube_name.clone();

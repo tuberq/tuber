@@ -25,14 +25,10 @@ impl ServerState {
                     .and_then(|t| t.delay.pop().map(|(_, id)| id));
 
                 if let Some(job_id) = job_id {
-                    // Check if this is an aft: job whose group isn't complete yet
                     let hold_for_group = self
                         .jobs
                         .get(&job_id)
-                        .and_then(|j| j.after_group())
-                        .and_then(|ag| self.groups.get(ag))
-                        .map(|gs| !gs.is_complete())
-                        .unwrap_or(false);
+                        .is_some_and(|j| self.held_by_group(j));
 
                     if hold_for_group {
                         // Keep as delayed with no deadline; add to group waiting list

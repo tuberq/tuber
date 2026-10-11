@@ -2573,6 +2573,155 @@ async fn test_delete_held_after_job_cleans_waiting_jobs() {
     c.ckresp("y\r\n").await;
 }
 
+/// `stats-job <id>`'s `state:` value.
+async fn job_state(c: &mut TestConn, id: u64) -> String {
+    c.mustsend(&format!("stats-job {id}\r\n")).await;
+    let body = c.read_ok_body().await;
+    body.lines()
+        .find_map(|l| l.strip_prefix("state: "))
+        .unwrap_or_else(|| panic!("no state in {body:?}"))
+        .to_string()
+}
+
+/// `kick` skips an aft: job with a delay while its group is incomplete, and
+/// still kicks the plain delayed job behind it. The skipped job keeps its
+/// delay and is kickable once the group completes.
+#[tokio::test]
+async fn test_kick_skips_delayed_after_job_until_group_completes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:kb\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 30 60 1 aft:kb\r\nz\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("put 0 30 60 1\r\nd\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    assert_eq!(job_state(&mut c, 2).await, "delayed");
+    assert_eq!(job_state(&mut c, 3).await, "ready");
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("d\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Completing the group makes the after-job kickable.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// `kick-job` on an after-job held for its group is NOT_FOUND, as
+/// `reserve-job` is, and leaves it held rather than making it ready.
+#[tokio::test]
+async fn test_kick_job_refuses_held_after_job() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:kj\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 0 60 1 aft:kj\r\nz\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("kick-job 2\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+    assert_eq!(job_state(&mut c, 2).await, "delayed");
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Completing the group releases it as usual.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// `kick-job` on an after-job with a delay is NOT_FOUND while its group is
+/// incomplete, and kicks it once the group completes.
+#[tokio::test]
+async fn test_kick_job_refuses_delayed_after_job_until_group_completes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:kd\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 30 60 1 aft:kd\r\nz\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("kick-job 2\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+    assert_eq!(job_state(&mut c, 2).await, "delayed");
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("kick-job 2\r\n").await;
+    c.ckresp("KICKED\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// A buried after-job whose group has new members again stays buried under
+/// `kick` and `kick-job`, as it would on replay or `reserve-job`. With no
+/// other buried job to kick, `kick` moves on to the delayed jobs.
+#[tokio::test]
+async fn test_kick_skips_buried_after_job_while_group_reopened() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // An after-job for an empty group is ready at once; bury it.
+    c.mustsend("put 0 0 60 1 aft:ro\r\nz\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("z\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // The group gets a member, and there is a plain delayed job.
+    c.mustsend("put 0 0 60 1 grp:ro\r\na\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("put 0 30 60 1\r\nd\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    assert_eq!(job_state(&mut c, 1).await, "buried");
+    assert_eq!(job_state(&mut c, 3).await, "ready");
+    c.mustsend("kick-job 1\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+
+    // Completing the group makes it kickable again.
+    c.mustsend("reserve-job 2\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    assert_eq!(job_state(&mut c, 1).await, "ready");
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency key (con:) tests
 // ---------------------------------------------------------------------------
