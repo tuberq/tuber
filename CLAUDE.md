@@ -26,7 +26,7 @@ The codebase mirrors the original C beanstalkd structure:
 - **`src/server.rs`** - Tokio TCP server, accepts connections and dispatches to protocol handler.
 - **`src/protocol.rs`** - Beanstalkd text protocol parser and command dispatch. The protocol is line-based (`\r\n` terminated). See `tmp/prot.c` for the full C implementation. Includes tuber extensions: `idp:`, `grp:`, `aft:`, `con:` tags on `put`, `reserve-mode`, `flush-tube`, `flush-buried`, and `touch-all`.
 - **`src/job.rs`** - Job struct and job storage (hash table). Jobs have states: Ready, Reserved, Buried, Delayed. Jobs are ordered by priority then ID. Includes fields for idempotency key, group, after-group, and concurrency key.
-- **`src/tube.rs`** - Named queues ("tubes"). Each tube has a ready heap, delay heap, buried list, and waiting connections list. Default tube is "default".
+- **`src/tube.rs`** - Named queues ("tubes"). Each tube has a ready queue (`ReadyQueue`: a priority heap, with `con:` jobs grouped by key so a reserve steps past a blocked key in one move), delay heap, buried list, and waiting connections list. Default tube is "default".
 - **`src/conn.rs`** - Per-connection state: current tube (`use`), watched tubes (`watch`), reserved jobs list, reserve mode (FIFO or weighted), and read/write buffers.
 - **`src/heap.rs`** - Binary min-heap used for ready queue (priority ordering), delay queue (deadline ordering), and connection timeouts.
 - **`src/wal.rs`** - Write-ahead log for persistence (optional, enabled with `-b`).

@@ -49,18 +49,28 @@ pub struct IndexHeap<K: Ord> {
 ```
 
 Used for:
-- **Tube ready heap**: key = `(priority, job_id)` -- lowest priority first, FIFO within same priority
+- **Tube ready queue** (`ReadyQueue`, below): key = `(priority, job_id)` -- lowest priority first, FIFO within same priority
 - **Tube delay heap**: key = `(deadline_nanos, job_id)` -- soonest deadline first
 
 The C version uses a `setpos` callback to track positions; we use an internal
 HashMap instead, which is cleaner.
+
+## ReadyQueue
+
+A tube's ready jobs. Untagged jobs sit in one `IndexHeap`. Jobs with a `con:`
+key sit in a `BTreeSet` ordered by key and then `(priority, job_id)`, and each
+key's best job also sits in a second `IndexHeap`, `heads`. Whether a key is
+blocked depends only on the key (its reservations against its limit), so a
+reserve walks `heads` best-first and passes one entry per blocked key, never a
+key's whole backlog. `heads` keeps blocked keys too: a key's slots are shared by
+every tube, so checking at reserve time spares each tube from tracking them.
 
 ## Tube
 
 ```rust
 pub struct Tube {
     pub name: String,
-    pub ready: IndexHeap<(u32, u64)>,
+    pub ready: ReadyQueue,
     pub delay: IndexHeap<(i64, u64)>,
     pub buried: VecDeque<u64>,
     pub stat: TubeStats,

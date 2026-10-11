@@ -790,6 +790,274 @@ fn test_find_unblocked_returns_smallest_unblocked() {
     );
 }
 
+/// `reserve-with-timeout 0`: the reserved id, or None on TIMED_OUT.
+fn reserve_now(s: &mut ServerState, conn: u64) -> Option<u64> {
+    match s.handle_command(conn, Command::ReserveWithTimeout { timeout: 0 }, None) {
+        Response::Reserved { id, .. } => Some(id),
+        Response::TimedOut => None,
+        other => panic!("unexpected reserve response {other:?}"),
+    }
+}
+
+#[test]
+fn test_deep_con_backlog_does_not_hide_untagged_jobs() {
+    // 300 con:A jobs ahead of 5 untagged ones at the same priority. Once A is
+    // held, the untagged jobs are next; a search that gives up partway down
+    // the blocked backlog reported the tube empty instead.
+    let mut s = make_state();
+    let c = register(&mut s);
+    for _ in 0..300 {
+        s.handle_command(c, put_con_cmd(0, 120, 1, "A", 1), Some(b"a".to_vec()));
+    }
+    for _ in 0..5 {
+        s.handle_command(c, put_cmd(0, 0, 120, 1), Some(b"b".to_vec()));
+    }
+
+    assert_eq!(reserve_now(&mut s, c), Some(1));
+    for want in 301..=305 {
+        assert_eq!(reserve_now(&mut s, c), Some(want));
+    }
+    assert_eq!(
+        reserve_now(&mut s, c),
+        None,
+        "only blocked con:A jobs are left"
+    );
+}
+
+#[test]
+fn test_many_blocked_con_keys_do_not_hide_ready_jobs() {
+    // 300 keys with two jobs each, then one untagged job. Each reserve takes
+    // a key's first job and leaves its second blocked, so by the end 300
+    // blocked jobs sort ahead of every job still reservable.
+    let mut s = make_state();
+    let c = register(&mut s);
+    for k in 0..300 {
+        for _ in 0..2 {
+            let key = format!("k{k}");
+            s.handle_command(c, put_con_cmd(0, 120, 1, &key, 1), Some(b"a".to_vec()));
+        }
+    }
+    s.handle_command(c, put_cmd(0, 0, 120, 1), Some(b"b".to_vec()));
+
+    for k in 0..300 {
+        assert_eq!(reserve_now(&mut s, c), Some(2 * k + 1), "first job of k{k}");
+    }
+    assert_eq!(reserve_now(&mut s, c), Some(601), "the untagged job");
+    assert_eq!(reserve_now(&mut s, c), None);
+}
+
+#[test]
+fn test_parked_worker_gets_job_put_behind_deep_con_backlog() {
+    // The waiter path: a put behind a blocked backlog must wake a parked
+    // worker straight away, not leave it parked with a job ready.
+    let mut s = make_state();
+    let c1 = register(&mut s);
+    let c2 = register(&mut s);
+    for _ in 0..300 {
+        s.handle_command(c1, put_con_cmd(0, 120, 1, "A", 1), Some(b"a".to_vec()));
+    }
+    assert_eq!(reserve_now(&mut s, c1), Some(1));
+
+    let (tx, mut rx) = oneshot::channel();
+    s.add_waiter(c2, tx, None, None);
+    assert!(matches!(
+        s.handle_command(c1, put_cmd(0, 0, 120, 1), Some(b"b".to_vec())),
+        Response::Inserted(301)
+    ));
+
+    let received = rx
+        .try_recv()
+        .expect("the parked worker should have been woken");
+    assert!(
+        matches!(received, Response::Reserved { id: 301, .. }),
+        "expected Reserved(301), got {received:?}"
+    );
+}
+
+/// The best reservable job in `tube` by exhaustive search: the smallest
+/// (pri, id) among its ready jobs whose `con:` key has a free slot.
+fn brute_force_best_unblocked(s: &ServerState, tube: &str) -> Option<u64> {
+    s.jobs
+        .values()
+        .filter(|j| j.state == JobState::Ready && &*j.tube_name == tube)
+        .filter(|j| !s.is_concurrency_blocked(j.id))
+        .map(|j| j.ready_key())
+        .min()
+        .map(|(_, id)| id)
+}
+
+#[test]
+fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
+    // Random puts, reserves, deletes, releases, buries, kicks, idp: priority
+    // upgrades, aft: promotions, disconnects and flushes across two tubes
+    // sharing con: keys. After every step, each tube's pick must equal an
+    // exhaustive search, and its ready count must match the jobs in Ready.
+    const TUBES: [&str; 2] = ["default", "other"];
+    const KEYS: [&str; 4] = ["a", "b", "c", "d"];
+
+    let mut blocked_tops = 0;
+    for seed in 1..=8u64 {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+
+        let mut s = make_state();
+        let mut conns: Vec<u64> = Vec::new();
+        let new_conn = |s: &mut ServerState| {
+            let c = register(s);
+            s.handle_command(
+                c,
+                Command::Watch {
+                    tube: "other".into(),
+                    weight: 1,
+                },
+                None,
+            );
+            c
+        };
+        for _ in 0..4 {
+            conns.push(new_conn(&mut s));
+        }
+
+        for step in 0..2500 {
+            let c = conns[next(conns.len() as u64) as usize];
+            let max_id = s.next_job_id.max(1);
+            let held: Vec<u64> = s
+                .conns
+                .get(&c)
+                .map(|cs| cs.reserved_jobs.clone())
+                .unwrap_or_default();
+            let any_held = |next: &mut dyn FnMut(u64) -> u64| {
+                (!held.is_empty()).then(|| held[next(held.len() as u64) as usize])
+            };
+            match next(100) {
+                0..=34 => {
+                    let tube = TUBES[next(2) as usize];
+                    s.handle_command(c, Command::Use { tube: tube.into() }, None);
+                    let concurrency_key = (next(10) < 7)
+                        .then(|| (KEYS[next(4) as usize].to_string(), 1 + next(3) as u32));
+                    let idempotency_key = (next(10) == 0).then(|| (format!("i{}", next(3)), 0));
+                    let (group, after_group) = match next(20) {
+                        0 => (Some("g".to_string()), None),
+                        1 => (None, Some("g".to_string())),
+                        _ => (None, None),
+                    };
+                    let cmd = Command::Put {
+                        pri: next(4) as u32,
+                        delay: 0,
+                        ttr: 120,
+                        bytes: 1,
+                        idempotency_key,
+                        group,
+                        after_group,
+                        concurrency_key,
+                    };
+                    s.handle_command(c, cmd, Some(b"x".to_vec()));
+                }
+                35..=59 => {
+                    reserve_now(&mut s, c);
+                }
+                60..=69 => {
+                    if let Some(id) = any_held(&mut next) {
+                        s.handle_command(c, Command::Delete { id }, None);
+                    } else {
+                        s.handle_command(
+                            c,
+                            Command::Delete {
+                                id: 1 + next(max_id),
+                            },
+                            None,
+                        );
+                    }
+                }
+                70..=79 => {
+                    if let Some(id) = any_held(&mut next) {
+                        let pri = next(4) as u32;
+                        s.handle_command(c, Command::Release { id, pri, delay: 0 }, None);
+                    }
+                }
+                80..=84 => {
+                    if let Some(id) = any_held(&mut next) {
+                        s.handle_command(
+                            c,
+                            Command::Bury {
+                                id,
+                                pri: next(4) as u32,
+                            },
+                            None,
+                        );
+                    }
+                }
+                85..=89 => {
+                    let tube = TUBES[next(2) as usize];
+                    s.handle_command(c, Command::Use { tube: tube.into() }, None);
+                    s.handle_command(
+                        c,
+                        Command::Kick {
+                            bound: 1 + next(3) as u32,
+                        },
+                        None,
+                    );
+                }
+                90..=93 => {
+                    s.handle_command(
+                        c,
+                        Command::KickJob {
+                            id: 1 + next(max_id),
+                        },
+                        None,
+                    );
+                }
+                94..=97 => {
+                    s.unregister_conn(c);
+                    conns.retain(|&x| x != c);
+                    conns.push(new_conn(&mut s));
+                }
+                _ => {
+                    let tube = TUBES[next(2) as usize];
+                    s.handle_command(c, Command::FlushTube { tube: tube.into() }, None);
+                }
+            }
+
+            for name in TUBES {
+                let Some(tube) = s.tubes.get(name) else {
+                    continue;
+                };
+                if tube
+                    .ready
+                    .peek()
+                    .is_some_and(|e| s.is_concurrency_blocked(e.1))
+                {
+                    blocked_tops += 1;
+                }
+                let got = s.find_best_unblocked_ready(tube).map(|(_, id)| id);
+                let want = brute_force_best_unblocked(&s, name);
+                assert_eq!(got, want, "seed {seed} step {step} tube {name}: pick");
+                let ready = s
+                    .jobs
+                    .values()
+                    .filter(|j| j.state == JobState::Ready && &*j.tube_name == name)
+                    .count();
+                assert_eq!(
+                    tube.ready.len(),
+                    ready,
+                    "seed {seed} step {step} tube {name}: count"
+                );
+                tube.ready.assert_consistent();
+            }
+        }
+    }
+    eprintln!("steps with a blocked top: {blocked_tops}");
+    assert!(
+        blocked_tops > 1000,
+        "only {blocked_tops} steps had a blocked top job to skip"
+    );
+}
+
 #[test]
 fn test_idempotency_ttl_cooldown() {
     let mut s = make_state();

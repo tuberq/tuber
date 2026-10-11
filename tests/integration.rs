@@ -2850,6 +2850,43 @@ async fn test_concurrency_disconnect_frees_slot() {
     );
 }
 
+/// The review's repro: 300 con:A jobs ahead of 5 untagged ones. With A held,
+/// every other worker should get an untagged job, not TIMED_OUT.
+#[tokio::test]
+async fn test_concurrency_deep_backlog_does_not_starve_other_jobs() {
+    let srv = TestServer::start().await;
+    let mut producer = srv.connect().await;
+    for _ in 0..300 {
+        producer.mustsend("put 0 0 60 1 con:A\r\na\r\n").await;
+        producer.ckrespsub("INSERTED ").await;
+    }
+    for _ in 0..5 {
+        producer.put_job(0, 0, 60, "b").await;
+    }
+
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        workers.push(srv.connect().await);
+    }
+    let mut got = Vec::new();
+    for w in &mut workers {
+        w.mustsend("reserve-with-timeout 0\r\n").await;
+        got.push(w.readline().await);
+        if got.last().unwrap().starts_with("RESERVED ") {
+            w.readline().await;
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            "RESERVED 1 1\r\n",
+            "RESERVED 301 1\r\n",
+            "RESERVED 302 1\r\n",
+            "RESERVED 303 1\r\n"
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cross-tube group tests
 // ---------------------------------------------------------------------------

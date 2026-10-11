@@ -31,7 +31,7 @@ A job is a unit of work with a body (arbitrary bytes), priority, delay, and TTR
 ### Tubes
 
 Tubes are named queues. Each tube has:
-- **ready heap** -- priority-ordered min-heap of jobs ready for consumption
+- **ready queue** -- priority-ordered jobs ready for consumption; jobs with a `con:` key are grouped by key, so a reserve steps past a key at its limit in one move
 - **delay heap** -- deadline-ordered min-heap of jobs waiting to become ready
 - **buried list** -- jobs that have been buried (failed), kicked to re-enter ready
 - **waiting connections** -- connections blocked on `reserve` for this tube

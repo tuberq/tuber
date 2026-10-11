@@ -41,12 +41,6 @@ const TOMBSTONE_OVERHEAD_BYTES: u64 = 128;
 /// Below this threshold, raw weights are used.
 const FAIR_MIN_SAMPLES: u64 = 10;
 
-/// Cap on heap entries inspected by find_best_unblocked_ready when the heap
-/// top is concurrency-blocked. Bounds slow-path cost on large tubes; if the
-/// real unblocked job is deeper than this, the next process_queue tick or
-/// state-change event re-checks.
-const FIND_UNBLOCKED_MAX_VISITS: usize = 256;
-
 /// Interval at which the background TOAST compactor scans for sealed
 /// segments below the live-ratio threshold. Brisk enough to absorb
 /// realistic delete bursts without burning cycles on idle queues.
@@ -839,7 +833,9 @@ impl ServerState {
                 if let Some((tube_name, key)) = requeue {
                     self.ensure_tube(&tube_name);
                     if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.ready.insert(key, job_id);
+                        if let Some(job) = self.jobs.get(&job_id) {
+                            tube.ready.insert(job);
+                        }
                         self.ready_ct += 1;
                         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -863,6 +859,8 @@ impl ServerState {
     }
 
     /// Check if a job's concurrency key already has an active reservation.
+    /// The answer depends only on the key, never on the job: `ReadyQueue`
+    /// relies on that to pass over all of a blocked key's jobs at once.
     fn is_concurrency_blocked(&self, job_id: u64) -> bool {
         self.jobs
             .get(&job_id)
@@ -922,39 +920,10 @@ impl ServerState {
         }
     }
 
-    /// Find the best unblocked ready job from a tube. The slow-path walk is
-    /// capped at FIND_UNBLOCKED_MAX_VISITS so a heavily con-key-blocked heap
-    /// doesn't melt CPU; a real unblocked job deeper than the cap is picked
-    /// up on the next event-driven process_queue.
+    /// Find the best unblocked ready job from a tube. See `ReadyQueue`.
     fn find_best_unblocked_ready(&self, tube: &Tube) -> Option<((u32, u64), u64)> {
-        let entries = tube.ready.entries();
-        let top = *entries.first()?;
-        if !self.is_concurrency_blocked(top.1) {
-            return Some(top);
-        }
-
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-        // (priority+id key, job id, heap index) — Reverse turns max-heap into min-heap.
-        type Pending = Reverse<((u32, u64), u64, usize)>;
-        let mut pending: BinaryHeap<Pending> = BinaryHeap::new();
-        pending.push(Reverse((top.0, top.1, 0)));
-        let mut visited = 0usize;
-        while let Some(Reverse((key, jid, idx))) = pending.pop() {
-            visited += 1;
-            if !self.is_concurrency_blocked(jid) {
-                return Some((key, jid));
-            }
-            if visited >= FIND_UNBLOCKED_MAX_VISITS {
-                return None;
-            }
-            for child in [idx * 2 + 1, idx * 2 + 2] {
-                if let Some(&(k, id)) = entries.get(child) {
-                    pending.push(Reverse((k, id, child)));
-                }
-            }
-        }
-        None
+        tube.ready
+            .best_unblocked(|id| self.is_concurrency_blocked(id))
     }
 
     fn handle_command(&mut self, conn_id: u64, cmd: Command, body: Option<Vec<u8>>) -> Response {
@@ -1227,7 +1196,7 @@ impl ServerState {
                     // If job is Ready, re-sort the ready heap
                     if state == JobState::Ready {
                         tube.ready.remove_by_id(existing_id);
-                        tube.ready.insert((pri, existing_id), existing_id);
+                        tube.ready.insert(existing_job);
                         // Update urgent stats if crossing threshold. Only Ready
                         // jobs are counted as urgent; bumping the counter for a
                         // Reserved/Delayed/Buried job would drift it upward and
@@ -1416,11 +1385,10 @@ impl ServerState {
                 gs.waiting_jobs.push(id);
             }
         } else {
-            let key = job.ready_key();
-            self.insert_job(id, job);
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.ready.insert(key, id);
+                tube.ready.insert(&job);
             }
+            self.insert_job(id, job);
             self.ready_ct += 1;
             if pri < URGENT_THRESHOLD {
                 self.stats.urgent_ct += 1;
@@ -2249,9 +2217,8 @@ impl ServerState {
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.state = JobState::Ready;
                 job.deadline_at = None;
-                let key = job.ready_key();
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.ready.insert(key, id);
+                    tube.ready.insert(job);
                 }
             }
             self.ready_ct += 1;
@@ -2468,7 +2435,7 @@ impl ServerState {
             .map(|c| c.use_tube.as_str())
             .unwrap_or("default");
         if let Some(tube) = self.tubes.get(tube_name)
-            && let Some(&(_, job_id)) = tube.ready.peek()
+            && let Some((_, job_id)) = tube.ready.peek()
             && let Some(job) = self.jobs.get(&job_id)
         {
             return self.found_or_error(job);
@@ -2572,7 +2539,7 @@ impl ServerState {
                     let key = job.ready_key();
                     let tn = job.tube_name.clone();
                     if let Some(tube) = self.tubes.get_mut(&*tn) {
-                        tube.ready.insert(key, job_id);
+                        tube.ready.insert(job);
                     }
                     self.ready_ct += 1;
                     if key.0 < URGENT_THRESHOLD {
@@ -2615,7 +2582,7 @@ impl ServerState {
                     let key = job.ready_key();
                     let tn = job.tube_name.clone();
                     if let Some(tube) = self.tubes.get_mut(&*tn) {
-                        tube.ready.insert(key, job_id);
+                        tube.ready.insert(job);
                     }
                     self.ready_ct += 1;
                     if key.0 < URGENT_THRESHOLD {
@@ -2682,7 +2649,7 @@ impl ServerState {
             job.kick_ct += 1;
             let key = job.ready_key();
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.ready.insert(key, id);
+                tube.ready.insert(job);
             }
             self.ready_ct += 1;
             if key.0 < URGENT_THRESHOLD {
@@ -2857,7 +2824,7 @@ impl ServerState {
         let (oldest_ready_id, oldest_ready_age) = tube
             .ready
             .peek()
-            .map(|(_, id)| (*id, age_secs(*id)))
+            .map(|(_, id)| (id, age_secs(id)))
             .unwrap_or((0, 0));
         let oldest_delayed_age = tube
             .delay
@@ -3464,8 +3431,10 @@ impl ServerState {
             }
             if let Some((tn, key)) = promoted {
                 self.ensure_tube(&tn);
-                if let Some(tube) = self.tubes.get_mut(&*tn) {
-                    tube.ready.insert(key, *job_id);
+                if let Some(tube) = self.tubes.get_mut(&*tn)
+                    && let Some(job) = self.jobs.get(job_id)
+                {
+                    tube.ready.insert(job);
                 }
                 self.ready_ct += 1;
                 if key.0 < URGENT_THRESHOLD {
