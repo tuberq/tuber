@@ -113,6 +113,10 @@ impl TestConn {
         self.writer.write_all(s.as_bytes()).await.unwrap();
     }
 
+    async fn send_bytes(&mut self, b: &[u8]) {
+        self.writer.write_all(b).await.unwrap();
+    }
+
     async fn readline(&mut self) -> String {
         let mut buf = String::new();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -295,6 +299,23 @@ async fn a_malformed_line_aborts_the_sync() {
     c.ck("schedule-begin splat", "SYNCING splat").await;
     c.ck("schedule-put", "BAD_FORMAT").await;
     c.ck("schedule-commit", "ABORTED").await;
+
+    // A line that isn't UTF-8 (a Latin-1 name), and one with a NUL: refused
+    // like any other bad line, body consumed, sync aborted.
+    for line in [
+        &b"schedule-put r\xe9port maint 0 0 120 2 @daily\r\n{}\r\n"[..],
+        &b"schedule-put re\x00port maint 0 0 120 2 @daily\r\n{}\r\n"[..],
+    ] {
+        c.ck("schedule-begin splat", "SYNCING splat").await;
+        assert_eq!(
+            c.schedule_put("ok", "maint", "@daily", "{}").await,
+            "STAGED"
+        );
+        c.send_bytes(line).await;
+        assert_eq!(c.readline().await, "BAD_FORMAT", "{line:?}");
+        c.ck("list-tube-used", "USING default").await;
+        c.ck("schedule-commit", "ABORTED").await;
+    }
 
     // Same name twice in one sync.
     c.ck("schedule-begin splat", "SYNCING splat").await;

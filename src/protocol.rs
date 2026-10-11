@@ -371,7 +371,7 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
 
     // Check for embedded NULs (malicious input)
     if line.bytes().any(|b| b == 0) {
-        return Err(Response::BadFormat);
+        return refused_schedule_put(line.as_bytes()).ok_or(Response::BadFormat);
     }
 
     if let Some(rest) = line.strip_prefix("put ") {
@@ -543,6 +543,26 @@ fn parse_schedule_begin(rest: &str) -> Result<Command, Response> {
     }
     Ok(Command::ScheduleBegin {
         owner: rest.to_string(),
+    })
+}
+
+/// A `schedule-put` line too broken to parse — not UTF-8, or holding a NUL
+/// — as a refused `schedule-put`, with its body length if one can be read.
+/// It still has to reach the engine, so that the sync it was meant for
+/// aborts, and its body still has to be consumed. `None` if `raw` isn't a
+/// `schedule-put` line at all.
+pub fn refused_schedule_put(raw: &[u8]) -> Option<Command> {
+    let rest = raw.strip_prefix(b"schedule-put")?;
+    if !(rest.is_empty() || rest.starts_with(b" ")) {
+        return None;
+    }
+    let bytes = String::from_utf8_lossy(rest)
+        .split_whitespace()
+        .nth(5)
+        .and_then(|b| b.parse().ok());
+    Some(Command::SchedulePut {
+        bytes,
+        line: Err(Response::BadFormat),
     })
 }
 

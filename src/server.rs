@@ -5149,18 +5149,17 @@ async fn handle_connection(
         if line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
         }
-        let cmd_str = match std::str::from_utf8(line) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = writer.write_all(b"UNKNOWN_COMMAND\r\n").await;
-                continue;
-            }
+        // A schedule-put that isn't UTF-8 is still a schedule-put: it goes to
+        // the engine refused, so the sync it was meant for aborts.
+        let parsed = match std::str::from_utf8(line) {
+            Ok(cmd_str) => protocol::parse_command(cmd_str).map_err(|resp| (resp, Some(cmd_str))),
+            Err(_) => protocol::refused_schedule_put(line).ok_or((Response::UnknownCommand, None)),
         };
 
         // Parse command
-        let mut cmd = match protocol::parse_command(cmd_str) {
+        let mut cmd = match parsed {
             Ok(cmd) => cmd,
-            Err(resp) => {
+            Err((resp, cmd_str)) => {
                 resp_buf.clear();
                 resp.serialize_into(&mut resp_buf);
                 let _ = writer.write_all(&resp_buf).await;
@@ -5168,7 +5167,7 @@ async fn handle_connection(
                 // length, the body is still inbound — drain it (plus the
                 // trailing CRLF) so the client's payload isn't parsed as
                 // commands. Mirrors the JOB_TOO_BIG drain path below.
-                if let Some(body_size) = protocol::put_declared_body_len(cmd_str) {
+                if let Some(body_size) = cmd_str.and_then(protocol::put_declared_body_len) {
                     let to_drain = body_size as u64 + 2;
                     match drain_bytes(
                         &mut reader,
