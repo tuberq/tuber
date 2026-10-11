@@ -1,6 +1,6 @@
 ---
 name: tuber
-description: Interact with a Tuber or beanstalkd work queue server using tuber-cli (preferred), the tuber binary's put/work/tubes subcommands, or raw protocol over nc (netcat). Use when tasks involve job queues, background workers, running queued shell commands, or beanstalkd protocol commands.
+description: Interact with a Tuber or beanstalkd work queue server using tuber-cli (preferred), the tuber binary's put/work/tubes/schedules subcommands, or raw protocol over nc (netcat). Use when tasks involve job queues, background workers, running queued shell commands, recurring (cron) jobs scheduled inside tuber, or beanstalkd protocol commands.
 ---
 
 # Tuber / Beanstalkd Work Queue Client
@@ -10,7 +10,7 @@ Two command-line tools talk to a tuber server:
 | Tool | Use it for |
 | --- | --- |
 | `tuber-cli` | One-shot protocol commands with JSON output: inspect, put, delete, kick, flush, pause, drain. The default choice. |
-| `tuber` (the server binary) | `tuber work` to *run* jobs as shell commands, `tuber put` to enqueue one job per stdin line, `tuber tubes` for a per-tube count table. |
+| `tuber` (the server binary) | `tuber work` to *run* jobs as shell commands, `tuber put` to enqueue one job per stdin line, `tuber tubes` for a per-tube count table, `tuber schedules` for [recurring schedules](#recurring-schedules-tuber-only). |
 
 Drop to raw protocol over `nc` only for the connection-scoped commands listed
 under [Raw protocol](#raw-protocol-fallback), or when neither tool is installed.
@@ -203,6 +203,77 @@ tuber server -l 127.0.0.1 -p 11301 &
 
 ---
 
+## Recurring schedules (tuber only)
+
+Tuber can put jobs on a timer itself. An app registers its schedule at boot
+under a name of its choosing, the **owner** (`splat`, `booko`), and tuber puts
+each entry's body into its tube at the times its spec names. A fire is an
+ordinary put: the job lands in the tube like any other, with the entry's
+priority, ttr and tags. Beanstalkd has none of this, and `tuber-cli` has no
+schedule commands yet — use `tuber schedules` and raw protocol.
+
+```bash
+# One line per entry: spec, tube, next fire, last fire's reply
+tuber schedules
+#   splat retention: 0 2 * * * Australia/Melbourne -> splat.maintenance next=2026-10-12T02:00:00+11:00 last=INSERTED 48213
+#   splat rollup: 5 * * * * -> splat.maintenance next=2026-10-11T05:05:00+00:00 last=INSERTED 47101 BURIED (deduped against a buried job 70 times running)
+tuber schedules -o splat          # one owner
+
+# Everything about one entry, including its next three fires in its own zone
+printf 'stats-schedule splat rollup\r\n' | nc -w 1 localhost 11300
+printf 'list-schedules\r\n' | nc -w 1 localhost 11300     # - <owner> <name> per line
+```
+
+**An entry that "fires" but nothing runs** shows `last=INSERTED <id> BURIED`
+and a non-zero `buried-streak`: it has an `idp:` key, and the job from an
+earlier fire is buried, so every fire dedups against it and queues nothing.
+Find the job with `tuber-cli peek-buried --tube <tube>` (or `stats-job <id>`),
+fix the cause, and `tuber-cli kick-job <id>` or delete it; the next fire
+queues again.
+
+### Syncing: a sync replaces the owner's whole set
+
+A sync sends an owner's **complete** schedule; on commit, tuber replaces that
+owner's entries with exactly the set sent. Sending one entry under `splat`
+deletes every other `splat` entry. An empty sync deletes them all. And the app
+re-syncs at its next boot, undoing a hand edit anyway — so:
+
+- **Don't sync an app's owner by hand** unless the user asks for exactly that.
+  Change the app's schedule config and let it redeploy.
+- For ad-hoc schedules, use an owner of your own (`ops`) and send its full set
+  every time.
+
+A sync is staged on one connection and committed by it, so it must be a single
+`nc` session (closing the connection mid-sync aborts it):
+
+```bash
+# schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>\r\n<body>\r\n
+# <bytes> is the body's exact byte length, as for put.
+printf 'schedule-begin ops\r\nschedule-put nightly-report reports 1024 0 600 20 idp:nightly-report 0 2 * * * Australia/Melbourne\r\n./generate-report.sh\r\nschedule-put heartbeat ops 1024 0 60 4 every 5m\r\ntrue\r\nschedule-commit\r\n' | nc -w 1 localhost 11300
+# SYNCING ops / STAGED / STAGED / SYNCED 2 0 0 0      (added changed removed unchanged)
+
+# Remove all of an owner's entries: an empty sync
+printf 'schedule-begin ops\r\nschedule-commit\r\n' | nc -w 1 localhost 11300
+# SYNCING ops / SYNCED 0 0 2 0
+```
+
+If any line is refused — `BAD_SCHEDULE` (unknown zone, a cron that never
+matches), `BAD_FORMAT`, `JOB_TOO_BIG` — the commit replies `ABORTED` and
+**nothing changes**: the old set keeps running. Fix the line and resend the
+whole sync.
+
+Specs: 5-field cron (`5 * * * *`, names like `MON-FRI`), optionally followed
+by an IANA zone (`0 2 * * * Australia/Melbourne`; default UTC) or prefixed
+`CRON_TZ=<zone>`; `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`; or
+`every 30s|10m|1h|1d [offset 5m]`, aligned to the epoch (`every 10m` fires at
+:00, :10, :20). Tags are `put`'s (`idp:`, `con:`, `grp:`, `aft:`), plus
+`catchup:<secs>`: after downtime, missed ticks fire **once** by default;
+`catchup:300` fires that one only if it's under 5 minutes stale, `catchup:0`
+never. Give recurring entries an `idp:` key so a fire is skipped while the last
+one's job is still waiting — but see the buried trap above.
+
+---
+
 ## Running jobs: `tuber work`
 
 `tuber work` is the shell's way to actually *consume* jobs. Each job body is
@@ -262,6 +333,7 @@ released. Commands that only make sense inside one live session:
 | `reserve-mode` | Sets `fifo`/`weighted` for this connection |
 | `peek-reserved` | Peeks a job this connection reserved |
 | `list-tube-used`, `list-tubes-watched` | Report this connection's state |
+| `schedule-begin` / `-put` / `-commit` | A sync is staged on this connection; a one-shot can begin one but never commit it |
 
 `tuber-cli reserve` / `reserve-batch` / `reserve-job` are therefore for
 *inspection* — seeing what a worker would get. To actually consume a job,
@@ -365,3 +437,5 @@ reserve-batch 5 30\r\n
   Long jobs should `touch` (`tuber work` does it for you); batch workers should
   `touch-all`.
 - **Job IDs** are sequential integers starting from 1.
+- **A schedule sync replaces the owner's whole set** — never send a partial
+  list under an app's owner.
