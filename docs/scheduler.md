@@ -435,7 +435,11 @@ cron is defined on the wall clock. With at most 10,000 entries a scan per
 tick is cheaper than keeping a heap in step with syncs. Fires are at most one
 tick late. A forward clock step is treated like downtime (one catch-up
 fire). After a backward step, nothing at or before an entry's last fire fires
-again.
+again — for a step of up to an hour. A last fire or sync time more than an
+hour in the future means the clock was wrong when it was recorded (a bad RTC
+put right by NTP), not that it stepped back; honouring it would silence the
+entry for as long as the clock was out, so the entry resumes from now, with a
+warning.
 
 The next-fire search walks the zone's stretches of constant offset, taking
 each stretch's first match: within a stretch civil time and real time move

@@ -238,6 +238,13 @@ impl ServerState {
 /// downtime and forward clock steps, not a slow engine step.
 const ON_TIME: SignedDuration = SignedDuration::from_secs(5);
 
+/// How far ahead of now an entry's last fire or sync may sit and still be
+/// honoured — nothing at or before it fires again — after the clock steps
+/// back. Further ahead than this, the clock was wrong when it was recorded
+/// (a bad RTC put right by NTP, say), and waiting for the clock to pass it
+/// would silence the entry for as long as the clock was out.
+const CLOCK_STEP_TOLERANCE: SignedDuration = SignedDuration::from_hours(1);
+
 impl ServerState {
     /// Fire every entry whose next tick is at or before `now`, once however
     /// many of its ticks have passed: a run of missed ticks (tuber down, or
@@ -245,7 +252,24 @@ impl ServerState {
     /// entry's `catchup:`. Called from the tick with the wall clock.
     pub(super) fn fire_due_schedules(&mut self, now: Timestamp) {
         let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
+        let mut corrected = false;
         for e in self.schedules.iter_mut() {
+            let recorded = e
+                .last_fire
+                .map_or(e.synced_at, |last| last.max(e.synced_at));
+            if recorded > now + CLOCK_STEP_TOLERANCE {
+                tracing::warn!(
+                    owner = %e.owner,
+                    name = %e.line.name,
+                    recorded = %format_time(recorded, &e.line.spec.time_zone()),
+                    "schedule's last fire or sync is in the future: the clock was wrong \
+                     then; resuming from now",
+                );
+                e.last_fire = e.last_fire.filter(|&last| last <= now);
+                e.synced_at = e.synced_at.min(now);
+                e.next_fire = e.line.spec.next_after(now);
+                corrected = true;
+            }
             let Some(tick) = e.next_fire.filter(|&t| t <= now) else {
                 continue;
             };
@@ -276,6 +300,14 @@ impl ServerState {
                 due.push((e.owner.clone(), e.line.name.clone(), e.last_fire));
                 e.last_fire = Some(now);
             }
+        }
+        // Persist corrected sync times, so a restart doesn't find them in
+        // the future again. Corrected last fires go out with the stamps.
+        if corrected
+            && let Some(files) = self.schedule_files.as_mut()
+            && let Err(e) = files.write_all(&self.schedules)
+        {
+            tracing::error!("schedule clock correction not persisted: {e}");
         }
         if due.is_empty() {
             return;

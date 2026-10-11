@@ -2394,3 +2394,37 @@ fn a_fire_that_cannot_be_stamped_is_not_put() {
     assert_eq!((e.stats.rejected, e.stats.inserted), (1, 0));
     assert_eq!(e.stats.last_result.as_deref(), Some("INTERNAL_ERROR"));
 }
+
+#[test]
+fn a_fire_stamped_by_a_clock_far_ahead_does_not_silence_the_entry() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    // It fires while the clock reads a month ahead, then the clock is put
+    // right. Waiting for the clock to pass the bogus last fire would
+    // silence the entry for a month: it resumes from now instead.
+    s.fire_due_schedules(t + jiff::SignedDuration::from_hours(24 * 30));
+    assert_eq!(fired(&s, "ping"), 1);
+    s.fire_due_schedules(t + mins(1));
+    assert_eq!(next_fire(&s, "ping"), t + mins(2));
+    s.fire_due_schedules(t + mins(2));
+    assert_eq!(fired(&s, "ping"), 2);
+}
+
+#[test]
+fn a_sync_under_a_clock_far_ahead_does_not_silence_the_entry() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+    // As restored from a sync committed while the clock read a month ahead.
+    let ahead = t + jiff::SignedDuration::from_hours(24 * 30);
+    let e = s.schedules.get_mut("app", "ping").unwrap();
+    e.synced_at = ahead;
+    e.next_fire = e.line.spec.next_after(ahead);
+
+    s.fire_due_schedules(t);
+    assert_eq!(next_fire(&s, "ping"), t + mins(1));
+}
