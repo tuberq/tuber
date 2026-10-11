@@ -1258,7 +1258,7 @@ impl ServerState {
                 .expect("job must exist — just looked up by idempotency key")
                 .state;
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.stat.count_idp_dedup(Some(state));
+                tube.stat.idp_dedups.count(Some(state));
             }
             return Response::InsertedDup(existing_id, state.as_protocol_str(), upgraded_pri);
         }
@@ -1272,7 +1272,7 @@ impl ServerState {
             if let Some((original_id, expiry)) = cooldown {
                 if SystemTime::now() < expiry {
                     if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.stat.count_idp_dedup(None);
+                        tube.stat.idp_dedups.count(None);
                     }
                     return Response::InsertedDup(original_id, "DELETED", None);
                 } else {
@@ -2948,11 +2948,11 @@ impl ServerState {
             tube.stat.queue_time_min.unwrap_or(0.0),
             tube.stat.queue_time_max.unwrap_or(0.0),
             tube.stat.queue_time_samples,
-            tube.stat.idp_dedup_ready_ct,
-            tube.stat.idp_dedup_reserved_ct,
-            tube.stat.idp_dedup_delayed_ct,
-            tube.stat.idp_dedup_buried_ct,
-            tube.stat.idp_dedup_deleted_ct,
+            tube.stat.idp_dedups.ready,
+            tube.stat.idp_dedups.reserved,
+            tube.stat.idp_dedups.delayed,
+            tube.stat.idp_dedups.buried,
+            tube.stat.idp_dedups.deleted,
         );
         Response::Ok(yaml.into_bytes())
     }

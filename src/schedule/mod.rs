@@ -17,6 +17,7 @@ use jiff::Timestamp;
 
 use crate::job::JobExt;
 use crate::protocol::Response;
+use crate::tube::IdpDedups;
 use spec::Spec;
 
 /// Most entries held across all owners. Keeps the schedule files and the
@@ -91,15 +92,20 @@ pub fn memory_cost(owner: &str, line: &Line, body: &[u8]) -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct EntryStats {
     pub inserted: u64,
-    /// `idp:` dedups by the state of the job matched: ready, reserved,
-    /// delayed, buried, and deleted (a cooldown tombstone).
-    pub deduped: [u64; 5],
+    /// `idp:` dedups by the state of the job matched.
+    pub deduped: IdpDedups,
     /// Refused puts: `DRAINING`, `OUT_OF_MEMORY`, `OUT_OF_STORAGE`, …
     pub rejected: u64,
     /// Consecutive fires that deduped against a buried job.
     pub buried_streak: u64,
     /// The reply a client would have got from the latest fire.
     pub last_result: Option<String>,
+}
+
+impl EntryStats {
+    pub fn fires(&self) -> u64 {
+        self.inserted + self.deduped.total() + self.rejected
+    }
 }
 
 #[derive(Debug)]
@@ -112,6 +118,15 @@ pub struct Entry {
     pub last_fire: Option<Timestamp>,
     pub next_fire: Option<Timestamp>,
     pub stats: EntryStats,
+}
+
+impl Entry {
+    /// The latest time recorded for this entry: its last fire, or its sync
+    /// if that's later. Ticks up to here are done; a restart resumes after.
+    pub fn recorded(&self) -> Timestamp {
+        self.last_fire
+            .map_or(self.synced_at, |last| last.max(self.synced_at))
+    }
 }
 
 /// A sync in progress on one connection. Nothing in it is live until it is
@@ -181,21 +196,21 @@ pub struct SyncCounts {
     pub unchanged: u32,
 }
 
-/// Every entry, keyed by (owner, name).
+/// Every entry, by owner then name. An owner with no entries has no map.
 #[derive(Debug, Default)]
 pub struct Schedules {
-    entries: BTreeMap<(String, String), Entry>,
-    /// Sum of `memory_cost` over `entries`.
+    owners: BTreeMap<String, BTreeMap<String, Entry>>,
+    /// Sum of `memory_cost` over every entry.
     bytes: u64,
 }
 
 impl Schedules {
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.owners.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.owners.is_empty()
     }
 
     pub fn bytes(&self) -> u64 {
@@ -203,35 +218,35 @@ impl Schedules {
     }
 
     pub fn get(&self, owner: &str, name: &str) -> Option<&Entry> {
-        self.entries.get(&(owner.to_string(), name.to_string()))
+        self.owners.get(owner)?.get(name)
+    }
+
+    pub fn get_mut(&mut self, owner: &str, name: &str) -> Option<&mut Entry> {
+        self.owners.get_mut(owner)?.get_mut(name)
     }
 
     /// Add an entry read back from disk.
     pub fn restore(&mut self, entry: Entry) {
         self.bytes += memory_cost(&entry.owner, &entry.line, &entry.body);
-        let key = (entry.owner.clone(), entry.line.name.clone());
-        if let Some(old) = self.entries.insert(key, entry) {
+        let names = self.owners.entry(entry.owner.clone()).or_default();
+        if let Some(old) = names.insert(entry.line.name.clone(), entry) {
             self.bytes -= memory_cost(&old.owner, &old.line, &old.body);
         }
     }
 
-    pub fn get_mut(&mut self, owner: &str, name: &str) -> Option<&mut Entry> {
-        self.entries.get_mut(&(owner.to_string(), name.to_string()))
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.values()
+        self.owners.values().flat_map(BTreeMap::values)
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Entry> {
-        self.entries.values_mut()
+        self.owners.values_mut().flat_map(BTreeMap::values_mut)
     }
 
-    pub fn owner_entries<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
-        self.entries
-            .range((owner.to_string(), String::new())..)
-            .take_while(move |((o, _), _)| o == owner)
-            .map(|(_, e)| e)
+    pub fn owner_entries(&self, owner: &str) -> impl Iterator<Item = &Entry> {
+        self.owners
+            .get(owner)
+            .into_iter()
+            .flat_map(BTreeMap::values)
     }
 
     /// (entries, memory) `owner` holds now.
@@ -246,21 +261,13 @@ impl Schedules {
     /// `now`, so a sync never fires anything itself.
     pub fn commit(&mut self, staging: Staging, now: Timestamp) -> SyncCounts {
         let owner = staging.owner;
-        let mut old: BTreeMap<String, Entry> = BTreeMap::new();
-        let keys: Vec<(String, String)> = self
-            .entries
-            .range((owner.clone(), String::new())..)
-            .take_while(|((o, _), _)| *o == owner)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys {
-            if let Some(e) = self.entries.remove(&key) {
-                self.bytes -= memory_cost(&e.owner, &e.line, &e.body);
-                old.insert(key.1, e);
-            }
+        let mut old = self.owners.remove(&owner).unwrap_or_default();
+        for e in old.values() {
+            self.bytes -= memory_cost(&e.owner, &e.line, &e.body);
         }
 
         let mut counts = SyncCounts::default();
+        let mut new = BTreeMap::new();
         for (name, (line, body)) in staging.entries {
             let entry = match old.remove(&name) {
                 None => {
@@ -293,9 +300,12 @@ impl Schedules {
                 }
             };
             self.bytes += memory_cost(&entry.owner, &entry.line, &entry.body);
-            self.entries.insert((owner.clone(), name), entry);
+            new.insert(name, entry);
         }
         counts.removed = old.len() as u32;
+        if !new.is_empty() {
+            self.owners.insert(owner, new);
+        }
         counts
     }
 }

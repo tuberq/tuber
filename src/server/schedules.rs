@@ -130,8 +130,6 @@ impl ServerState {
         let next2 = e.next_fire.and_then(|t| e.line.spec.next_after(t));
         let next3 = next2.and_then(|t| e.line.spec.next_after(t));
         let s = &e.stats;
-        let [ready, reserved, delayed, buried, deleted] = s.deduped;
-        let fires = s.inserted + s.deduped.iter().sum::<u64>() + s.rejected;
         let yaml = format!(
             "---\n\
              owner: \"{}\"\n\
@@ -173,13 +171,13 @@ impl ServerState {
             time(next3),
             time(e.last_fire),
             s.last_result.as_deref().unwrap_or(""),
-            fires,
+            s.fires(),
             s.inserted,
-            ready,
-            reserved,
-            delayed,
-            buried,
-            deleted,
+            s.deduped.ready,
+            s.deduped.reserved,
+            s.deduped.delayed,
+            s.deduped.buried,
+            s.deduped.deleted,
             s.rejected,
             s.buried_streak,
         );
@@ -207,9 +205,7 @@ impl ServerState {
         let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
         let mut corrected = false;
         for e in self.schedules.iter_mut() {
-            let recorded = e
-                .last_fire
-                .map_or(e.synced_at, |last| last.max(e.synced_at));
+            let recorded = e.recorded();
             if recorded > now + CLOCK_STEP_TOLERANCE {
                 tracing::warn!(
                     owner = %e.owner,
@@ -306,15 +302,9 @@ impl ServerState {
                 s.buried_streak = 0;
             }
             Response::InsertedDup(id, state, _) => {
-                let i = match *state {
-                    "READY" => 0,
-                    "RESERVED" => 1,
-                    "DELAYED" => 2,
-                    "BURIED" => 3,
-                    _ => 4,
-                };
-                s.deduped[i] += 1;
-                if i == 3 {
+                let state = JobState::from_protocol_str(state);
+                s.deduped.count(state);
+                if state == Some(JobState::Buried) {
                     s.buried_streak += 1;
                     // The 09-09 failure: the put "succeeded", queued nothing,
                     // and will keep doing so until that job is kicked.

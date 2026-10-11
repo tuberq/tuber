@@ -159,6 +159,15 @@ impl JobState {
             JobState::Buried => "BURIED",
         }
     }
+
+    /// The inverse of [`as_protocol_str`](Self::as_protocol_str). `None`
+    /// for anything else, notably the `DELETED` of a dedup reply that hit a
+    /// cooldown tombstone.
+    pub fn from_protocol_str(s: &str) -> Option<JobState> {
+        [JobState::Ready, JobState::Reserved, JobState::Delayed, JobState::Buried]
+            .into_iter()
+            .find(|state| state.as_protocol_str() == s)
+    }
 }
 
 /// Extension keys carried by `idp:`/`grp:`/`aft:`/`con:` put tags. Most

@@ -2233,8 +2233,7 @@ fn next_fire(s: &ServerState, name: &str) -> jiff::Timestamp {
 }
 
 fn fired(s: &ServerState, name: &str) -> u64 {
-    let st = &s.schedules.get("app", name).unwrap().stats;
-    st.inserted + st.deduped.iter().sum::<u64>() + st.rejected
+    s.schedules.get("app", name).unwrap().stats.fires()
 }
 
 fn ready_in(s: &ServerState, tube: &str) -> usize {
@@ -2342,7 +2341,7 @@ fn schedule_fire_records_dedups_and_buried_streak() {
     s.fire_due_schedules(t + mins(1));
     {
         let st = &s.schedules.get("app", "rollup").unwrap().stats;
-        assert_eq!((st.inserted, st.deduped[0]), (1, 1));
+        assert_eq!((st.inserted, st.deduped.ready), (1, 1));
         assert_eq!(st.last_result.as_deref(), Some("INSERTED 1 READY"));
     }
 
@@ -2353,10 +2352,10 @@ fn schedule_fire_records_dedups_and_buried_streak() {
     s.fire_due_schedules(t + mins(2));
     s.fire_due_schedules(t + mins(3));
     let st = &s.schedules.get("app", "rollup").unwrap().stats;
-    assert_eq!(st.deduped[3], 2);
+    assert_eq!(st.deduped.buried, 2);
     assert_eq!(st.buried_streak, 2);
     assert_eq!(st.last_result.as_deref(), Some("INSERTED 1 BURIED"));
-    assert_eq!(s.tubes["jobs"].stat.idp_dedup_buried_ct, 2, "counted on the tube too");
+    assert_eq!(s.tubes["jobs"].stat.idp_dedups.buried, 2, "counted on the tube too");
 }
 
 #[test]

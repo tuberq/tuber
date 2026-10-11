@@ -105,16 +105,17 @@ impl ScheduleFiles {
                 }
             };
             let last_fire = stamps.get(&(owner.clone(), line.name.clone())).copied();
-            let from = last_fire.map_or(synced_at, |last| last.max(synced_at));
-            schedules.restore(Entry {
+            let mut entry = Entry {
                 owner,
-                next_fire: line.spec.next_after(from),
+                next_fire: None,
                 line,
                 body,
                 synced_at,
                 last_fire,
                 stats: EntryStats::default(),
-            });
+            };
+            entry.next_fire = entry.line.spec.next_after(entry.recorded());
+            schedules.restore(entry);
         }
         Ok((files, schedules))
     }
