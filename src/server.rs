@@ -3970,9 +3970,10 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // index, which is correct.
         let toast_dir = dir.join("toast");
         tracing::info!("TOAST: scanning body store at {:?}", toast_dir);
-        let body_store = Arc::new(BodyStore::open(
+        let body_store = Arc::new(BodyStore::open_with_skip_corrupt(
             &toast_dir,
             crate::body_store::DEFAULT_SEGMENT_SIZE,
+            wal_skip_corrupt,
         )?);
 
         let on_disk = wal.total_disk_bytes();

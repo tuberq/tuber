@@ -193,12 +193,13 @@ enum Commands {
         #[arg(long, env = "TUBER_MIGRATE_WAL")]
         migrate_wal: bool,
 
-        /// Start even when an older WAL segment is damaged (a corrupt record
-        /// or bad header) or a segment can't be read, replaying what remains
-        /// and keeping the damaged segment as `<segment>.corrupt`. Without
-        /// this the server refuses to start, since replaying past a lost
-        /// delete brings its job back. A write cut short at the end of the
-        /// newest segment is what a crash leaves, and is truncated either way.
+        /// Start even when an older WAL or TOAST segment is damaged (a
+        /// corrupt record or header) or a WAL segment can't be read, using
+        /// what remains and keeping the damaged segment as
+        /// `<segment>.corrupt`. Without this the server refuses to start,
+        /// since replaying past a lost delete brings its job back, and a lost
+        /// body drops its job. A write cut short at the end of the newest
+        /// segment is what a crash leaves, and is truncated either way.
         #[arg(long, env = "TUBER_WAL_SKIP_CORRUPT")]
         wal_skip_corrupt: bool,
 
