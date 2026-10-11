@@ -113,6 +113,7 @@ but without a backoff, so it busy-spins and floods the log for the duration.
 | `connections-refused` | `tuber_connections_refused_total` | cumulative refusals |
 | `connections-pruned` | `tuber_connections_pruned_total` | cumulative idle closes |
 | `conn-idle-timeout` | `tuber_conn_idle_timeout_seconds` | pruning period (0 = disabled) |
+| `tcp-keepalive` | `tuber_tcp_keepalive_seconds` | keepalive idle time (0 = off) |
 
 **What to alert on:** the *ratio* `tuber_fd_connections_used /
 tuber_fd_max_connections` approaching 1, and any rise in
@@ -165,9 +166,9 @@ random worker deaths whenever the queue is quiet.
 
 Not as a sweep over `ConnState` in the engine tick, for three reasons:
 
-- **A parked `reserve` is excluded structurally.** That task is blocked awaiting
-  the engine's reply, not reading, so its timer cannot fire at all — no
-  predicate to remember and get right. (The predicate that suggests itself,
+- **A parked `reserve` is excluded structurally.** That task is awaiting the
+  engine's reply, watching the socket only for a hang-up (below), so its idle
+  timer cannot fire at all — no predicate to remember and get right. (The predicate that suggests itself,
   `!ConnState::is_waiting()`, would not have worked anyway: `CONN_TYPE_WAITING`
   is defined but never set anywhere, so `is_waiting()` is always false. The
   authoritative source for "parked" is the engine's `waiters` list.)
@@ -188,6 +189,28 @@ client is not waiting on anything, so an unsolicited line would be read as the
 response to whatever it sends next. Clients see a clean EOF. Each close
 increments `connections-pruned`.
 
+### A worker that hangs up while parked
+
+Pruning never closes a parked worker, so something else has to notice when one
+dies mid-wait — killed, OOM-killed, restarted by a deploy. While a `reserve`,
+`reserve-with-timeout` or `reserve-batch` is parked, its connection task watches
+the socket as well as the engine's reply. On EOF or a read error it sends the
+engine `Hangup`, which ends the wait with the reserve's empty answer
+(`TIMED_OUT`, or `RESERVED_BATCH 0`). The reply is still written, because a
+half-closed client (`nc -N`) can read it. The next read then sees EOF and the
+connection closes as usual. This matches beanstalkd.
+
+Before this, a dead parked worker kept its slot, fd and waiter entry until a job
+arrived. The job was then handed to each dead waiter in turn, and bounced back to
+ready from each, before reaching a live worker. Every worker restart left one
+such ghost per parked connection.
+
+Bytes that arrive during the wait are the client's next command, not a hang-up.
+They stay buffered and run once the reserve is answered.
+
+This relies on the client's host closing the connection. A peer that vanishes
+without a FIN or RST is left to TCP keepalive, below.
+
 ### Choosing a period
 
 Pick one comfortably longer than the longest gap your legitimate clients leave
@@ -203,3 +226,49 @@ message rate is roughly `busy_silent_connections / period` — negligible at
 sensible settings (10k workers on a 60 s period is ~170 msg/s), but worth not
 combining a very short period with a very large worker pool, since the engine is
 single-threaded. A pruned connection costs one message, once.
+
+## TCP keepalive
+
+Some peers vanish with nothing on the wire: a host loses power or panics, the
+network partitions, or a NAT, firewall or load balancer silently drops a quiet
+flow. The server's socket then looks healthy forever. A parked worker on such a
+peer is never sent anything, so nothing ever fails. It holds its slot and waiter
+entry indefinitely. A job handed to it sits reserved until its TTR expires, and
+the connection lingers until TCP gives up retransmitting (about 15 minutes on
+Linux).
+
+So accepted sockets get TCP keepalive, on by default (`--tcp-keepalive 60`, env
+`TUBER_TCP_KEEPALIVE`). After 60 s with nothing received, the kernel probes every
+10 s (a sixth of the period) and fails the socket after 6 unanswered probes, so a
+dead peer is noticed within about two minutes. The failure arrives as a read
+error: a parked reserve ends as above, and any other connection disconnects,
+with its reserved jobs going straight back to ready rather than waiting out
+their TTR.
+
+Two properties make this the right tool for what idle pruning can't do:
+
+- **No false positives from busy workers.** The probes are answered by the
+  peer's kernel, not the client, so a worker silent on a two-hour job is never
+  mistaken for a dead one. Only a dead host or a broken path fails.
+- **It keeps middleboxes from dropping parked workers.** The default sits under
+  the common cloud load-balancer idle timeouts (AWS NLB 350 s, Azure 240 s), so
+  a parked worker's flow is never idle long enough to be silently dropped.
+
+The cost is one small packet per idle connection per period: 10k parked workers
+at the default is about 170 packets/s.
+
+**The trade-off is the window.** A shorter period notices dead peers sooner but
+closes connections across a network outage they would otherwise have survived.
+That matters on the client side: the server's close can't reach the client
+during the outage, so afterwards a worker blocked in plain `reserve` still
+thinks it is parked and waits forever. Workers should use `reserve-with-timeout`
+(or enable keepalive on their own sockets), which covers this and a server host
+dying without closing its sockets alike.
+
+`0` turns keepalive off. There is rarely a reason to; it is there as an escape
+hatch. Values above 32767 are refused at startup, as Linux caps the idle time
+there.
+
+Behind a proxy, keepalive covers only the hop to the proxy. The proxy has to
+notice dead clients itself; when it does, it closes its connection to tuber and
+the parked-worker handling above takes over.

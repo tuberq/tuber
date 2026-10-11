@@ -227,7 +227,7 @@ put 0 0 60 14 aft:import
 send-summary
 ```
 
-The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish. If an `aft:` job isn't running and you're not sure why, use `stats-group <name>` to check whether the group still has pending or buried members.
+The `send-summary` job stays held until both `import` group jobs are deleted. Buried jobs block group completion — kick them to let the group finish. Kicking can't hurry an `aft:` job itself: while its group is incomplete, `kick` passes over it and `kick-job` returns `NOT_FOUND`, as `reserve-job` does. If an `aft:` job isn't running and you're not sure why, use `stats-group <name>` to check whether the group still has pending or buried members.
 
 Chain stages together by combining `aft:` and `grp:` on the same job — the job waits on one group while belonging to another:
 
@@ -476,12 +476,14 @@ tuber server [OPTIONS]
 | `-b`, `--binlog-dir` | `TUBER_BINLOG_DIR` | — | WAL + body-store directory (enables persistence) |
 | `-s`, `--max-storage-bytes` | `TUBER_MAX_STORAGE_BYTES` | — | Combined cap on WAL + body-store disk usage. **Mandatory** when `-b` is set. PUT returns `OUT_OF_STORAGE` when the projected footprint would exceed this; state changes (reserve/release/bury/kick/delete) always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `100g`). |
 | `-i`, `--sync-interval` | `TUBER_SYNC_INTERVAL` | `100ms` | How often the WAL and body store fsync to disk. Lower = less data loss on crash, more I/O. Accepts `ms`, `s`, `m`, `h`. |
+| `--wal-skip-corrupt` | `TUBER_WAL_SKIP_CORRUPT` | off | Start even when an older WAL or TOAST segment is damaged or a WAL segment can't be read, using what remains and keeping the segment as `<segment>.corrupt`. Without this the server refuses to start, since replaying past a lost delete brings its job back. See [WAL format: corruption handling](docs/wal-format.md#corruption-handling). |
 | `--migrate-wal` | `TUBER_MIGRATE_WAL` | off | Opt in to upgrading a pre-v5 WAL to the v5 + body-store format on startup. Without this flag the server refuses to start when it detects pre-v5 records. |
 | `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `1m` | Max size of a single job body. **Bodies pass through RAM in full on both `put` and `reserve`** — see [Sizing `--max-job-size`](#sizing---max-job-size) before raising it. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
 | `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | `1g` | Max total in-memory footprint of jobs. With persistence enabled, bodies live on disk and don't count — this caps job *metadata* (~512 B/job) plus idempotency tombstones, so 1 GiB is roughly 2M resident jobs. Without persistence, bodies are in RAM and counted. PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Pass `0` for unlimited. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
 | `-V` | `TUBER_VERBOSE` | warn | Verbosity (`-V` info, `-VV` debug) |
 | `--max-connections` | `TUBER_MAX_CONNECTIONS` | derived | Max concurrent client connections. Defaults to the fd soft limit (`ulimit -n`) minus the descriptors TOAST and the WAL currently hold, minus slack — so storage always keeps the descriptors it needs and the ceiling shrinks as the body store grows. Pass `0` for unlimited. See [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md). |
 | `--conn-idle-timeout` | `TUBER_CONN_IDLE_TIMEOUT` | `0` (off) | Close connections idle this many seconds, so a client that opens connections and leaves them open can't hold slots against the ceiling. A worker parked in `reserve` or still running jobs it reserved is never closed, however long it stays silent. Pick a period longer than your slowest legitimate client gap. See [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md). |
+| `--tcp-keepalive` | `TUBER_TCP_KEEPALIVE` | `60` | Seconds of silence before TCP keepalive probes start on a client connection; `0` turns it off. A peer that vanished without closing (host crash, partition, a NAT or load balancer dropping the flow) is noticed within about twice this, and its reserved jobs go straight back to ready. Probes are answered by the client's kernel, so a worker busy on a long job is never mistaken for a dead one. Max 32767. See [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md#tcp-keepalive). |
 | `--metrics-port` | `TUBER_METRICS_PORT` | — | Prometheus metrics endpoint port |
 | `--name` | `TUBER_NAME` | — | Instance name (shown in stats and metrics) |
 

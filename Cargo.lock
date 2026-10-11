@@ -803,6 +803,7 @@ dependencies = [
  "crc32fast",
  "jiff",
  "libc",
+ "socket2",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

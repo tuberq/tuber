@@ -22,6 +22,8 @@ const PERSIST_ENVS: &[&str] = &[
     "TUBER_BINLOG_DIR",
     "TUBER_MAX_STORAGE_BYTES",
     "TUBER_MIGRATE_WAL",
+    "TUBER_WAL_SKIP_CORRUPT",
+    "TUBER_TCP_KEEPALIVE",
 ];
 
 /// Spawn `tuber server <extra_args>` with a hermetic env plus `envs`, piping
@@ -190,4 +192,31 @@ fn server_survives_log_output_losing_its_reader() {
     );
     assert_eq!(drain.expect("drain reply"), "DRAINING\r\n");
     assert_eq!(undrain.expect("undrain reply"), "NOT_DRAINING\r\n");
+}
+
+/// Start `tuber server -V <args>` and return its log, asserting it kept running.
+fn running_server_log(envs: &[(&str, &str)], args: &[&str]) -> String {
+    let mut all_args = vec!["-V"];
+    all_args.extend_from_slice(args);
+    let (early, out) = settle(spawn_server(envs, &all_args));
+    assert!(early.is_none(), "{args:?} {envs:?}: exited early ({early:?})\n{out}");
+    out
+}
+
+#[test]
+fn tcp_keepalive_is_on_by_default_and_configurable() {
+    let out = running_server_log(&[], &[]);
+    assert!(out.contains("tcp-keepalive=60s"), "{out}");
+    let out = running_server_log(&[], &["--tcp-keepalive", "0"]);
+    assert!(out.contains("tcp-keepalive=off"), "{out}");
+    let out = running_server_log(&[("TUBER_TCP_KEEPALIVE", "30")], &[]);
+    assert!(out.contains("tcp-keepalive=30s"), "{out}");
+}
+
+#[test]
+fn tcp_keepalive_beyond_the_kernel_limit_is_refused_at_startup() {
+    // Linux caps TCP_KEEPIDLE at 32767 s. Past that every accepted socket
+    // would fail to configure, so refuse the flag rather than run without.
+    let (early, _) = settle(spawn_server(&[], &["--tcp-keepalive", "40000"]));
+    assert!(early.is_some_and(|s| !s.success()), "{early:?}");
 }

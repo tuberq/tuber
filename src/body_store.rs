@@ -7,10 +7,13 @@
 // Each segment file (`body.NNNNNN`) starts with a 16-byte file header:
 //   magic(4) "TBOD" | version(4) u32 LE | reserved(8) u64
 // followed by a sequence of body records:
-//   header(20) = body_id(8) u64 LE | len(4) u32 LE | crc32(4) u32 LE | reserved(4)
+//   header(20) = body_id(8) u64 LE | len(4) u32 LE | crc32(4) u32 LE | header_crc32(4) u32 LE
 //   body bytes (len)
-// All multi-byte integers are little-endian. The CRC covers the body bytes
-// only — header corruption is handled separately at scan time.
+// All multi-byte integers are little-endian. `crc32` covers the body bytes
+// and is checked on every read. `header_crc32` covers the 16 header bytes
+// before it and is checked by the startup scan, so a damaged id or length
+// is caught rather than misread (version 2; version 1 left those 4 bytes
+// zero, and its segments are still read without the check).
 //
 // In-RAM state
 // ------------
@@ -34,10 +37,13 @@ use crate::wal::format_bytes;
 // --- Constants ---
 
 const TOAST_MAGIC: &[u8; 4] = b"TBOD";
-const TOAST_VERSION: u32 = 1;
+const TOAST_VERSION: u32 = 2;
+/// The first format, without `header_crc32`. Still read; new segments are
+/// always written as `TOAST_VERSION`.
+const TOAST_VERSION_NO_HEADER_CRC: u32 = 1;
 /// Bytes occupied at the head of every segment file: magic(4) + version(4) + reserved(8).
 pub const FILE_HEADER_SIZE: usize = 16;
-/// Bytes occupied by each body's record header: body_id(8) + len(4) + crc32(4) + reserved(4).
+/// Bytes occupied by each body's record header: body_id(8) + len(4) + crc32(4) + header_crc32(4).
 pub const BODY_HEADER_SIZE: usize = 20;
 const TOAST_FILE_PREFIX: &str = "body.";
 
@@ -60,6 +66,9 @@ pub enum BodyStoreError {
     BadVersion(u32),
     BadCrc { expected: u32, found: u32, body_id: BodyId },
     NotFound(BodyId),
+    /// A segment is damaged in a way a crash can't explain; the message
+    /// names it and the way forward.
+    Damaged(String),
 }
 
 impl From<io::Error> for BodyStoreError {
@@ -80,6 +89,7 @@ impl std::fmt::Display for BodyStoreError {
                 body_id.0, expected, found
             ),
             BodyStoreError::NotFound(id) => write!(f, "TOAST body {} not found", id.0),
+            BodyStoreError::Damaged(msg) => f.write_str(msg),
         }
     }
 }
@@ -198,7 +208,25 @@ impl BodyStore {
     /// Existing segments are scanned to rebuild the in-memory index. The
     /// next assigned `BodyId` is one greater than the highest id seen on
     /// disk, so ids remain monotonic across restarts.
+    ///
+    /// A damaged segment is refused; see [`BodyStore::open_with_skip_corrupt`].
     pub fn open(dir: &Path, segment_size: u64) -> Result<Self, BodyStoreError> {
+        Self::open_with_skip_corrupt(dir, segment_size, false)
+    }
+
+    /// [`BodyStore::open`], choosing what to do with a damaged segment. A
+    /// crash can only cut the newest segment's last write short, and the
+    /// scan truncates that quietly. Any other damage, such as a body header
+    /// failing its CRC or a length running past the end of an older segment,
+    /// is an error unless `skip_corrupt` (`--wal-skip-corrupt`) is set. Then
+    /// the bodies before the damage are used and a copy of the segment is
+    /// kept as `.corrupt`, or a segment with no usable file header is moved
+    /// there.
+    pub fn open_with_skip_corrupt(
+        dir: &Path,
+        segment_size: u64,
+        skip_corrupt: bool,
+    ) -> Result<Self, BodyStoreError> {
         fs::create_dir_all(dir)?;
 
         let mut seqs: Vec<u64> = Vec::new();
@@ -231,11 +259,59 @@ impl BodyStore {
         let total_segments = seqs.len();
         let mut last_log = Instant::now();
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+        let newest_seq = seqs.last().copied();
+        // Appends go to the newest segment only if it is in the current
+        // format; otherwise the first write starts a new one.
+        let mut current_seq = None;
 
         for (idx, seq) in seqs.iter().enumerate() {
             let path = segment_path(dir, *seq);
+            let newest = Some(*seq) == newest_seq;
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-            let scan = scan_segment(&mut file)?;
+            let scan = scan_segment(&mut file, newest)?;
+            if let Some(damage) = &scan.damage {
+                if !skip_corrupt {
+                    return Err(damaged_segment_error(&path, &damage.what, !newest));
+                }
+                let aside = corrupt_copy_path(&path);
+                if damage.unusable {
+                    drop(file);
+                    match fs::rename(&path, &aside) {
+                        Ok(()) => tracing::error!(
+                            "TOAST: segment {:?} {}; moved to {:?} (--wal-skip-corrupt)",
+                            path,
+                            damage.what,
+                            aside,
+                        ),
+                        Err(e) => tracing::error!(
+                            "TOAST: segment {:?} {}; failed to move it aside: {}",
+                            path,
+                            damage.what,
+                            e,
+                        ),
+                    }
+                    continue;
+                }
+                match fs::copy(&path, &aside) {
+                    Ok(_) => tracing::error!(
+                        "TOAST: segment {:?} {}; using the bodies before it, copy kept as {:?} \
+                         (--wal-skip-corrupt)",
+                        path,
+                        damage.what,
+                        aside,
+                    ),
+                    Err(e) => tracing::error!(
+                        "TOAST: segment {:?} {}; using the bodies before it, failed to keep a \
+                         copy: {}",
+                        path,
+                        damage.what,
+                        e,
+                    ),
+                }
+            }
+            if newest && scan.version == TOAST_VERSION {
+                current_seq = Some(*seq);
+            }
             let mut live_bytes: u64 = 0;
             for entry in scan.entries {
                 max_body_id = max_body_id.max(entry.body_id.0 + 1);
@@ -273,7 +349,6 @@ impl BodyStore {
         }
 
         let next_seq = seqs.last().map(|s| s + 1).unwrap_or(0);
-        let current_seq = seqs.last().copied();
 
         let segment_count = segments.len();
         let store = BodyStore {
@@ -873,6 +948,13 @@ fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{}{:06}", TOAST_FILE_PREFIX, seq))
 }
 
+/// Where a damaged segment is copied or moved aside: `<path>.corrupt`.
+fn corrupt_copy_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".corrupt");
+    PathBuf::from(os)
+}
+
 /// fsync a directory so file creations/unlinks inside it survive a crash.
 /// POSIX only persists dirents when the directory itself is synced; an
 /// fsynced file can still vanish wholesale if its dirent never lands.
@@ -885,7 +967,14 @@ fn encode_body_header(body_id: BodyId, len: u32, crc: u32) -> [u8; BODY_HEADER_S
     h[0..8].copy_from_slice(&body_id.0.to_le_bytes());
     h[8..12].copy_from_slice(&len.to_le_bytes());
     h[12..16].copy_from_slice(&crc.to_le_bytes());
+    let header_crc = crc32fast::hash(&h[0..16]);
+    h[16..20].copy_from_slice(&header_crc.to_le_bytes());
     h
+}
+
+/// Whether a version 2 body header's `header_crc32` matches its other bytes.
+fn body_header_crc_ok(h: &[u8; BODY_HEADER_SIZE]) -> bool {
+    crc32fast::hash(&h[0..16]) == u32::from_le_bytes([h[16], h[17], h[18], h[19]])
 }
 
 fn decode_body_header(h: &[u8; BODY_HEADER_SIZE]) -> (BodyId, u32) {
@@ -917,13 +1006,68 @@ struct SegmentScan {
     /// A truncated tail is treated as not-present and the segment will be
     /// re-appended past `consumed` on next write.
     consumed: u64,
+    version: u32,
+    /// Damage a crash can't explain. `entries` holds the bodies before it.
+    damage: Option<Damage>,
 }
 
-fn scan_segment(file: &mut File) -> Result<SegmentScan, BodyStoreError> {
+struct Damage {
+    /// Completes "TOAST segment <path> ...".
+    what: String,
+    /// No usable file header, so no bodies at all.
+    unusable: bool,
+}
+
+impl SegmentScan {
+    fn unusable(what: String) -> Self {
+        SegmentScan {
+            entries: Vec::new(),
+            consumed: 0,
+            version: 0,
+            damage: Some(Damage {
+                what,
+                unusable: true,
+            }),
+        }
+    }
+}
+
+/// The error that stops startup at a damaged segment. `older` says a newer
+/// segment exists, which a crash can't explain: rotation fsyncs a segment
+/// before creating the next.
+fn damaged_segment_error(path: &Path, damage: &str, older: bool) -> BodyStoreError {
+    let why = if older {
+        "It is not the newest segment, so this is not a write cut short by a crash: \
+         its bodies were fsynced. "
+    } else {
+        ""
+    };
+    BodyStoreError::Damaged(format!(
+        "TOAST segment {} {damage}. {why}Starting without the bodies from there on would \
+         drop the jobs they belong to. Restore the WAL directory from a backup, or start \
+         with --wal-skip-corrupt (env TUBER_WAL_SKIP_CORRUPT) to start without them, \
+         keeping the damaged segment as {}.",
+        path.display(),
+        corrupt_copy_path(path).display(),
+    ))
+}
+
+/// Walk a segment's body headers. `newest` says no later segment exists:
+/// only then can damage be a write cut short by a crash, which is truncated
+/// here. Damage anywhere else is reported in `damage`, with the file left
+/// untouched.
+fn scan_segment(file: &mut File, newest: bool) -> Result<SegmentScan, BodyStoreError> {
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
 
     if file_len < FILE_HEADER_SIZE as u64 {
+        if !newest {
+            // rotate() fsyncs a segment's header before the next segment
+            // exists, so an older one this short was cut down afterwards.
+            return Ok(SegmentScan::unusable(format!(
+                "is {file_len} bytes, shorter than its file header"
+            )));
+        }
         // Crash artifact: rotate() creates the segment and writes its
         // header non-atomically, so a crash can leave 0..FILE_HEADER_SIZE
         // bytes behind. No complete body record fits in such a file, so
@@ -943,48 +1087,59 @@ fn scan_segment(file: &mut File) -> Result<SegmentScan, BodyStoreError> {
         return Ok(SegmentScan {
             entries: Vec::new(),
             consumed: FILE_HEADER_SIZE as u64,
+            version: TOAST_VERSION,
+            damage: None,
         });
     }
 
     let mut hbuf = [0u8; FILE_HEADER_SIZE];
     file.read_exact(&mut hbuf)?;
     if &hbuf[0..4] != TOAST_MAGIC {
-        return Err(BodyStoreError::BadMagic);
+        return Ok(SegmentScan::unusable("has a bad file header".to_string()));
     }
     let version = u32::from_le_bytes([hbuf[4], hbuf[5], hbuf[6], hbuf[7]]);
-    if version != TOAST_VERSION {
+    if version != TOAST_VERSION && version != TOAST_VERSION_NO_HEADER_CRC {
         return Err(BodyStoreError::BadVersion(version));
     }
+    let check_header_crc = version == TOAST_VERSION;
 
     let mut entries = Vec::new();
     let mut offset = FILE_HEADER_SIZE as u64;
+    let mut damage = None;
 
-    while offset + BODY_HEADER_SIZE as u64 <= file_len {
+    while offset < file_len {
+        if offset + BODY_HEADER_SIZE as u64 > file_len {
+            damage = Some(format!("ends in a partial body header at offset {offset}"));
+            break;
+        }
         let mut bh = [0u8; BODY_HEADER_SIZE];
         file.read_exact_at(&mut bh, offset)?;
+        if check_header_crc && !body_header_crc_ok(&bh) {
+            damage = Some(format!("has a corrupt body header at offset {offset}"));
+            break;
+        }
         let (body_id, len) = decode_body_header(&bh);
         let body_offset = offset + BODY_HEADER_SIZE as u64;
         let next_offset = body_offset + len as u64;
-
         if next_offset > file_len {
-            // Truncated tail. Stop here; the segment will be re-appended at
-            // `offset` on the next write. (CRC verification of the body
-            // happens at read time, not scan time, so we don't read body
-            // bytes here.)
+            // (CRC verification of the body happens at read time, not scan
+            // time, so we don't read body bytes here.)
+            damage = Some(format!(
+                "has a body at offset {offset} running {} bytes past the end of the file",
+                next_offset - file_len
+            ));
             break;
         }
-
         entries.push(ScanEntry { body_id, body_offset, len });
         offset = next_offset;
     }
 
-    // Physically drop any torn tail (a partial record after the last complete
-    // one) now. If left in place, a later append writes at `offset` but the
-    // older stray bytes beyond the new record survive, where a subsequent scan
-    // could parse them as a phantom body record — worst case advancing
-    // next_body_id toward u64::MAX permanently. Only the active segment can
-    // carry a torn tail; a cleanly sealed one has offset == file_len here.
-    if offset < file_len {
+    if damage.is_some() && newest {
+        // A torn tail: a partial record after the last complete one. Drop
+        // it now. If left in place, a later append writes at `offset` but the
+        // older stray bytes beyond the new record survive, where a subsequent
+        // scan could parse them as a phantom body record — worst case
+        // advancing next_body_id toward u64::MAX permanently.
         tracing::warn!(
             "TOAST: truncating torn tail ({} stray bytes) at offset {}",
             file_len - offset,
@@ -992,9 +1147,18 @@ fn scan_segment(file: &mut File) -> Result<SegmentScan, BodyStoreError> {
         );
         file.set_len(offset)?;
         file.sync_data()?;
+        damage = None;
     }
 
-    Ok(SegmentScan { entries, consumed: offset })
+    Ok(SegmentScan {
+        entries,
+        consumed: offset,
+        version,
+        damage: damage.map(|what| Damage {
+            what,
+            unusable: false,
+        }),
+    })
 }
 
 // --- Tests ---
@@ -1517,6 +1681,219 @@ mod tests {
         drop(inner);
         assert_eq!(bs.compact_segment(current).unwrap(), 0);
         assert_eq!(bs.read_body(id).unwrap(), b"alive");
+    }
+
+    /// Three 40-byte bodies in segment 0 and one in segment 1, so segment 0
+    /// is an older segment. Returns the ids in order.
+    fn store_with_older_segment(dir: &Path) -> Vec<BodyId> {
+        // header(16) + 3×(20 + 40) = 196 fits three; the fourth rotates.
+        let bs = BodyStore::open(dir, 200).unwrap();
+        let ids = (0..4u8).map(|i| bs.write_body(&[i; 40]).unwrap()).collect();
+        bs.fsync().unwrap();
+        ids
+    }
+
+    /// Offset of the `n`th body's header in a segment of 40-byte bodies.
+    fn header_offset(n: u64) -> u64 {
+        FILE_HEADER_SIZE as u64 + n * (BODY_HEADER_SIZE as u64 + 40)
+    }
+
+    /// Open `dir`, which must refuse; the refusal's message.
+    fn open_refusal(dir: &Path) -> String {
+        match BodyStore::open(dir, 200) {
+            Ok(bs) => panic!(
+                "open went ahead, indexing {} bodies",
+                bs.inner.lock().unwrap().index.len()
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--wal-skip-corrupt"),
+                    "names the way out: {msg}"
+                );
+                msg
+            }
+        }
+    }
+
+    /// Overwrite `bytes` at `offset` in segment `seq`; the file's new contents.
+    fn patch_segment(dir: &Path, seq: u64, offset: u64, bytes: &[u8]) -> Vec<u8> {
+        let path = segment_path(dir, seq);
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(bytes, offset).unwrap();
+        fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn test_open_refuses_overlong_body_in_older_segment() {
+        // The review's case: a corrupt length runs past the end of a sealed
+        // segment. The scan took it for a torn tail and truncated the file
+        // there, losing every body after it.
+        let tmp = TempDir::new().unwrap();
+        store_with_older_segment(tmp.path());
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+
+        let msg = open_refusal(tmp.path());
+        assert!(msg.contains("body.000000"), "{msg}");
+        assert!(
+            msg.contains(&format!("offset {}", header_offset(1))),
+            "{msg}"
+        );
+        let seg0 = segment_path(tmp.path(), 0);
+        assert_eq!(fs::read(&seg0).unwrap(), damaged, "segment left as found");
+        assert!(!corrupt_copy_path(&seg0).exists());
+    }
+
+    #[test]
+    fn test_open_refuses_corrupt_body_header_in_older_segment() {
+        // A flipped bit in a body id stays inside the file, so nothing
+        // looked wrong: the body was indexed under the wrong id, and its job
+        // found no body at startup.
+        let tmp = TempDir::new().unwrap();
+        let ids = store_with_older_segment(tmp.path());
+        let wrong_id = ids[1].0 ^ 0x40;
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1), &wrong_id.to_le_bytes());
+
+        let msg = open_refusal(tmp.path());
+        assert!(msg.contains("body.000000"), "{msg}");
+        assert_eq!(fs::read(segment_path(tmp.path(), 0)).unwrap(), damaged);
+    }
+
+    #[test]
+    fn test_open_refuses_older_segment_shorter_than_its_header() {
+        // Only a crash right after creating the newest segment leaves it
+        // shorter than its header. In an older segment, it is damage, and
+        // rewriting the header threw its bodies away.
+        let tmp = TempDir::new().unwrap();
+        store_with_older_segment(tmp.path());
+        let seg0 = segment_path(tmp.path(), 0);
+        OpenOptions::new()
+            .write(true)
+            .open(&seg0)
+            .unwrap()
+            .set_len(5)
+            .unwrap();
+
+        let msg = open_refusal(tmp.path());
+        assert!(msg.contains("body.000000"), "{msg}");
+        assert_eq!(
+            fs::metadata(&seg0).unwrap().len(),
+            5,
+            "segment left as found"
+        );
+    }
+
+    #[test]
+    fn test_open_refuses_bad_magic_and_names_the_way_out() {
+        let tmp = TempDir::new().unwrap();
+        store_with_older_segment(tmp.path());
+        patch_segment(tmp.path(), 0, 0, b"XXXX");
+
+        let msg = open_refusal(tmp.path());
+        assert!(msg.contains("body.000000"), "{msg}");
+    }
+
+    #[test]
+    fn test_open_skip_corrupt_uses_the_bodies_before_the_damage() {
+        let tmp = TempDir::new().unwrap();
+        let ids = store_with_older_segment(tmp.path());
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+
+        let bs = BodyStore::open_with_skip_corrupt(tmp.path(), 200, true).unwrap();
+        assert_eq!(bs.read_body(ids[0]).unwrap(), vec![0; 40]);
+        assert!(matches!(
+            bs.read_body(ids[1]),
+            Err(BodyStoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            bs.read_body(ids[2]),
+            Err(BodyStoreError::NotFound(_))
+        ));
+        assert_eq!(bs.read_body(ids[3]).unwrap(), vec![3; 40]);
+        let seg0 = segment_path(tmp.path(), 0);
+        assert_eq!(
+            fs::read(&seg0).unwrap(),
+            damaged,
+            "an older segment is never truncated"
+        );
+        assert_eq!(fs::read(corrupt_copy_path(&seg0)).unwrap(), damaged);
+    }
+
+    #[test]
+    fn test_open_skip_corrupt_moves_aside_a_segment_with_no_file_header() {
+        let tmp = TempDir::new().unwrap();
+        let ids = store_with_older_segment(tmp.path());
+        patch_segment(tmp.path(), 0, 0, b"XXXX");
+
+        let bs = BodyStore::open_with_skip_corrupt(tmp.path(), 200, true).unwrap();
+        assert!(matches!(
+            bs.read_body(ids[0]),
+            Err(BodyStoreError::NotFound(_))
+        ));
+        assert_eq!(bs.read_body(ids[3]).unwrap(), vec![3; 40]);
+        let seg0 = segment_path(tmp.path(), 0);
+        assert!(!seg0.exists());
+        assert!(corrupt_copy_path(&seg0).exists());
+        // New bodies still get fresh ids and land in a new segment.
+        let id = bs.write_body(b"after").unwrap();
+        assert!(id.0 > ids[3].0);
+        assert_eq!(bs.read_body(id).unwrap(), b"after");
+    }
+
+    #[test]
+    fn test_open_truncates_a_garbage_header_at_the_end_of_the_newest_segment() {
+        use std::io::Write;
+        // A crash can leave zeros where the last header should be. It fails
+        // its CRC like damage would, but in the newest segment it is a torn
+        // tail, and is truncated.
+        let tmp = TempDir::new().unwrap();
+        let ids = store_with_older_segment(tmp.path());
+        let seg1 = segment_path(tmp.path(), 1);
+        let good_len = fs::metadata(&seg1).unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&seg1)
+            .unwrap()
+            .write_all(&[0u8; BODY_HEADER_SIZE + 8])
+            .unwrap();
+
+        let bs = BodyStore::open(tmp.path(), 200).unwrap();
+        assert_eq!(fs::metadata(&seg1).unwrap().len(), good_len);
+        assert_eq!(bs.read_body(ids[3]).unwrap(), vec![3; 40]);
+    }
+
+    #[test]
+    fn test_open_reads_version_1_segments_and_writes_on_in_a_new_one() {
+        // A version 1 segment, as an earlier tuber wrote it: no header CRC.
+        let tmp = TempDir::new().unwrap();
+        let body = b"from version 1";
+        let mut seg = Vec::from(*TOAST_MAGIC);
+        seg.extend_from_slice(&TOAST_VERSION_NO_HEADER_CRC.to_le_bytes());
+        seg.extend_from_slice(&0u64.to_le_bytes());
+        seg.extend_from_slice(&7u64.to_le_bytes());
+        seg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        seg.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+        seg.extend_from_slice(&0u32.to_le_bytes());
+        seg.extend_from_slice(body);
+        let seg0 = segment_path(tmp.path(), 0);
+        fs::write(&seg0, &seg).unwrap();
+
+        let bs = BodyStore::open(tmp.path(), 1024 * 1024).unwrap();
+        assert_eq!(bs.read_body(BodyId(7)).unwrap(), body);
+        let id = bs.write_body(b"new").unwrap();
+        bs.fsync().unwrap();
+        assert_eq!(
+            fs::read(&seg0).unwrap(),
+            seg,
+            "the version 1 segment is not appended to"
+        );
+        let seg1 = fs::read(segment_path(tmp.path(), 1)).unwrap();
+        assert_eq!(seg1[4..8], TOAST_VERSION.to_le_bytes());
+        drop(bs);
+
+        let bs = BodyStore::open(tmp.path(), 1024 * 1024).unwrap();
+        assert_eq!(bs.read_body(BodyId(7)).unwrap(), body);
+        assert_eq!(bs.read_body(id).unwrap(), b"new");
     }
 
     #[test]

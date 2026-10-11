@@ -240,6 +240,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     );
     prom_gauge(
         &mut out,
+        "tuber_tcp_keepalive_seconds",
+        "TCP keepalive idle time in seconds (0 if off)",
+        &stats,
+        "tcp-keepalive",
+    );
+    prom_gauge(
+        &mut out,
         "tuber_producers_current",
         "Current producers",
         &stats,

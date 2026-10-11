@@ -57,6 +57,19 @@ impl TestServer {
         TestServer { port, handle }
     }
 
+    async fn start_with_tcp_keepalive(idle: Option<Duration>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_tcp_keepalive(listener, 65535, idle)
+                .await
+                .ok();
+        });
+
+        TestServer { port, handle }
+    }
+
     async fn start_with_max_jobs_size(max_jobs_size: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2560,6 +2573,155 @@ async fn test_delete_held_after_job_cleans_waiting_jobs() {
     c.ckresp("y\r\n").await;
 }
 
+/// `stats-job <id>`'s `state:` value.
+async fn job_state(c: &mut TestConn, id: u64) -> String {
+    c.mustsend(&format!("stats-job {id}\r\n")).await;
+    let body = c.read_ok_body().await;
+    body.lines()
+        .find_map(|l| l.strip_prefix("state: "))
+        .unwrap_or_else(|| panic!("no state in {body:?}"))
+        .to_string()
+}
+
+/// `kick` skips an aft: job with a delay while its group is incomplete, and
+/// still kicks the plain delayed job behind it. The skipped job keeps its
+/// delay and is kickable once the group completes.
+#[tokio::test]
+async fn test_kick_skips_delayed_after_job_until_group_completes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:kb\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 30 60 1 aft:kb\r\nz\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("put 0 30 60 1\r\nd\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    assert_eq!(job_state(&mut c, 2).await, "delayed");
+    assert_eq!(job_state(&mut c, 3).await, "ready");
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 3 1\r\n").await;
+    c.ckresp("d\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Completing the group makes the after-job kickable.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// `kick-job` on an after-job held for its group is NOT_FOUND, as
+/// `reserve-job` is, and leaves it held rather than making it ready.
+#[tokio::test]
+async fn test_kick_job_refuses_held_after_job() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:kj\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 0 60 1 aft:kj\r\nz\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("kick-job 2\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+    assert_eq!(job_state(&mut c, 2).await, "delayed");
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("TIMED_OUT\r\n").await;
+
+    // Completing the group releases it as usual.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// `kick-job` on an after-job with a delay is NOT_FOUND while its group is
+/// incomplete, and kicks it once the group completes.
+#[tokio::test]
+async fn test_kick_job_refuses_delayed_after_job_until_group_completes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:kd\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 30 60 1 aft:kd\r\nz\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("kick-job 2\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+    assert_eq!(job_state(&mut c, 2).await, "delayed");
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+
+    c.mustsend("kick-job 2\r\n").await;
+    c.ckresp("KICKED\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("z\r\n").await;
+}
+
+/// A buried after-job whose group has new members again stays buried under
+/// `kick` and `kick-job`, as it would on replay or `reserve-job`. With no
+/// other buried job to kick, `kick` moves on to the delayed jobs.
+#[tokio::test]
+async fn test_kick_skips_buried_after_job_while_group_reopened() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // An after-job for an empty group is ready at once; bury it.
+    c.mustsend("put 0 0 60 1 aft:ro\r\nz\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("z\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+
+    // The group gets a member, and there is a plain delayed job.
+    c.mustsend("put 0 0 60 1 grp:ro\r\na\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("put 0 30 60 1\r\nd\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
+
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    assert_eq!(job_state(&mut c, 1).await, "buried");
+    assert_eq!(job_state(&mut c, 3).await, "ready");
+    c.mustsend("kick-job 1\r\n").await;
+    c.ckresp("NOT_FOUND\r\n").await;
+
+    // Completing the group makes it kickable again.
+    c.mustsend("reserve-job 2\r\n").await;
+    c.ckresp("RESERVED 2 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("kick 5\r\n").await;
+    c.ckresp("KICKED 1\r\n").await;
+    assert_eq!(job_state(&mut c, 1).await, "ready");
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency key (con:) tests
 // ---------------------------------------------------------------------------
@@ -2834,6 +2996,43 @@ async fn test_concurrency_disconnect_frees_slot() {
         line.starts_with("RESERVED "),
         "expected RESERVED after disconnect, got: {}",
         line
+    );
+}
+
+/// The review's repro: 300 con:A jobs ahead of 5 untagged ones. With A held,
+/// every other worker should get an untagged job, not TIMED_OUT.
+#[tokio::test]
+async fn test_concurrency_deep_backlog_does_not_starve_other_jobs() {
+    let srv = TestServer::start().await;
+    let mut producer = srv.connect().await;
+    for _ in 0..300 {
+        producer.mustsend("put 0 0 60 1 con:A\r\na\r\n").await;
+        producer.ckrespsub("INSERTED ").await;
+    }
+    for _ in 0..5 {
+        producer.put_job(0, 0, 60, "b").await;
+    }
+
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        workers.push(srv.connect().await);
+    }
+    let mut got = Vec::new();
+    for w in &mut workers {
+        w.mustsend("reserve-with-timeout 0\r\n").await;
+        got.push(w.readline().await);
+        if got.last().unwrap().starts_with("RESERVED ") {
+            w.readline().await;
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            "RESERVED 1 1\r\n",
+            "RESERVED 301 1\r\n",
+            "RESERVED 302 1\r\n",
+            "RESERVED 303 1\r\n"
+        ]
     );
 }
 
@@ -5117,6 +5316,211 @@ async fn test_fuzz_very_long_line_no_newline() {
         resp.contains("current-jobs-ready"),
         "server survived long line attack"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hanging up while parked in reserve
+// ---------------------------------------------------------------------------
+
+/// Poll global `stats` until `pred` holds; false if it still doesn't after 2 s.
+/// A disconnect is handled asynchronously, so counters settle a moment after
+/// the client goes.
+async fn stats_settle(c: &mut TestConn, mut pred: impl FnMut(&str) -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        c.mustsend("stats\r\n").await;
+        if pred(&c.read_ok_body().await) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Open `n` connections watching only `tube`, each parked in a blocking
+/// `reserve`. Dropping one is what a worker killed mid-wait looks like.
+async fn park_workers(srv: &TestServer, tube: &str, n: usize) -> Vec<TestConn> {
+    let mut conns = Vec::new();
+    for _ in 0..n {
+        let mut c = srv.connect().await;
+        c.mustsend(&format!("watch {tube}\r\nignore default\r\n")).await;
+        c.ckresp("WATCHING 2\r\n").await;
+        c.ckresp("WATCHING 1\r\n").await;
+        c.mustsend("reserve\r\n").await;
+        conns.push(c);
+    }
+    conns
+}
+
+/// A worker that dies while parked in `reserve` must not stay registered. The
+/// connection task used to await the engine's reply without reading the
+/// socket, so it never saw the EOF: each such client kept its connection slot,
+/// fd and waiter entry until a job came along. Idle pruning exempts parked
+/// waiters, so nothing else reclaimed them either.
+#[tokio::test]
+async fn test_hangup_while_parked_frees_the_connection() {
+    let srv = TestServer::start().await;
+    let ghosts = park_workers(&srv, "ghost", 5).await;
+    let mut obs = srv.connect().await;
+    assert!(
+        stats_settle(&mut obs, |b| b.contains("current-waiting: 5")).await,
+        "all five should park"
+    );
+
+    drop(ghosts);
+    let mut last = String::new();
+    let settled = stats_settle(&mut obs, |b| {
+        last = b.to_string();
+        b.contains("current-waiting: 0") && b.contains("current-connections: 1")
+    })
+    .await;
+    assert!(settled, "hung-up waiters are still registered:\n{last}");
+}
+
+/// The job that arrives after the hang-ups must reach the live worker on its
+/// first reserve. It used to be handed to each dead waiter in turn: the write
+/// into the closed socket succeeded, the next read saw EOF, and the job went
+/// back to ready for the next one.
+#[tokio::test]
+async fn test_job_after_hangups_goes_straight_to_a_live_worker() {
+    let srv = TestServer::start().await;
+    let ghosts = park_workers(&srv, "ghost", 5).await;
+    let mut obs = srv.connect().await;
+    assert!(stats_settle(&mut obs, |b| b.contains("current-waiting: 5")).await);
+
+    drop(ghosts);
+    let mut worker = park_workers(&srv, "ghost", 1).await.pop().unwrap();
+    // Not asserted: with the bug the five never leave, and the job's reserve
+    // count below is the clearer failure.
+    stats_settle(&mut obs, |b| b.contains("current-waiting: 1")).await;
+
+    obs.mustsend("use ghost\r\n").await;
+    obs.ckresp("USING ghost\r\n").await;
+    let id = obs.put_job(0, 0, 60, "x").await;
+    worker.ckresp(&format!("RESERVED {id} 1\r\n")).await;
+    worker.ckresp("x\r\n").await;
+
+    obs.mustsend(&format!("stats-job {id}\r\n")).await;
+    let body = obs.read_ok_body().await;
+    assert!(body.contains("reserves: 1\n"), "{body}");
+}
+
+/// A client that half-closes while parked can still read, and gets TIMED_OUT
+/// at once, as beanstalkd answers it — not after the full timeout. This is
+/// `printf 'reserve-with-timeout 30\r\n' | nc -N`.
+#[tokio::test]
+async fn test_half_close_while_parked_times_out_at_once() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.mustsend("reserve-with-timeout 30\r\n").await;
+    c.writer.shutdown().await.unwrap();
+    c.ckresp("TIMED_OUT\r\n").await;
+    c.expect_closed(Duration::from_secs(2)).await;
+}
+
+/// The same for a long-polling `reserve-batch`, whose empty answer is
+/// `RESERVED_BATCH 0`.
+#[tokio::test]
+async fn test_half_close_while_parked_in_reserve_batch_returns_empty_batch() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.mustsend("reserve-batch 5 30\r\n").await;
+    c.writer.shutdown().await.unwrap();
+    c.ckresp("RESERVED_BATCH 0\r\n").await;
+    c.expect_closed(Duration::from_secs(2)).await;
+}
+
+/// Bytes a client sends while parked are its next command, not a hang-up:
+/// they stay buffered and run once the reserve is answered.
+#[tokio::test]
+async fn test_command_sent_while_parked_runs_after_the_reserve() {
+    let srv = TestServer::start().await;
+    let mut w = srv.connect().await;
+    w.mustsend("reserve\r\n").await;
+    let mut obs = srv.connect().await;
+    assert!(stats_settle(&mut obs, |b| b.contains("current-waiting: 1")).await);
+
+    w.mustsend("use foo\r\n").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let id = obs.put_job(0, 0, 60, "x").await;
+    w.ckresp(&format!("RESERVED {id} 1\r\n")).await;
+    w.ckresp("x\r\n").await;
+    w.ckresp("USING foo\r\n").await;
+}
+
+// ---------------------------------------------------------------------------
+// TCP keepalive
+// ---------------------------------------------------------------------------
+
+/// The server's end of `c`. The test server runs in this process, so its
+/// accepted socket is one of our own fds; find it by its address pair.
+/// Linux-only: walks /proc/self/fd.
+#[cfg(target_os = "linux")]
+fn server_side_socket(c: &TestConn) -> std::os::fd::OwnedFd {
+    use std::os::fd::BorrowedFd;
+    let want_local = c.reader.get_ref().peer_addr().unwrap();
+    let want_peer = c.reader.get_ref().local_addr().unwrap();
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let Some(fd) = entry.unwrap().file_name().to_str().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        // A stale fd from the listing just fails these lookups and is skipped.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let sock = socket2::SockRef::from(&borrowed);
+        let local = sock.local_addr().ok().and_then(|a| a.as_socket());
+        let peer = sock.peer_addr().ok().and_then(|a| a.as_socket());
+        if local == Some(want_local) && peer == Some(want_peer) {
+            return borrowed.try_clone_to_owned().unwrap();
+        }
+    }
+    panic!("no server-side socket for {want_peer} -> {want_local}");
+}
+
+/// Accepted sockets get TCP keepalive, so a peer that vanishes without a FIN
+/// or RST (host crash, partition, a middlebox dropping the flow) is noticed:
+/// after 60 s of silence, 6 probes 10 s apart. Without it a parked worker on
+/// such a peer stays registered forever, since nothing is ever sent to fail.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_accepted_sockets_have_tcp_keepalive_by_default() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    // A reply means the socket has been accepted and configured.
+    c.mustsend("list-tube-used\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    let fd = server_side_socket(&c);
+    let sock = socket2::SockRef::from(&fd);
+    assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE is off");
+    assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(60));
+    assert_eq!(
+        sock.tcp_keepalive_interval().unwrap(),
+        Duration::from_secs(10)
+    );
+    assert_eq!(sock.tcp_keepalive_retries().unwrap(), 6);
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("tcp-keepalive: 60\n"), "{body}");
+}
+
+/// `--tcp-keepalive 0` leaves accepted sockets without it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_tcp_keepalive_off_leaves_sockets_alone() {
+    let srv = TestServer::start_with_tcp_keepalive(None).await;
+    let mut c = srv.connect().await;
+    c.mustsend("list-tube-used\r\n").await;
+    c.ckresp("USING default\r\n").await;
+
+    let fd = server_side_socket(&c);
+    assert!(!socket2::SockRef::from(&fd).keepalive().unwrap());
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("tcp-keepalive: 0\n"), "{body}");
 }
 
 // ---------------------------------------------------------------------------

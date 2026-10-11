@@ -41,12 +41,6 @@ const TOMBSTONE_OVERHEAD_BYTES: u64 = 128;
 /// Below this threshold, raw weights are used.
 const FAIR_MIN_SAMPLES: u64 = 10;
 
-/// Cap on heap entries inspected by find_best_unblocked_ready when the heap
-/// top is concurrency-blocked. Bounds slow-path cost on large tubes; if the
-/// real unblocked job is deeper than this, the next process_queue tick or
-/// state-change event re-checks.
-const FIND_UNBLOCKED_MAX_VISITS: usize = 256;
-
 /// Interval at which the background TOAST compactor scans for sealed
 /// segments below the live-ratio threshold. Brisk enough to absorb
 /// realistic delete bursts without burning cycles on idle queues.
@@ -99,6 +93,43 @@ pub struct FdBudget {
     idle_timeout: Option<Duration>,
     /// Connections closed by idle pruning.
     pruned: AtomicU64,
+    /// Idle time before TCP keepalive probes start on an accepted socket, or
+    /// `None` for no keepalive. See [`set_tcp_keepalive`].
+    tcp_keepalive: Option<Duration>,
+}
+
+/// Default for `--tcp-keepalive`, in seconds. Under the idle timeouts of the
+/// common cloud load balancers (AWS NLB 350 s, Azure 240 s), so the probes also
+/// keep a parked worker's flow from being silently dropped.
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+
+/// Largest `--tcp-keepalive` accepted. Linux caps `TCP_KEEPIDLE` at 32767 s;
+/// past it every accepted socket would fail to configure.
+pub const MAX_TCP_KEEPALIVE_SECS: u64 = 32767;
+
+/// Unanswered probes before the kernel declares the peer dead. Probes go out
+/// every `idle / TCP_KEEPALIVE_PROBES`, so a dead peer is detected within
+/// about twice the idle time.
+const TCP_KEEPALIVE_PROBES: u32 = 6;
+
+/// Turn on TCP keepalive for an accepted socket: after `idle` with nothing
+/// received, probe every `idle / 6` (at least 1 s) and fail the socket after
+/// 6 unanswered probes.
+///
+/// This catches a peer that vanishes without a FIN or RST — host crash,
+/// partition, a NAT or load balancer dropping the flow — which nothing else
+/// can: a parked worker on such a peer is never sent anything, so nothing
+/// ever fails. The probes are answered by the peer's kernel, not the client,
+/// so a worker busy on a long job is never mistaken for a dead one. The
+/// failure surfaces as a read error, which ends a parked reserve
+/// ([`await_parked_reply`]) or any other read as a disconnect.
+fn set_tcp_keepalive(socket: &tokio::net::TcpStream, idle: Duration) -> io::Result<()> {
+    let interval = (idle / TCP_KEEPALIVE_PROBES).max(Duration::from_secs(1));
+    let params = socket2::TcpKeepalive::new()
+        .with_time(idle)
+        .with_interval(interval)
+        .with_retries(TCP_KEEPALIVE_PROBES);
+    socket2::SockRef::from(socket).set_tcp_keepalive(&params)
 }
 
 impl FdBudget {
@@ -111,7 +142,19 @@ impl FdBudget {
             refused: AtomicU64::new(0),
             idle_timeout: None,
             pruned: AtomicU64::new(0),
+            tcp_keepalive: Some(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS)),
         }
+    }
+
+    /// Set the TCP keepalive idle time. `None` or zero turns keepalive off.
+    pub fn with_tcp_keepalive(mut self, idle: Option<Duration>) -> Self {
+        self.tcp_keepalive = idle.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// TCP keepalive idle time, or `None` when keepalive is off.
+    pub fn tcp_keepalive(&self) -> Option<Duration> {
+        self.tcp_keepalive
     }
 
     /// Enable idle pruning. `None` or a zero duration leaves it off.
@@ -259,6 +302,10 @@ enum EnginePayload {
     IdleCheck {
         reply_tx: oneshot::Sender<bool>,
     },
+    /// The client hung up, or half-closed, while a reserve was parked
+    /// awaiting its reply. See [`await_parked_reply`] and
+    /// [`ServerState::end_wait`].
+    Hangup,
     Disconnect,
     Shutdown,
 }
@@ -809,7 +856,9 @@ impl ServerState {
                 if let Some((tube_name, key)) = requeue {
                     self.ensure_tube(&tube_name);
                     if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.ready.insert(key, job_id);
+                        if let Some(job) = self.jobs.get(&job_id) {
+                            tube.ready.insert(job);
+                        }
                         self.ready_ct += 1;
                         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -832,7 +881,18 @@ impl ServerState {
         true
     }
 
+    /// True for an `aft:` job whose group still has members outstanding. Such
+    /// a job must not become ready: the tick holds it when its delay runs
+    /// out, and `reserve-job`, `kick` and `kick-job` pass it over.
+    fn held_by_group(&self, job: &Job) -> bool {
+        job.after_group()
+            .and_then(|ag| self.groups.get(ag))
+            .is_some_and(|gs| !gs.is_complete())
+    }
+
     /// Check if a job's concurrency key already has an active reservation.
+    /// The answer depends only on the key, never on the job: `ReadyQueue`
+    /// relies on that to pass over all of a blocked key's jobs at once.
     fn is_concurrency_blocked(&self, job_id: u64) -> bool {
         self.jobs
             .get(&job_id)
@@ -892,39 +952,10 @@ impl ServerState {
         }
     }
 
-    /// Find the best unblocked ready job from a tube. The slow-path walk is
-    /// capped at FIND_UNBLOCKED_MAX_VISITS so a heavily con-key-blocked heap
-    /// doesn't melt CPU; a real unblocked job deeper than the cap is picked
-    /// up on the next event-driven process_queue.
+    /// Find the best unblocked ready job from a tube. See `ReadyQueue`.
     fn find_best_unblocked_ready(&self, tube: &Tube) -> Option<((u32, u64), u64)> {
-        let entries = tube.ready.entries();
-        let top = *entries.first()?;
-        if !self.is_concurrency_blocked(top.1) {
-            return Some(top);
-        }
-
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-        // (priority+id key, job id, heap index) — Reverse turns max-heap into min-heap.
-        type Pending = Reverse<((u32, u64), u64, usize)>;
-        let mut pending: BinaryHeap<Pending> = BinaryHeap::new();
-        pending.push(Reverse((top.0, top.1, 0)));
-        let mut visited = 0usize;
-        while let Some(Reverse((key, jid, idx))) = pending.pop() {
-            visited += 1;
-            if !self.is_concurrency_blocked(jid) {
-                return Some((key, jid));
-            }
-            if visited >= FIND_UNBLOCKED_MAX_VISITS {
-                return None;
-            }
-            for child in [idx * 2 + 1, idx * 2 + 2] {
-                if let Some(&(k, id)) = entries.get(child) {
-                    pending.push(Reverse((k, id, child)));
-                }
-            }
-        }
-        None
+        tube.ready
+            .best_unblocked(|id| self.is_concurrency_blocked(id))
     }
 
     fn handle_command(&mut self, conn_id: u64, cmd: Command, body: Option<Vec<u8>>) -> Response {
@@ -1226,7 +1257,7 @@ impl ServerState {
                     // If job is Ready, re-sort the ready heap
                     if state == JobState::Ready {
                         tube.ready.remove_by_id(existing_id);
-                        tube.ready.insert((pri, existing_id), existing_id);
+                        tube.ready.insert(existing_job);
                         // Update urgent stats if crossing threshold. Only Ready
                         // jobs are counted as urgent; bumping the counter for a
                         // Reserved/Delayed/Buried job would drift it upward and
@@ -1410,11 +1441,10 @@ impl ServerState {
                 gs.waiting_jobs.push(id);
             }
         } else {
-            let key = job.ready_key();
-            self.insert_job(id, job);
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.ready.insert(key, id);
+                tube.ready.insert(&job);
             }
+            self.insert_job(id, job);
             self.ready_ct += 1;
             if pri < URGENT_THRESHOLD {
                 self.stats.urgent_ct += 1;
@@ -1525,13 +1555,7 @@ impl ServerState {
             return Response::NotFound;
         }
 
-        // Check after_group dependency
-        let hold_for_group = job
-            .after_group()
-            .and_then(|ag| self.groups.get(ag))
-            .map(|gs| !gs.is_complete())
-            .unwrap_or(false);
-        if hold_for_group {
+        if self.held_by_group(job) {
             return Response::NotFound;
         }
 
@@ -2243,9 +2267,8 @@ impl ServerState {
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.state = JobState::Ready;
                 job.deadline_at = None;
-                let key = job.ready_key();
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.ready.insert(key, id);
+                    tube.ready.insert(job);
                 }
             }
             self.ready_ct += 1;
@@ -2462,7 +2485,7 @@ impl ServerState {
             .map(|c| c.use_tube.as_str())
             .unwrap_or("default");
         if let Some(tube) = self.tubes.get(tube_name)
-            && let Some(&(_, job_id)) = tube.ready.peek()
+            && let Some((_, job_id)) = tube.ready.peek()
             && let Some(job) = self.jobs.get(&job_id)
         {
             return self.found_or_error(job);
@@ -2526,39 +2549,92 @@ impl ServerState {
 
         let mut kicked = 0u32;
 
-        // Kick buried first, then delayed
-        let has_buried = self
-            .tubes
-            .get(&tube_name)
-            .map(|t| !t.buried.is_empty())
-            .unwrap_or(false);
+        // Kick buried first, then delayed. An after-job whose group is
+        // incomplete is passed over in both, keeping its place; if every
+        // buried job is passed over, the delayed ones are kicked instead.
+        let mut passed_over = Vec::new();
+        while kicked < bound {
+            let Some(job_id) = self
+                .tubes
+                .get_mut(&*tube_name)
+                .and_then(|t| t.buried.pop_front())
+            else {
+                break;
+            };
+            if self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|j| self.held_by_group(j))
+            {
+                passed_over.push(job_id);
+                continue;
+            }
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
+            }
+            self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
 
-        if has_buried {
-            for _ in 0..bound {
-                let job_id = {
-                    let tube = match self.tubes.get_mut(&*tube_name) {
-                        Some(t) => t,
-                        None => break,
-                    };
-                    match tube.buried.pop_front() {
-                        Some(id) => {
-                            tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
-                            id
-                        }
-                        None => break,
+            // Group tracking: un-bury decrements buried count
+            if let Some(job) = self.jobs.get(&job_id)
+                && let Some(grp) = job.group()
+                && let Some(gs) = self.groups.get_mut(grp)
+            {
+                gs.buried = gs.buried.saturating_sub(1);
+            }
+
+            // Re-enqueue as ready
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                job.state = JobState::Ready;
+                job.deadline_at = None;
+                job.kick_ct += 1;
+                let key = job.ready_key();
+                let tn = job.tube_name.clone();
+                if let Some(tube) = self.tubes.get_mut(&*tn) {
+                    tube.ready.insert(job);
+                }
+                self.ready_ct += 1;
+                if key.0 < URGENT_THRESHOLD {
+                    self.stats.urgent_ct += 1;
+                    if let Some(tube) = self.tubes.get_mut(&*tn) {
+                        tube.stat.urgent_ct += 1;
                     }
-                };
-                self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
+                }
+            }
+            // WAL: write kick state change
+            let pri = self.job_pri(job_id);
+            self.wal_write_state_change(
+                job_id,
+                Some(JobState::Ready),
+                pri,
+                Duration::ZERO,
+                0,
+                StateChangeReason::Kick,
+            );
+            kicked += 1;
+        }
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+            for &id in passed_over.iter().rev() {
+                tube.buried.push_front(id);
+            }
+        }
 
-                // Group tracking: un-bury decrements buried count
-                if let Some(job) = self.jobs.get(&job_id)
-                    && let Some(grp) = job.group()
-                    && let Some(gs) = self.groups.get_mut(grp)
+        if kicked == 0 {
+            let mut passed_over = Vec::new();
+            while kicked < bound {
+                let Some((deadline, job_id)) =
+                    self.tubes.get_mut(&*tube_name).and_then(|t| t.delay.pop())
+                else {
+                    break;
+                };
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|j| self.held_by_group(j))
                 {
-                    gs.buried = gs.buried.saturating_sub(1);
+                    passed_over.push((deadline, job_id));
+                    continue;
                 }
 
-                // Re-enqueue as ready
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.state = JobState::Ready;
                     job.deadline_at = None;
@@ -2566,7 +2642,7 @@ impl ServerState {
                     let key = job.ready_key();
                     let tn = job.tube_name.clone();
                     if let Some(tube) = self.tubes.get_mut(&*tn) {
-                        tube.ready.insert(key, job_id);
+                        tube.ready.insert(job);
                     }
                     self.ready_ct += 1;
                     if key.0 < URGENT_THRESHOLD {
@@ -2588,48 +2664,10 @@ impl ServerState {
                 );
                 kicked += 1;
             }
-        } else {
-            // Kick delayed
-            for _ in 0..bound {
-                let job_id = {
-                    let tube = match self.tubes.get_mut(&*tube_name) {
-                        Some(t) => t,
-                        None => break,
-                    };
-                    match tube.delay.pop() {
-                        Some((_, id)) => id,
-                        None => break,
-                    }
-                };
-
-                if let Some(job) = self.jobs.get_mut(&job_id) {
-                    job.state = JobState::Ready;
-                    job.deadline_at = None;
-                    job.kick_ct += 1;
-                    let key = job.ready_key();
-                    let tn = job.tube_name.clone();
-                    if let Some(tube) = self.tubes.get_mut(&*tn) {
-                        tube.ready.insert(key, job_id);
-                    }
-                    self.ready_ct += 1;
-                    if key.0 < URGENT_THRESHOLD {
-                        self.stats.urgent_ct += 1;
-                        if let Some(tube) = self.tubes.get_mut(&*tn) {
-                            tube.stat.urgent_ct += 1;
-                        }
-                    }
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                for (deadline, id) in passed_over {
+                    tube.delay.insert(deadline, id);
                 }
-                // WAL: write kick state change
-                let pri = self.job_pri(job_id);
-                self.wal_write_state_change(
-                    job_id,
-                    Some(JobState::Ready),
-                    pri,
-                    Duration::ZERO,
-                    0,
-                    StateChangeReason::Kick,
-                );
-                kicked += 1;
             }
         }
 
@@ -2642,6 +2680,9 @@ impl ServerState {
             Some(j) => j,
             None => return Response::NotFound,
         };
+        if self.held_by_group(job) {
+            return Response::NotFound;
+        }
 
         let state = job.state;
         let tube_name = job.tube_name.clone();
@@ -2676,7 +2717,7 @@ impl ServerState {
             job.kick_ct += 1;
             let key = job.ready_key();
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.ready.insert(key, id);
+                tube.ready.insert(job);
             }
             self.ready_ct += 1;
             if key.0 < URGENT_THRESHOLD {
@@ -2851,7 +2892,7 @@ impl ServerState {
         let (oldest_ready_id, oldest_ready_age) = tube
             .ready
             .peek()
-            .map(|(_, id)| (*id, age_secs(*id)))
+            .map(|(_, id)| (id, age_secs(id)))
             .unwrap_or((0, 0));
         let oldest_delayed_age = tube
             .delay
@@ -3149,6 +3190,7 @@ impl ServerState {
              connections-refused: {}\n\
              connections-pruned: {}\n\
              conn-idle-timeout: {}\n\
+             tcp-keepalive: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              current-schedules: {}\n\
@@ -3243,6 +3285,8 @@ impl ServerState {
             self.fd_budget
                 .idle_timeout()
                 .map_or(0, |d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
+            // Seconds; 0 when off.
+            self.fd_budget.tcp_keepalive().map_or(0, |d| d.as_secs()),
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             self.schedules.len(),
@@ -3460,8 +3504,10 @@ impl ServerState {
             }
             if let Some((tn, key)) = promoted {
                 self.ensure_tube(&tn);
-                if let Some(tube) = self.tubes.get_mut(&*tn) {
-                    tube.ready.insert(key, *job_id);
+                if let Some(tube) = self.tubes.get_mut(&*tn)
+                    && let Some(job) = self.jobs.get(job_id)
+                {
+                    tube.ready.insert(job);
                 }
                 self.ready_ct += 1;
                 if key.0 < URGENT_THRESHOLD {
@@ -3685,6 +3731,25 @@ impl ServerState {
         waiter
     }
 
+    /// The client hung up, or half-closed, while parked. End the wait the way
+    /// beanstalkd does, with the reserve's empty answer — TIMED_OUT, or
+    /// `RESERVED_BATCH 0` for a batch — since a half-closed client can still
+    /// read it. A no-op once the reserve has been answered: commands from one
+    /// connection arrive in order, so a job handed over before the hang-up is
+    /// replied to normally, and goes back to ready on the disconnect if the
+    /// client really has gone.
+    fn end_wait(&mut self, conn_id: u64) {
+        if let Some(i) = self.waiters.iter().position(|w| w.conn_id == conn_id) {
+            let waiter = self.remove_waiter_at(i);
+            let resp = if waiter.batch_count.is_some() {
+                Response::ReservedBatch(Vec::new())
+            } else {
+                Response::TimedOut
+            };
+            let _ = waiter.reply_tx.send(resp);
+        }
+    }
+
     fn remove_waiter(&mut self, conn_id: u64) {
         let mut i = 0;
         while i < self.waiters.len() {
@@ -3864,6 +3929,7 @@ struct StateConfig<'a> {
     wal_dir: Option<&'a Path>,
     sync_interval: Duration,
     migrate_wal: bool,
+    wal_skip_corrupt: bool,
     name: Option<String>,
     fd_budget: Arc<FdBudget>,
 }
@@ -3886,6 +3952,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         wal_dir,
         sync_interval,
         migrate_wal,
+        wal_skip_corrupt,
         name,
         fd_budget,
     } = cfg;
@@ -3919,6 +3986,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             crate::wal::WalConfig {
                 max_file_size: None,
                 sync_interval,
+                skip_corrupt: wal_skip_corrupt,
             },
         )?;
 
@@ -3954,9 +4022,10 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // index, which is correct.
         let toast_dir = dir.join("toast");
         tracing::info!("TOAST: scanning body store at {:?}", toast_dir);
-        let body_store = Arc::new(BodyStore::open(
+        let body_store = Arc::new(BodyStore::open_with_skip_corrupt(
             &toast_dir,
             crate::body_store::DEFAULT_SEGMENT_SIZE,
+            wal_skip_corrupt,
         )?);
 
         let on_disk = wal.total_disk_bytes();
@@ -4167,13 +4236,19 @@ pub async fn run(
     wal_dir: Option<&str>,
     sync_interval: Duration,
     migrate_wal: bool,
+    wal_skip_corrupt: bool,
     metrics_port: Option<u16>,
     name: Option<String>,
     max_connections: Option<usize>,
     conn_idle_timeout: Option<Duration>,
+    tcp_keepalive: Option<Duration>,
 ) -> io::Result<()> {
     let wal_path = wal_dir.map(Path::new);
-    let fd_budget = Arc::new(FdBudget::new(max_connections).with_idle_timeout(conn_idle_timeout));
+    let fd_budget = Arc::new(
+        FdBudget::new(max_connections)
+            .with_idle_timeout(conn_idle_timeout)
+            .with_tcp_keepalive(tcp_keepalive),
+    );
     let state = build_state(StateConfig {
         max_job_size,
         max_job_bytes,
@@ -4181,6 +4256,7 @@ pub async fn run(
         wal_dir: wal_path,
         sync_interval,
         migrate_wal,
+        wal_skip_corrupt,
         name: name.clone(),
         fd_budget: Arc::clone(&fd_budget),
     })?;
@@ -4204,6 +4280,11 @@ pub async fn run(
     // documented default rather than an ambiguous omission.
     if let Some(d) = fd_budget.idle_timeout() {
         opts.push_str(&format!(" conn-idle-timeout={}s", d.as_secs()));
+    }
+    // Always logged: it's on by default, so "off" is a deliberate choice.
+    match fd_budget.tcp_keepalive() {
+        Some(d) => opts.push_str(&format!(" tcp-keepalive={}s", d.as_secs())),
+        None => opts.push_str(" tcp-keepalive=off"),
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
@@ -4293,6 +4374,7 @@ pub async fn run_with_listener_limited(
         wal_dir,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal,
+        wal_skip_corrupt: false,
         name,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
     })?;
@@ -4316,6 +4398,7 @@ pub async fn run_with_listener_sync_zero(
         wal_dir: Some(wal_dir),
         sync_interval: Duration::ZERO,
         migrate_wal: true,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
     })?;
@@ -4337,6 +4420,7 @@ pub async fn run_with_listener_max_connections(
         wal_dir: None,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal: false,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(max_connections))),
     })?;
@@ -4358,8 +4442,30 @@ pub async fn run_with_listener_idle_timeout(
         wal_dir: None,
         sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal: false,
+        wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_idle_timeout(Some(idle_timeout))),
+    })?;
+    serve(listener, state, max_job_size).await
+}
+
+/// Test-only: run with TCP keepalive at `idle` (`None` = off), which production
+/// reaches via `--tcp-keepalive`. The other constructors use the default.
+pub async fn run_with_listener_tcp_keepalive(
+    listener: TcpListener,
+    max_job_size: u32,
+    idle: Option<Duration>,
+) -> io::Result<()> {
+    let state = build_state(StateConfig {
+        max_job_size,
+        max_job_bytes: None,
+        max_storage_bytes: None,
+        wal_dir: None,
+        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
+        migrate_wal: false,
+        wal_skip_corrupt: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0)).with_tcp_keepalive(idle)),
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4475,6 +4581,10 @@ fn process_message(
                 state.fd_budget.note_pruned();
             }
             let _ = reply_tx.send(prune);
+            ProcessResult::Continue
+        }
+        EnginePayload::Hangup => {
+            state.end_wait(msg.conn_id);
             ProcessResult::Continue
         }
         EnginePayload::Disconnect => {
@@ -4780,6 +4890,11 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                     continue;
                 }
                 let _ = socket.set_nodelay(true);
+                if let Some(idle) = fd_budget.tcp_keepalive()
+                    && let Err(e) = set_tcp_keepalive(&socket, idle)
+                {
+                    tracing::debug!(peer = %peer, "could not enable TCP keepalive: {e}");
+                }
                 tracing::debug!("accepted connection from {}", peer);
 
                 let tx = engine_tx.clone();
@@ -5072,6 +5187,49 @@ async fn drain_bytes(
 /// Closing is silent, for the same reason a refused connection is: the client is
 /// not awaiting a reply, so an unsolicited line would be read as the response to
 /// whatever it sends next.
+/// Await the reply to a reserve that may park in the engine, while watching the
+/// socket for the client going away.
+///
+/// A plain `reply_rx.await` reads nothing while it waits, so a client that died
+/// mid-reserve was never noticed: its slot, fd and waiter entry stayed until a
+/// job arrived, and that job then bounced through every such ghost before
+/// reaching a live worker. Idle pruning can't help, as it exempts waiters.
+///
+/// On EOF or a read error this sends the engine `Hangup`, which ends the wait
+/// with the reserve's empty answer. The reply is still awaited and written —
+/// a half-closed client can read it — and the next read sees EOF and
+/// disconnects as usual. beanstalkd does the same (`prot.c`, `STATE_WAIT`).
+///
+/// Bytes that arrive instead are the client's next command, pipelined: they
+/// stay in `reader`'s buffer and the wait carries on unwatched, as it does
+/// when the buffer already held some.
+async fn await_parked_reply(
+    conn_id: u64,
+    engine_tx: &mpsc::Sender<EngineMsg>,
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut reply_rx: oneshot::Receiver<Response>,
+) -> Result<Response, oneshot::error::RecvError> {
+    if !reader.buffer().is_empty() {
+        return reply_rx.await;
+    }
+    tokio::select! {
+        biased;
+        reply = &mut reply_rx => return reply,
+        read = reader.fill_buf() => {
+            let hung_up = read.map_or(true, |buf| buf.is_empty());
+            if hung_up {
+                let _ = engine_tx
+                    .send(EngineMsg {
+                        conn_id,
+                        payload: EnginePayload::Hangup,
+                    })
+                    .await;
+            }
+        }
+    }
+    reply_rx.await
+}
+
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     engine_tx: mpsc::Sender<EngineMsg>,
@@ -5260,7 +5418,12 @@ async fn handle_connection(
             None
         };
 
-        // Send to engine and await response
+        // Send to engine and await response. A reserve can park in the engine
+        // indefinitely, so its wait also watches the socket.
+        let can_park = matches!(
+            cmd,
+            Command::Reserve | Command::ReserveWithTimeout { .. } | Command::ReserveBatch { .. }
+        );
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = engine_tx
             .send(EngineMsg {
@@ -5273,7 +5436,12 @@ async fn handle_connection(
             })
             .await;
 
-        match reply_rx.await {
+        let reply = if can_park {
+            await_parked_reply(conn_id, &engine_tx, &mut reader, reply_rx).await
+        } else {
+            reply_rx.await
+        };
+        match reply {
             Ok(resp) => {
                 resp_buf.clear();
                 resp.serialize_into(&mut resp_buf);

@@ -287,10 +287,30 @@ you want a rollback option.
 
 ### Corruption handling
 
-Corrupt or truncated records terminate processing of that file (with a
-warning). Valid records before the corruption point are preserved. The
-file is truncated at the corrupt offset to prevent repeated warnings on
-future restarts.
+A crash can only damage the **newest** segment: it cuts the last writes
+short. A corrupt or truncated record there ends processing of that file;
+the valid records before it are kept, a copy of the whole segment is kept
+as `<segment>.corrupt`, and the file is truncated at the bad offset so the
+next restart doesn't trip on it again. A newest segment shorter than its
+header (a crash between creating it and fsyncing the header) holds no
+records and is removed.
+
+Damage anywhere else stops the server from starting (the TOAST body
+store follows the same rule; see its Crash Safety section):
+
+- a corrupt or truncated record, or a bad header, in an **older**
+  segment. Rotation fsyncs a segment before creating the next one, and
+  creating a segment fsyncs its header, so a crash can't explain it.
+  Records there were durable.
+- any segment, newest included, that can't be read (EIO, permissions).
+
+Replaying past either would lose the changes recorded there. A lost
+delete brings its job back, and a lost put loses its job. The error
+names the segment and the damage, and nothing on disk is changed. Restore the WAL
+directory from a backup, or start with `--wal-skip-corrupt` (env
+`TUBER_WAL_SKIP_CORRUPT`) to replay what remains. A segment with a bad
+header or a read error is then renamed to `<segment>.corrupt`, and one
+with a corrupt record is copied there and truncated at the bad offset.
 
 ## Durability
 
@@ -412,7 +432,7 @@ freshly-created segment is also `fsync`'d after writing its file header.
 | Offset | Size | Field    | Value                            |
 |--------|------|----------|----------------------------------|
 | 0      | 4    | magic    | `TBOD` (`0x54424F44`)            |
-| 4      | 4    | version  | `1` (u32 LE)                     |
+| 4      | 4    | version  | `2` (u32 LE); `1` is still read  |
 | 8      | 8    | reserved | `0` — for future use             |
 
 **Total: 16 bytes**
@@ -429,7 +449,7 @@ After the file header, each body is laid out as:
 +------------------------------------+
 | crc32 (u32)                         |  4
 +------------------------------------+
-| reserved (u32)                      |  4
+| header_crc32 (u32)                  |  4
 +------------------------------------+
 | body bytes (len)                    |  N
 +------------------------------------+
@@ -439,14 +459,16 @@ After the file header, each body is laid out as:
 
 - `body_id` — the logical id stored in the WAL's FullJob record.
 - `len` — body byte count (does not include the header).
-- `crc32` — `crc32fast` over the body bytes only. Header corruption is
-  handled separately at scan time (truncated tails are recovered, see
-  below).
-- `reserved` — currently zero, available for future per-body flags.
+- `crc32` — `crc32fast` over the body bytes only.
+- `header_crc32` — `crc32fast` over the 16 header bytes before it
+  (`body_id`, `len`, `crc32`). Version 1 segments have zero here and are
+  read without the check.
 
-The CRC is verified on every read. Compaction also re-verifies the CRC
+The body CRC is verified on every read. Compaction also re-verifies it
 when copying bodies to a new segment, so silent disk corruption surfaces
-loudly rather than silently propagating.
+loudly rather than silently propagating. The header CRC is verified by
+the startup scan, so a damaged id or length is caught there instead of
+being misread (see Crash Safety).
 
 ## In-RAM Index
 
@@ -489,9 +511,22 @@ synchronisation point.
 - **TOAST-then-WAL fsync ordering** (see overview) — a WAL record never
   becomes durable before the body it references. A crash leaves orphan
   bodies, never dangling references.
-- **Truncated tail recovery** — `BodyStore::open` stops scanning at the
-  first incomplete record and records `consumed = offset`. The next write
-  resumes at `consumed`, overwriting the partial record.
+- **Torn tail recovery** — only the newest segment can end in a write a
+  crash cut short: rotation fsyncs a segment before creating the next,
+  and fsyncs the new segment's file header. In the newest segment,
+  `BodyStore::open` stops at the first partial record, failed header CRC
+  or length running past the end of the file, and truncates the segment
+  there. The next write resumes at that point.
+- **Damage** — the same findings in an older segment, or a segment with
+  a bad file header, mean bodies that were durable are gone, and the
+  server refuses to start, leaving the files alone. With
+  `--wal-skip-corrupt` it starts with the bodies before the damage, keeps
+  a copy of the segment as `<segment>.corrupt` (or moves it there when
+  its file header is bad), and never truncates an older segment. Jobs
+  whose bodies are lost are reaped as missing-body jobs (below).
+- **Version 1 segments** — read without the header check. A version 1
+  newest segment is not appended to; the first write starts a version 2
+  segment.
 - **Orphan reclamation** — bodies whose owning jobs were deleted before
   the runtime `BodyStore::delete` could run are detected during WAL
   replay and dropped via `BodyStore::delete_many`.
@@ -597,3 +632,4 @@ counts on both if multiple distinct failures happened.
 | Version | Changes |
 |---------|---------|
 | 1       | Initial format: 16-byte file header + 20-byte body record headers + raw bytes. CRC32 over body bytes only. |
+| 2       | The body header's last 4 bytes, reserved in v1, hold `header_crc32` over the 16 bytes before them, checked by the startup scan. v1 segments are still read. An older tuber refuses to start on a v2 segment (`TOAST bad version: 2`). |

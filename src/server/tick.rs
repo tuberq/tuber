@@ -25,14 +25,10 @@ impl ServerState {
                     .and_then(|t| t.delay.pop().map(|(_, id)| id));
 
                 if let Some(job_id) = job_id {
-                    // Check if this is an aft: job whose group isn't complete yet
                     let hold_for_group = self
                         .jobs
                         .get(&job_id)
-                        .and_then(|j| j.after_group())
-                        .and_then(|ag| self.groups.get(ag))
-                        .map(|gs| !gs.is_complete())
-                        .unwrap_or(false);
+                        .is_some_and(|j| self.held_by_group(j));
 
                     if hold_for_group {
                         // Keep as delayed with no deadline; add to group waiting list
@@ -49,7 +45,7 @@ impl ServerState {
                         job.deadline_at = None;
                         let key = job.ready_key();
                         if let Some(tube) = self.tubes.get_mut(tube_name) {
-                            tube.ready.insert(key, job_id);
+                            tube.ready.insert(job);
                         }
                         self.ready_ct += 1;
                         if key.0 < URGENT_THRESHOLD {
@@ -132,7 +128,9 @@ impl ServerState {
                     if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
                         tube.stat.total_timeout_ct += 1;
-                        tube.ready.insert(key, job_id);
+                        if let Some(job) = self.jobs.get(&job_id) {
+                            tube.ready.insert(job);
+                        }
                     }
                     self.ready_ct += 1;
                     if key.0 < URGENT_THRESHOLD {
@@ -345,7 +343,6 @@ impl ServerState {
             let tube_name = job.tube_name.clone();
             let state = job.state;
             let pri = job.priority;
-            let ready_key = job.ready_key();
             let deadline_at = job.deadline_at;
             let delay = job.delay;
             let idempotency_key = job.idempotency_key().cloned();
@@ -357,8 +354,10 @@ impl ServerState {
 
             match state {
                 JobState::Ready => {
-                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.ready.insert(ready_key, id);
+                    if let Some(tube) = self.tubes.get_mut(&*tube_name)
+                        && let Some(job) = self.jobs.get(&id)
+                    {
+                        tube.ready.insert(job);
                     }
                     self.ready_ct += 1;
                     if pri < URGENT_THRESHOLD {

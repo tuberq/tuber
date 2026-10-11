@@ -11,6 +11,9 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 crc32fast = "1"
 libc = "0.2"
+# Already built through tokio (which enables "all"); depended on directly for
+# TCP keepalive timings, which tokio's TcpStream doesn't expose.
+socket2 = { version = "0.6", features = ["all"] }
 tikv-jemallocator = "0.6.1"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 jiff = "0.2"

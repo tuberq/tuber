@@ -26,7 +26,7 @@ The codebase mirrors the original C beanstalkd structure:
 - **`src/server.rs`** - Tokio TCP server, accepts connections and dispatches to protocol handler.
 - **`src/protocol.rs`** - Beanstalkd text protocol parser and command dispatch. The protocol is line-based (`\r\n` terminated). See `tmp/prot.c` for the full C implementation. Includes tuber extensions: `idp:`, `grp:`, `aft:`, `con:` tags on `put`, `reserve-mode`, `flush-tube`, `flush-buried`, and `touch-all`.
 - **`src/job.rs`** - Job struct and job storage (hash table). Jobs have states: Ready, Reserved, Buried, Delayed. Jobs are ordered by priority then ID. Includes fields for idempotency key, group, after-group, and concurrency key.
-- **`src/tube.rs`** - Named queues ("tubes"). Each tube has a ready heap, delay heap, buried list, and waiting connections list. Default tube is "default".
+- **`src/tube.rs`** - Named queues ("tubes"). Each tube has a ready queue (`ReadyQueue`: a priority heap, with `con:` jobs grouped by key so a reserve steps past a blocked key in one move), delay heap, buried list, and waiting connections list. Default tube is "default".
 - **`src/conn.rs`** - Per-connection state: current tube (`use`), watched tubes (`watch`), reserved jobs list, reserve mode (FIFO or weighted), and read/write buffers.
 - **`src/heap.rs`** - Binary min-heap used for ready queue (priority ordering), delay queue (deadline ordering), and connection timeouts.
 - **`src/wal.rs`** - Write-ahead log for persistence (optional, enabled with `-b`).
@@ -46,11 +46,13 @@ The codebase mirrors the original C beanstalkd structure:
 Two on-disk stores side by side:
 
 - **WAL** (`binlog.NNNNNN` files): metadata records — `FullJob` carrying a `BodyId` reference and `StateChange` for delete/release/bury/kick/timeout. v7 is current; v3 and v4 inline-body records are still readable and migrated into TOAST on first replay.
-- **TOAST** (`toast/body.NNNNNN`): append-only body segments. Per-body record header is `body_id u64 + len u32 + crc32 u32 + reserved u32` followed by the bytes. File header is `"TBOD" + version + reserved`.
+- **TOAST** (`toast/body.NNNNNN`): append-only body segments. Per-body record header is `body_id u64 + len u32 + crc32 u32 + header_crc32 u32` followed by the bytes; `crc32` covers the body and is checked on read, `header_crc32` covers the 16 header bytes and is checked by the startup scan (v2; v1 segments have zero there and are read unchecked). File header is `"TBOD" + version + reserved`.
 
 **Sync ordering:** every WAL fsync is preceded by a TOAST fsync (`Wal::pre_sync_body_store`). A crash mid-sync leaves orphan bodies, never dangling references — orphans are detected on replay and reclaimed via `BodyStore::delete_many`.
 
 **Disk budget:** `--max-storage-bytes` caps WAL + TOAST combined. Puts return `OUT_OF_STORAGE` once the budget minus a one-WAL-segment reserve (≤10 MiB) would be exceeded; state changes (delete/release/bury/kick/touch) always succeed.
+
+**Corruption at startup:** a torn tail in the newest WAL or TOAST segment is truncated quietly (what a crash leaves). Anything else stops startup before touching the disk: a corrupt record or bad header in an older WAL segment, any unreadable WAL segment (`Wal::replay`), and a failed header CRC, overlong body, partial header or bad file header in an older TOAST segment (`BodyStore::open`). One switch, `--wal-skip-corrupt` (`WalConfig::skip_corrupt`, `BodyStore::open_with_skip_corrupt`), carries on past both, keeping the segment as `.corrupt`; an older TOAST segment is never truncated.
 
 **WAL I/O failure:** a WAL write or fsync error drops the WAL for good (`ServerState::fail_wal`; the fd is never retried). Puts get `INTERNAL_ERROR` until restart, as do strict-mode acks for the batch that failed; state changes on existing jobs still apply in memory. `binlog-enabled` / `tuber_binlog_enabled` go false/0.
 
@@ -76,7 +78,7 @@ structured `tracing` events on stderr; alerting belongs in the log pipeline.
 - `MAX_TUBE_WEIGHT`: 9999 (for weighted reserve mode)
 - Default port: 11300
 - WAL version: 7 (reads v3–v7; writes v7)
-- TOAST version: 1
+- TOAST version: 2 (reads v1–v2; writes v2)
 - TOAST default segment size: 64 MiB
 - TOAST compaction threshold: live ratio < 0.5
 
