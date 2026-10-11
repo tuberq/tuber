@@ -304,7 +304,7 @@ mod tests {
 
     fn schedules_with(lines: &[&str]) -> Schedules {
         let mut s = Schedules::default();
-        let mut staging = Staging::new("splat".to_string());
+        let mut staging = Staging::new("splat".to_string(), 0);
         for text in lines {
             let line = crate::protocol::parse_schedule_put_line(text).unwrap();
             staging

@@ -408,6 +408,9 @@ struct ServerState {
     fd_budget: Arc<FdBudget>,
     /// Recurring schedule entries; see `crate::schedule`.
     schedules: crate::schedule::Schedules,
+    /// Memory held by schedule syncs not yet committed, across every
+    /// connection. Counted against `--max-jobs-size` like committed entries.
+    staged_schedule_bytes: u64,
     /// Where `schedules` is persisted. Present iff a binlog directory is
     /// configured; without one, schedules live in memory and the next app to
     /// boot syncs them back.
@@ -522,6 +525,7 @@ impl ServerState {
             wal_failed: false,
             fd_budget,
             schedules: crate::schedule::Schedules::default(),
+            staged_schedule_bytes: 0,
             schedule_files: None,
         }
     }
@@ -583,14 +587,16 @@ impl ServerState {
     }
 
     /// True iff adding `additional` bytes would exceed the configured budget.
-    /// Returns false (allow) when `max_job_bytes` is `None`. Schedule entries
-    /// share the budget with jobs; their bytes are kept apart from
-    /// `total_job_bytes` so its drift detector stays about jobs alone.
+    /// Returns false (allow) when `max_job_bytes` is `None`. Schedule entries,
+    /// committed and staged, share the budget with jobs; their bytes are kept
+    /// apart from `total_job_bytes` so its drift detector stays about jobs
+    /// alone.
     fn memory_limit_exceeded(&self, additional: u64) -> bool {
         match self.max_job_bytes {
             Some(limit) => {
                 self.total_job_bytes
                     .saturating_add(self.schedules.bytes())
+                    .saturating_add(self.staged_schedule_bytes)
                     .saturating_add(additional)
                     > limit
             }
@@ -777,6 +783,8 @@ impl ServerState {
         // to decrement per-tube waiting_ct, so the conn must still be in
         // self.conns when it runs.
         self.remove_waiter(conn_id);
+        // A sync in progress is abandoned with the connection.
+        self.take_staging(conn_id);
         // Release all reserved jobs back to ready
         if let Some(conn) = self.conns.remove(&conn_id) {
 
@@ -4123,15 +4131,18 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // is not a reliable proxy (tombstones, superseded records, and format
         // overhead can make it 1.4x+ larger than the live set), so we measure
         // the actual in-memory cost.
+        // Restored schedule entries share the budget.
         if let Some(max) = max_job_bytes
-            && state.total_job_bytes > max
+            && state.total_job_bytes + state.schedules.bytes() > max
         {
-            let actual = state.total_job_bytes;
+            let jobs = state.total_job_bytes;
+            let schedules = state.schedules.bytes();
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 format!(
-                    "WAL replay produced {actual} in-memory bytes, exceeds --max-jobs-size \
-                     ({max} bytes). Raise --max-jobs-size or move the binlog aside and restart."
+                    "WAL replay produced {jobs} in-memory bytes of jobs and {schedules} of \
+                     schedules, exceeding --max-jobs-size ({max} bytes). Raise \
+                     --max-jobs-size or move the binlog aside and restart."
                 ),
             ));
         }

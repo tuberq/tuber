@@ -8,6 +8,7 @@ use crate::schedule::{self, Catchup, Line, MAX_ENTRIES, Staging};
 
 impl ServerState {
     pub(super) fn cmd_schedule_begin(&mut self, conn_id: u64, owner: String) -> Response {
+        let (_, held_bytes) = self.schedules.owner_usage(&owner);
         let Some(conn) = self.conns.get_mut(&conn_id) else {
             return Response::InternalError;
         };
@@ -17,7 +18,7 @@ impl ServerState {
             sync.poisoned = true;
             return Response::BadFormat;
         }
-        conn.schedule_sync = Some(Staging::new(owner.clone()));
+        conn.schedule_sync = Some(Staging::new(owner.clone(), held_bytes));
         Response::Syncing(owner)
     }
 
@@ -27,6 +28,7 @@ impl ServerState {
         line: Result<Box<Line>, Response>,
         body: Option<Vec<u8>>,
     ) -> Response {
+        // Taken out only to stage into; its bytes stay counted meanwhile.
         let Some(mut sync) = self
             .conns
             .get_mut(&conn_id)
@@ -45,7 +47,7 @@ impl ServerState {
     }
 
     fn stage(
-        &self,
+        &mut self,
         sync: &mut Staging,
         line: Result<Box<Line>, Response>,
         body: Option<Vec<u8>>,
@@ -61,34 +63,64 @@ impl ServerState {
             return Response::BadFormat;
         }
         let cost = schedule::memory_cost(&sync.owner, &line, &body);
-        if sync.entries.len() >= MAX_ENTRIES || self.memory_limit_exceeded(sync.bytes + cost) {
+        if sync.entries.len() >= MAX_ENTRIES || self.staging_exceeds_budget(sync, cost) {
             return Response::OutOfMemory;
         }
         sync.bytes += cost;
+        self.staged_schedule_bytes += cost;
         sync.entries.insert(line.name.clone(), (line, body));
         Response::Staged
     }
 
+    /// Whether staging `cost` more bytes into `sync` would take memory past
+    /// `--max-jobs-size`. Staging on every connection counts — it is all held
+    /// in memory — but this sync is credited with the owner's current
+    /// entries, since its commit replaces them: resyncing an unchanged set
+    /// needs no room beyond what the set already has.
+    fn staging_exceeds_budget(&self, sync: &Staging, cost: u64) -> bool {
+        let Some(limit) = self.max_job_bytes else {
+            return false;
+        };
+        let other_syncs = self.staged_schedule_bytes.saturating_sub(sync.bytes);
+        let growth = (sync.bytes + cost).saturating_sub(sync.held_bytes);
+        self.total_job_bytes
+            .saturating_add(self.schedules.bytes())
+            .saturating_add(other_syncs)
+            .saturating_add(growth)
+            > limit
+    }
+
+    /// End `conn_id`'s sync, if it has one, releasing what it staged from
+    /// the memory budget.
+    pub(super) fn take_staging(&mut self, conn_id: u64) -> Option<Staging> {
+        let sync = self.conns.get_mut(&conn_id)?.schedule_sync.take()?;
+        self.staged_schedule_bytes = self.staged_schedule_bytes.saturating_sub(sync.bytes);
+        Some(sync)
+    }
+
     pub(super) fn cmd_schedule_commit(&mut self, conn_id: u64) -> Response {
-        let Some(sync) = self
-            .conns
-            .get_mut(&conn_id)
-            .and_then(|c| c.schedule_sync.take())
-        else {
+        let Some(sync) = self.take_staging(conn_id) else {
             return Response::NotSyncing;
         };
         if sync.poisoned {
             return Response::Aborted;
         }
         let (held, held_bytes) = self.schedules.owner_usage(&sync.owner);
-        if self.schedules.len() - held + sync.entries.len() > MAX_ENTRIES
-            || self.memory_limit_exceeded(sync.bytes.saturating_sub(held_bytes))
-        {
+        if self.schedules.len() - held + sync.entries.len() > MAX_ENTRIES {
             return Response::OutOfMemory;
         }
-        // An entry's memory cost over-estimates its share of the file.
-        if self.storage_limit_exceeded(sync.bytes.saturating_sub(held_bytes)) {
-            return Response::OutOfStorage;
+        // Only a commit that grows the owner's set needs room. One that keeps
+        // or shrinks it always goes through, as a delete does on a full
+        // queue — otherwise a full disk would stop an app removing an entry.
+        // (An entry's memory cost over-estimates its share of the file.)
+        let growth = sync.bytes.saturating_sub(held_bytes);
+        if growth > 0 {
+            if self.memory_limit_exceeded(growth) {
+                return Response::OutOfMemory;
+            }
+            if self.storage_limit_exceeded(growth) {
+                return Response::OutOfStorage;
+            }
         }
         let owner = sync.owner.clone();
         let counts = self.schedules.commit(sync, Timestamp::now());
@@ -118,11 +150,7 @@ impl ServerState {
     }
 
     pub(super) fn cmd_schedule_abort(&mut self, conn_id: u64) -> Response {
-        match self
-            .conns
-            .get_mut(&conn_id)
-            .and_then(|c| c.schedule_sync.take())
-        {
+        match self.take_staging(conn_id) {
             Some(_) => Response::Aborted,
             None => Response::NotSyncing,
         }

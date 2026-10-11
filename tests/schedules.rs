@@ -48,6 +48,24 @@ impl TestServer {
         .await
     }
 
+    async fn start_with_binlog_and_storage_budget(dir: &std::path::Path, bytes: u64) -> Self {
+        let dir = dir.to_path_buf();
+        Self::spawn(move |listener| async move {
+            tuber::server::run_with_listener_limited(
+                listener,
+                65535,
+                None,
+                Some(bytes),
+                Some(&dir),
+                true,
+                None,
+            )
+            .await
+            .ok();
+        })
+        .await
+    }
+
     /// Stop the server the way a crash would, as far as schedules go:
     /// nothing gets a chance to write on the way down.
     async fn kill(self) {
@@ -435,6 +453,148 @@ async fn entries_share_the_memory_budget() {
     c.send(&format!("put 0 0 10 {}\r\n{body}\r\n", body.len()))
         .await;
     assert_eq!(c.readline().await, "OUT_OF_MEMORY");
+}
+
+#[tokio::test]
+async fn staging_on_every_connection_shares_one_budget() {
+    // Each 2000-byte entry costs ~2530: two connections staging two each
+    // need ~10 KB, more than the 8 KB budget.
+    let srv = TestServer::start_with_max_jobs_size(8192).await;
+    let body = "x".repeat(2000);
+    let mut a = srv.connect().await;
+    a.ck("schedule-begin a", "SYNCING a").await;
+    assert_eq!(
+        a.schedule_put("1", "maint", "@hourly", &body).await,
+        "STAGED"
+    );
+    assert_eq!(
+        a.schedule_put("2", "maint", "@hourly", &body).await,
+        "STAGED"
+    );
+
+    let mut b = srv.connect().await;
+    b.ck("schedule-begin b", "SYNCING b").await;
+    assert_eq!(
+        b.schedule_put("1", "maint", "@hourly", &body).await,
+        "STAGED"
+    );
+    assert_eq!(
+        b.schedule_put("2", "maint", "@hourly", &body).await,
+        "OUT_OF_MEMORY"
+    );
+
+    // Aborting gives the staged bytes back.
+    a.ck("schedule-abort", "ABORTED").await;
+    b.ck("schedule-abort", "ABORTED").await;
+    b.ck("schedule-begin b", "SYNCING b").await;
+    for name in ["1", "2", "3"] {
+        assert_eq!(
+            b.schedule_put(name, "maint", "@hourly", &body).await,
+            "STAGED"
+        );
+    }
+    // As does a connection closing mid-sync.
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    a.ck("schedule-begin a", "SYNCING a").await;
+    for name in ["1", "2", "3"] {
+        assert_eq!(
+            a.schedule_put(name, "maint", "@hourly", &body).await,
+            "STAGED"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_resync_is_not_charged_twice() {
+    let srv = TestServer::start_with_max_jobs_size(8192).await;
+    let body = "x".repeat(2000);
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin splat", "SYNCING splat").await;
+    c.schedule_put("a", "maint", "@hourly", &body).await;
+    c.schedule_put("b", "maint", "@hourly", &body).await;
+    c.ck("schedule-commit", "SYNCED 2 0 0 0").await;
+    // ~5 KB of entries plus a ~2 KB job: no room for another copy of the
+    // entries, but a resync replaces them rather than adding to them.
+    let job = "j".repeat(1500);
+    c.send(&format!("put 0 0 10 {}\r\n{job}\r\n", job.len()))
+        .await;
+    assert!(c.readline().await.starts_with("INSERTED"));
+
+    c.ck("schedule-begin splat", "SYNCING splat").await;
+    assert_eq!(
+        c.schedule_put("a", "maint", "@hourly", &body).await,
+        "STAGED"
+    );
+    assert_eq!(
+        c.schedule_put("b", "maint", "@hourly", &body).await,
+        "STAGED"
+    );
+    c.ck("schedule-commit", "SYNCED 0 0 0 2").await;
+}
+
+#[tokio::test]
+async fn a_commit_that_frees_space_works_on_a_full_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    // One WAL segment (10 MiB) is held in reserve; leave ~1 MiB above it.
+    let srv = TestServer::start_with_binlog_and_storage_budget(dir.path(), 11 * 1024 * 1024).await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("runaway", "jobs", "@yearly", "{}").await;
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
+
+    // Fill the disk until even a one-byte put is refused.
+    for body in ["x".repeat(60_000), "x".to_string()] {
+        let mut refused = false;
+        for _ in 0..5_000 {
+            c.send(&format!("put 0 0 10 {}\r\n{body}\r\n", body.len()))
+                .await;
+            if c.readline().await == "OUT_OF_STORAGE" {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the budget never filled");
+    }
+
+    // Removing the entry adds nothing to the disk: it must go through.
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.ck("schedule-commit", "SYNCED 0 0 1 0").await;
+}
+
+#[tokio::test]
+async fn schedules_count_toward_the_memory_budget_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("big", "jobs", "@yearly", &"x".repeat(20_000))
+        .await;
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
+    drop(c);
+    srv.kill().await;
+
+    // 20 KB of schedules don't fit a 10 KB budget: refuse to start, as
+    // replayed jobs that don't fit do.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let started = tokio::time::timeout(
+        Duration::from_secs(2),
+        tuber::server::run_with_listener_limited(
+            listener,
+            65535,
+            Some(10_000),
+            Some(1024 * 1024 * 1024),
+            Some(dir.path()),
+            true,
+            None,
+        ),
+    )
+    .await;
+    match started {
+        Ok(Err(e)) => assert_eq!(e.kind(), std::io::ErrorKind::OutOfMemory, "{e}"),
+        Ok(Ok(())) => panic!("server exited cleanly"),
+        Err(_) => panic!("server started over its memory budget"),
+    }
 }
 
 // ---------------------------------------------------------------------------

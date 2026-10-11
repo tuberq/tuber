@@ -125,15 +125,19 @@ pub struct Staging {
     pub poisoned: bool,
     /// `memory_cost` of everything staged.
     pub bytes: u64,
+    /// `memory_cost` of the owner's entries when the sync began: what a
+    /// commit will free, so staging up to it needs no new room.
+    pub held_bytes: u64,
 }
 
 impl Staging {
-    pub fn new(owner: String) -> Staging {
+    pub fn new(owner: String, held_bytes: u64) -> Staging {
         Staging {
             owner,
             entries: BTreeMap::new(),
             poisoned: false,
             bytes: 0,
+            held_bytes,
         }
     }
 }
@@ -285,7 +289,7 @@ mod tests {
     }
 
     fn staging(owner: &str, lines: Vec<Line>) -> Staging {
-        let mut s = Staging::new(owner.to_string());
+        let mut s = Staging::new(owner.to_string(), 0);
         for l in lines {
             s.entries.insert(l.name.clone(), (l, b"{}".to_vec()));
         }
