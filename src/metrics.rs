@@ -332,6 +332,15 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
              # TYPE tuber_binlog_enabled gauge\ntuber_binlog_enabled {val}\n\n"
         ));
     }
+    // Tells a failed WAL apart from running without -b, which
+    // tuber_binlog_enabled alone can't: alert on 1 without knowing the config.
+    if let Some(val) = stats.get("binlog-failed") {
+        let val = u8::from(*val == "true");
+        out.push_str(&format!(
+            "# HELP tuber_binlog_failed 1 after a WAL I/O error, while puts are refused until restart\n\
+             # TYPE tuber_binlog_failed gauge\ntuber_binlog_failed {val}\n\n"
+        ));
+    }
     prom_gauge(
         &mut out,
         "tuber_binlog_file_count",

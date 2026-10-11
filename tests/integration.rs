@@ -1482,6 +1482,7 @@ async fn test_stats_format_complete() {
         "binlog-records-written:",
         "binlog-max-size:",
         "binlog-enabled:",
+        "binlog-failed:",
         "binlog-file-count:",
         "binlog-total-bytes:",
         "rusage-maxrss:",

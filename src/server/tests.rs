@@ -2481,6 +2481,40 @@ fn test_wal_failure_refuses_later_puts() {
     assert!(matches!(resp, Response::Deleted), "got {resp:?}");
 }
 
+/// `stats` output, as text.
+fn stats_text(s: &mut ServerState, c: u64) -> String {
+    match s.handle_command(c, Command::Stats, None) {
+        Response::Ok(data) => String::from_utf8(data).unwrap(),
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_stats_tell_a_failed_wal_from_no_wal() {
+    // binlog-enabled is false both without -b and after a WAL failure, so
+    // on its own a client can't tell an in-memory server from one refusing
+    // puts. binlog-failed is true only for the second.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let stats = stats_text(&mut s, c);
+    assert!(stats.contains("binlog-enabled: false\n"), "{stats}");
+    assert!(stats.contains("binlog-failed: false\n"), "{stats}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+    s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+    let stats = stats_text(&mut s, c);
+    assert!(stats.contains("binlog-enabled: true\n"), "{stats}");
+    assert!(stats.contains("binlog-failed: false\n"), "{stats}");
+
+    s.wal.as_mut().unwrap().inject_io_failure();
+    assert!(!s.sync_wal());
+    let stats = stats_text(&mut s, c);
+    assert!(stats.contains("binlog-enabled: false\n"), "{stats}");
+    assert!(stats.contains("binlog-failed: true\n"), "{stats}");
+}
+
 // --- Recurring schedules: firing ---
 
 /// Sync `entries` — (name, tags and spec) — for owner "app" into tube "jobs".

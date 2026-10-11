@@ -3226,6 +3226,7 @@ impl ServerState {
              binlog-records-written: 0\n\
              binlog-max-size: {}\n\
              binlog-enabled: {}\n\
+             binlog-failed: {}\n\
              binlog-file-count: {}\n\
              binlog-total-bytes: {}\n\
              toast-total-bytes: {}\n\
@@ -3313,6 +3314,7 @@ impl ServerState {
             self.wal.as_ref().map(|w| w.records_migrated()).unwrap_or(0),
             binlog_max_size,
             if self.wal.is_some() { "true" } else { "false" },
+            self.wal_failed,
             binlog_file_count,
             binlog_total_bytes,
             toast_total_bytes,

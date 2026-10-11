@@ -1891,6 +1891,7 @@ async fn test_wal_disk_full_refuses_puts_and_loses_no_acked_job() {
         format!("127.0.0.1:{port}"),
     ));
     let enabled_before = scrape_metric(metrics_port, "tuber_binlog_enabled").await;
+    let failed_before = scrape_metric(metrics_port, "tuber_binlog_failed").await;
 
     // Put until the disk fills, then keep going.
     let mut acked = Vec::new();
@@ -1916,6 +1917,7 @@ async fn test_wal_disk_full_refuses_puts_and_loses_no_acked_job() {
     let (refused_at, refusal) = first_refusal.expect("the 64 KiB cap never failed a WAL write");
     assert_eq!(refusal, "INTERNAL_ERROR\r\n", "put #{refused_at}");
     let enabled_after = scrape_metric(metrics_port, "tuber_binlog_enabled").await;
+    let failed_after = scrape_metric(metrics_port, "tuber_binlog_failed").await;
 
     unsafe {
         libc::kill(child.id().unwrap() as i32, libc::SIGKILL);
@@ -1949,6 +1951,12 @@ async fn test_wal_disk_full_refuses_puts_and_loses_no_acked_job() {
     );
     assert_eq!(enabled_before.as_deref(), Some("1"));
     assert_eq!(enabled_after.as_deref(), Some("0"));
+    assert_eq!(failed_before.as_deref(), Some("0"));
+    assert_eq!(
+        failed_after.as_deref(),
+        Some("1"),
+        "tells the failure from running without -b"
+    );
 }
 
 /// Four WAL segments of one record each: put 1, put 2, delete 1, put 3.
