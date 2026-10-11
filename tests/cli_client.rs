@@ -6,6 +6,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 fn bin() -> &'static str {
@@ -25,8 +26,17 @@ struct Server {
     port: u16,
 }
 
+/// Held by `Server::start` until its server is listening. A port from binding
+/// port 0 is only free, not reserved: until the spawned server binds it, a
+/// test starting in parallel can be handed the same one. That second server
+/// dies with EADDRINUSE while its readiness probe connects to the first, so
+/// the two tests share a server -- job ids collide, and once one test ends
+/// and kills it the other gets `Connection refused`.
+static STARTING: Mutex<()> = Mutex::new(());
+
 impl Server {
     fn start(extra_args: &[&str]) -> Server {
+        let _starting = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .expect("bind ephemeral port")
