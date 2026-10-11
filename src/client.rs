@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -235,8 +236,8 @@ impl TuberClient {
         self.read_ok_body().await
     }
 
-    /// `list-schedules [<owner>]`: a YAML list of `- <owner> <name>`.
-    pub async fn list_schedules(&mut self, owner: Option<&str>) -> io::Result<String> {
+    /// `list-schedules [<owner>]`, as (owner, name) pairs.
+    pub async fn list_schedules(&mut self, owner: Option<&str>) -> io::Result<Vec<(String, String)>> {
         match owner {
             Some(owner) => {
                 validate_token("owner", owner)?;
@@ -244,7 +245,12 @@ impl TuberClient {
             }
             None => self.send_line("list-schedules").await?,
         }
-        self.read_ok_body().await
+        let body = self.read_ok_body().await?;
+        Ok(parse_yaml_list(&body)
+            .iter()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(owner, name)| (owner.to_string(), name.to_string()))
+            .collect())
     }
 
     pub async fn stats_schedule(&mut self, owner: &str, name: &str) -> io::Result<String> {
@@ -288,6 +294,28 @@ impl TuberClient {
         }
         Ok(line.trim_end().to_string())
     }
+}
+
+/// Parse the `key: value` lines of a stats reply into a map, values
+/// unquoted. Split on ": ", since values hold colons (times, `con:1`).
+pub fn parse_yaml_map(yaml: &str) -> HashMap<&str, &str> {
+    let mut map = HashMap::new();
+    for line in yaml.lines() {
+        if line.starts_with("---") {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(": ") {
+            map.insert(key.trim(), val.trim().trim_matches('"'));
+        }
+    }
+    map
+}
+
+/// Parse the `- item` lines of a list reply.
+pub fn parse_yaml_list(yaml: &str) -> Vec<String> {
+    yaml.lines()
+        .filter_map(|line| line.strip_prefix("- ").map(|s| s.trim().to_string()))
+        .collect()
 }
 
 /// Env vars that name the server for the client subcommands, most preferred

@@ -1,4 +1,4 @@
-use crate::client::TuberClient;
+use crate::client::{TuberClient, parse_yaml_list, parse_yaml_map};
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
@@ -620,12 +620,7 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
 /// Per-entry schedule metrics, from `list-schedules` and `stats-schedule`.
 /// Each family's samples are kept together, as the exposition format asks.
 async fn schedule_metrics(client: &mut TuberClient, out: &mut String) -> io::Result<()> {
-    let list = client.list_schedules(None).await?;
-    let entries: Vec<(String, String)> = parse_yaml_list(&list)
-        .iter()
-        .filter_map(|l| l.split_once(' '))
-        .map(|(o, n)| (o.to_string(), n.to_string()))
-        .collect();
+    let entries = client.list_schedules(None).await?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -715,27 +710,6 @@ fn escape_label(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
-}
-
-/// Parse simple YAML `key: value` lines into a map.
-fn parse_yaml_map(yaml: &str) -> HashMap<&str, &str> {
-    let mut map = HashMap::new();
-    for line in yaml.lines() {
-        if line.starts_with("---") {
-            continue;
-        }
-        if let Some((key, val)) = line.split_once(": ") {
-            map.insert(key.trim(), val.trim().trim_matches('"'));
-        }
-    }
-    map
-}
-
-/// Parse simple YAML list (`- item`) lines.
-fn parse_yaml_list(yaml: &str) -> Vec<String> {
-    yaml.lines()
-        .filter_map(|line| line.strip_prefix("- ").map(|s| s.trim().to_string()))
-        .collect()
 }
 
 #[cfg(test)]

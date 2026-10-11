@@ -151,13 +151,21 @@ impl TestConn {
 
     async fn read_ok_body(&mut self) -> String {
         let header = self.readline().await;
+        self.read_body_of(&header).await
+    }
+
+    /// The body an `OK <bytes>` header announces.
+    async fn read_body_of(&mut self, header: &str) -> String {
         let len: usize = header
             .strip_prefix("OK ")
             .unwrap_or_else(|| panic!("expected OK, got {header:?}"))
             .parse()
             .unwrap();
         let mut body = vec![0u8; len + 2];
-        self.reader.read_exact(&mut body).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.reader.read_exact(&mut body))
+            .await
+            .expect("read_ok_body timed out after 5s")
+            .unwrap();
         String::from_utf8(body[..len].to_vec()).unwrap()
     }
 
@@ -716,10 +724,7 @@ async fn ready_jobs(c: &mut TestConn, tube: &str) -> u64 {
     if line == "NOT_FOUND" {
         return 0;
     }
-    let len: usize = line.strip_prefix("OK ").unwrap().parse().unwrap();
-    let mut body = vec![0u8; len + 2];
-    c.reader.read_exact(&mut body).await.unwrap();
-    let yaml = String::from_utf8(body).unwrap();
+    let yaml = c.read_body_of(&line).await;
     stat(&yaml, "current-jobs-ready").parse().unwrap()
 }
 
