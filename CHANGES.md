@@ -1,5 +1,15 @@
 # Changes
 
+## v0.15.0
+
+**`tuber put` now fails when the server rejects a job.** It printed whatever the server answered and exited 0 regardless, so `tuber put "job" && echo queued` reported success after a `DRAINING`, `JOB_TOO_BIG` or `OUT_OF_MEMORY`. A rejected put still prints its reply in that line's place and the remaining stdin lines are still put, but the run then exits 1 with `error: N of M puts rejected`. An idempotency dedup (`INSERTED <id> <state>`) is not a rejection — that is the key doing its job.
+
+**The client commands no longer crash when their output's reader goes away.** `put`, `stats`, `tubes` and `work` printed with `println!`/`eprintln!`, which panic when the pipe they write to has closed, so anything piped into `head` or `grep -m1` died with exit 101. For two of them that lost work, not just output: `printf 'a\nb\nc\n' | tuber put | head` put one job of the three before panicking on its first reply, and `tuber work 2>&1 | grep -m1 completed` killed the worker mid-job, handing the job back to the queue. Losing the reader now ends the output and nothing else — every put still lands, the worker keeps working, and the exit status is still the command's own.
+
+One thing this does not change: jobs run by `tuber work` inherit its stdout, so under `tuber work | head` a job that prints after `head` has exited fails on the closed pipe and is buried. That is the job's own command failing, correctly; pipe the worker's log lines (stderr), not its stdout.
+
+**The client commands read the server address from `TUBER_URL`.** `put`, `work`, `stats` and `tubes` take `-a`, else the first of `TUBER_URL`, `TUBER_ADDR` and `BEANSTALKD_URL` that is set, else `localhost:11300`, and accept `host` or `:port` as well as `host:port`. `TUBER_URL` is the variable the Ruby gem reads, and tuber-cli and tuber-tui read it first from their next release, so one setting points every client on a box at the same server. Despite the name it holds a bare address, not a URL. `tuber server` is unaffected; it still binds with `-l`/`-p`.
+
 ## v0.14.0
 
 **The server no longer aborts when its log output loses its reader.** Started as `tuber server -V … 2>&1 | <reader>`, the server died with SIGABRT the first time it logged after the reader exited — closing the terminal tab the reader ran in, or a `tee` going away, was enough. No jobs were lost (the process simply stopped), but nothing restarted it.
