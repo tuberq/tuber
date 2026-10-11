@@ -5134,17 +5134,10 @@ async fn handle_connection(
         if line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
         }
-        // A schedule-put that isn't UTF-8 is still a schedule-put: it goes to
-        // the engine refused, so the sync it was meant for aborts.
-        let parsed = match std::str::from_utf8(line) {
-            Ok(cmd_str) => protocol::parse_command(cmd_str).map_err(|resp| (resp, Some(cmd_str))),
-            Err(_) => protocol::refused_schedule_put(line).ok_or((Response::UnknownCommand, None)),
-        };
-
         // Parse command
-        let mut cmd = match parsed {
+        let mut cmd = match protocol::parse_line(line) {
             Ok(cmd) => cmd,
-            Err((resp, cmd_str)) => {
+            Err(resp) => {
                 resp_buf.clear();
                 resp.serialize_into(&mut resp_buf);
                 let _ = writer.write_all(&resp_buf).await;
@@ -5152,7 +5145,10 @@ async fn handle_connection(
                 // length, the body is still inbound — drain it (plus the
                 // trailing CRLF) so the client's payload isn't parsed as
                 // commands. Mirrors the JOB_TOO_BIG drain path below.
-                if let Some(body_size) = cmd_str.and_then(protocol::put_declared_body_len) {
+                let declared = std::str::from_utf8(line)
+                    .ok()
+                    .and_then(protocol::put_declared_body_len);
+                if let Some(body_size) = declared {
                     let to_drain = body_size as u64 + 2;
                     match drain_bytes(
                         &mut reader,
@@ -5190,8 +5186,7 @@ async fn handle_connection(
             if body_size > max_job_size as usize {
                 // A refused schedule-put still has to reach the engine, so
                 // that the sync it belongs to aborts; the engine replies.
-                let schedule_put = matches!(cmd, Command::SchedulePut { .. });
-                if !schedule_put {
+                if !matches!(cmd, Command::SchedulePut { .. }) {
                     let _ = writer.write_all(b"JOB_TOO_BIG\r\n").await;
                 }
                 // Drain the body + \r\n so the connection stays usable
@@ -5209,12 +5204,10 @@ async fn handle_connection(
                     Ok(true) => {}
                     Ok(false) | Err(_) => break,
                 }
-                if !schedule_put {
+                let Command::SchedulePut { line, .. } = &mut cmd else {
                     continue;
-                }
-                if let Command::SchedulePut { line, .. } = &mut cmd {
-                    *line = Err(Response::JobTooBig);
-                }
+                };
+                *line = Err(Response::JobTooBig);
                 None
             } else {
                 let mut body_buf = vec![0u8; body_size + 2]; // +2 for \r\n

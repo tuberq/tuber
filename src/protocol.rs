@@ -268,14 +268,33 @@ fn is_valid_tube_name(name: &str) -> bool {
         && !name.starts_with('-')
 }
 
-/// Parse a single command line (without the trailing \r\n).
+/// Parse one command line as read off the wire (without its \r\n).
+///
+/// `schedule-put` is recognised by its verb before anything else, so a line
+/// too broken to parse — not UTF-8, holding a NUL, malformed — is still a
+/// schedule-put: refused, but passed on to the engine so that the sync it was
+/// meant for aborts, with its body length if one can be read so the body can
+/// be consumed. Any other line that isn't UTF-8 is UNKNOWN_COMMAND.
+pub fn parse_line(raw: &[u8]) -> Result<Command, Response> {
+    if let Some(args) = raw.strip_prefix(b"schedule-put")
+        && matches!(args.first(), None | Some(b' '))
+    {
+        return Ok(parse_schedule_put(args));
+    }
+    std::str::from_utf8(raw)
+        .map_err(|_| Response::UnknownCommand)
+        .and_then(parse_command)
+}
+
+/// Parse a command line known to be UTF-8 — anything but `schedule-put`,
+/// which only [`parse_line`] reads.
 pub fn parse_command(line: &str) -> Result<Command, Response> {
     // The line has already been stripped of \r\n by the caller.
     let line = line.trim_end_matches('\0');
 
     // Check for embedded NULs (malicious input)
     if line.bytes().any(|b| b == 0) {
-        return refused_schedule_put(line.as_bytes()).ok_or(Response::BadFormat);
+        return Err(Response::BadFormat);
     }
 
     if let Some(rest) = line.strip_prefix("put ") {
@@ -348,12 +367,6 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_flush_buried(rest)
     } else if let Some(rest) = line.strip_prefix("schedule-begin ") {
         parse_schedule_begin(rest)
-    } else if let Some(rest) = line.strip_prefix("schedule-put ") {
-        Ok(parse_schedule_put(rest))
-    } else if line == "schedule-put" {
-        // Still a schedule-put, however malformed: it must reach the
-        // engine, or the sync it was meant for could commit without it.
-        Ok(parse_schedule_put(""))
     } else if line == "schedule-commit" {
         Ok(Command::ScheduleCommit)
     } else if line == "schedule-abort" {
@@ -504,34 +517,24 @@ fn parse_schedule_begin(rest: &str) -> Result<Command, Response> {
     })
 }
 
-/// A `schedule-put` line too broken to parse — not UTF-8, or holding a NUL
-/// — as a refused `schedule-put`, with its body length if one can be read.
-/// It still has to reach the engine, so that the sync it was meant for
-/// aborts, and its body still has to be consumed. `None` if `raw` isn't a
-/// `schedule-put` line at all.
-pub fn refused_schedule_put(raw: &[u8]) -> Option<Command> {
-    let rest = raw.strip_prefix(b"schedule-put")?;
-    if !(rest.is_empty() || rest.starts_with(b" ")) {
-        return None;
-    }
-    let bytes = String::from_utf8_lossy(rest)
-        .split_whitespace()
-        .nth(5)
-        .and_then(|b| b.parse().ok());
-    Some(Command::SchedulePut {
-        bytes,
-        line: Err(Response::BadFormat),
-    })
-}
-
-/// `schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>`.
-/// Tags are the tokens with a `prefix:`; the spec is everything after them,
-/// and no spec token has a colon.
-fn parse_schedule_put(rest: &str) -> Command {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
+/// `schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>`,
+/// given everything after the verb. Tags are the tokens with a `prefix:`;
+/// the spec is everything after them, and no spec token has a colon. A line
+/// that isn't UTF-8 or holds a NUL is refused outright, but still yields
+/// its body length.
+fn parse_schedule_put(args: &[u8]) -> Command {
+    // Trailing NULs are dropped, as parse_command drops them.
+    let args = &args[..args.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)];
+    let text = String::from_utf8_lossy(args);
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let clean = matches!(text, std::borrow::Cow::Borrowed(_)) && !args.contains(&0);
     Command::SchedulePut {
         bytes: parts.get(5).and_then(|b| b.parse().ok()),
-        line: parse_schedule_line(&parts).map(Box::new),
+        line: if clean {
+            parse_schedule_line(&parts).map(Box::new)
+        } else {
+            Err(Response::BadFormat)
+        },
     }
 }
 
@@ -1412,7 +1415,7 @@ mod tests {
     }
 
     fn schedule_line(line: &str) -> (Option<u32>, Result<Box<Line>, Response>) {
-        match parse_command(line).unwrap() {
+        match parse_line(line.as_bytes()).unwrap() {
             Command::SchedulePut { bytes, line } => (bytes, line),
             other => panic!("{other:?}"),
         }

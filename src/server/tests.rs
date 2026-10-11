@@ -2221,7 +2221,7 @@ fn sync_schedules(s: &mut ServerState, c: u64, entries: &[(&str, &str)]) {
     assert_eq!(resp, Response::Syncing("app".into()));
     for (name, rest) in entries {
         let line = format!("schedule-put {name} jobs 0 0 60 2 {rest}");
-        let cmd = protocol::parse_command(&line).unwrap();
+        let cmd = protocol::parse_line(line.as_bytes()).unwrap();
         assert_eq!(s.handle_command(c, cmd, Some(b"{}".to_vec())), Response::Staged);
     }
     let resp = s.handle_command(c, Command::ScheduleCommit, None);
