@@ -2573,6 +2573,19 @@ async fn test_delete_held_after_job_cleans_waiting_jobs() {
     c.ckresp("y\r\n").await;
 }
 
+/// A job can't wait for its own group: it counts itself as pending, so it
+/// would be held forever. The put is refused and its body drained.
+#[tokio::test]
+async fn test_put_after_its_own_group_is_bad_format() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 1 grp:self aft:self\r\na\r\n").await;
+    c.ckresp("BAD_FORMAT\r\n").await;
+    c.mustsend("put 0 0 60 1\r\nb\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+}
+
 /// `stats-job <id>`'s `state:` value.
 async fn job_state(c: &mut TestConn, id: u64) -> String {
     c.mustsend(&format!("stats-job {id}\r\n")).await;
@@ -5235,10 +5248,12 @@ async fn test_fuzz_long_put_with_extensions() {
     let server = TestServer::start().await;
     let mut conn = server.connect().await;
 
-    // 200-char key (max tube/key name length)
+    // 200-char keys (max tube/key name length). The after-group differs
+    // from the group: a job can't wait on its own group.
     let long_key = "a".repeat(200);
+    let other_key = "b".repeat(200);
     let cmd =
-        format!("put 0 0 120 5 idp:{long_key} grp:{long_key} aft:{long_key} con:{long_key}\r\n");
+        format!("put 0 0 120 5 idp:{long_key} grp:{long_key} aft:{other_key} con:{long_key}\r\n");
     // This is ~891 bytes — should be under the 1024 limit
     assert!(
         cmd.len() < 1024,

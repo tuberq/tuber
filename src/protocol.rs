@@ -479,6 +479,15 @@ fn parse_tag(tags: &mut JobExt, part: &str) -> Result<bool, Response> {
     Ok(true)
 }
 
+/// Reject tag combinations that can never run: a job in group X that waits
+/// for X counts itself as pending, so it would be held forever.
+fn check_tags(tags: &JobExt) -> Result<(), Response> {
+    if tags.group.is_some() && tags.group == tags.after_group {
+        return Err(Response::BadFormat);
+    }
+    Ok(())
+}
+
 fn parse_put(rest: &str) -> Result<Command, Response> {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 4 {
@@ -495,6 +504,7 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
             return Err(Response::BadFormat);
         }
     }
+    check_tags(&tags)?;
 
     Ok(Command::Put {
         pri,
@@ -569,6 +579,7 @@ fn parse_schedule_line(parts: &[&str]) -> Result<Line, Response> {
             return Err(Response::BadFormat);
         }
     }
+    check_tags(&tags)?;
     if spec_at == rest.len() {
         return Err(Response::BadFormat);
     }
@@ -1459,6 +1470,24 @@ mod tests {
             assert_eq!(got_bytes, bytes, "{line}");
             assert_eq!(got.unwrap_err(), err, "{line}");
         }
+    }
+
+    #[test]
+    fn test_job_after_its_own_group_is_bad_format() {
+        // A job in group X that waits for X counts itself as pending, so
+        // it would wait forever.
+        assert_eq!(
+            parse_command("put 0 0 60 1 grp:x aft:x").unwrap_err(),
+            Response::BadFormat
+        );
+        assert_eq!(
+            parse_command("put 0 0 60 1 aft:x grp:x").unwrap_err(),
+            Response::BadFormat
+        );
+        assert!(parse_command("put 0 0 60 1 grp:x aft:y").is_ok());
+        let (bytes, line) = schedule_line("schedule-put a t 0 0 1 2 grp:x aft:x @daily");
+        assert_eq!(bytes, Some(2));
+        assert_eq!(line.unwrap_err(), Response::BadFormat);
     }
 
     #[test]
