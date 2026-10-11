@@ -105,6 +105,18 @@ Returns per-tube statistics in YAML format.
 | `total-buries` | Cumulative bury operations |
 | `bury-rate` | Fraction of reserves that ended in a bury (`total-buries / total-reserves`, 0 if no reserves) |
 
+### Idempotency dedups
+
+A `put` whose `idp:` key matches a job already in the tube creates nothing and replies `INSERTED <id> <STATE>`. These count those hits by the state of the job matched. A hit on a **buried** job is the one to watch: nothing was queued, and nothing runs until that job is kicked, so a recurring put that keeps hitting it is silently dropping its work.
+
+| Field | Description |
+|---|---|
+| `total-idp-dedups-ready` | Dedups against a ready job |
+| `total-idp-dedups-reserved` | Dedups against a reserved job |
+| `total-idp-dedups-delayed` | Dedups against a delayed job |
+| `total-idp-dedups-buried` | Dedups against a buried job |
+| `total-idp-dedups-deleted` | Dedups against a cooldown tombstone (`idp:<key>:<ttl>`, job already deleted) |
+
 ### Processing time
 
 These fields track how long workers take to complete jobs on this tube,
@@ -259,3 +271,4 @@ Each has a `tube` label:
 | `tuber_tube_processing_time_p95{tube="..."}` | Processing time p95 |
 | `tuber_tube_processing_time_p99{tube="..."}` | Processing time p99 |
 | `tuber_tube_queue_time_ewma{tube="..."}` | Queue time EWMA |
+| `tuber_tube_idp_dedups_total{tube="...",state="..."}` | `idp:` dedups by state of the job matched (`ready`, `reserved`, `delayed`, `buried`, `deleted`). Alert on `state="buried"` rising |

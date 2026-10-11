@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+**`idp:` dedups are counted, and a dedup against a buried job is no longer silent.** A put whose idempotency key matches a buried job replies `INSERTED <id> BURIED` and queues nothing — and nothing runs until that job is kicked. A recurring put that keeps hitting one drops its work every time: a client that reads `INSERTED` as success and ignores the state sees nothing wrong, and the only sign server-side was `current-jobs-buried: 1`. Splat lost about 70 hourly rollups over three days this way after one buried on lock contention.
+
+`stats-tube` now has `total-idp-dedups-ready`, `-reserved`, `-delayed`, `-buried` and `-deleted` (a hit on a cooldown tombstone), exported as `tuber_tube_idp_dedups_total{tube,state}`. Alert on `state="buried"` going up. `tuber put` also warns on stderr when its dedup hits a buried job, so a crontab line using it gets mailed rather than going quiet; it still exits 0, since the key did its job.
+
 ## v0.15.0
 
 **`tuber put` now fails when the server rejects a job.** It printed whatever the server answered and exited 0 regardless, so `tuber put "job" && echo queued` reported success after a `DRAINING`, `JOB_TOO_BIG` or `OUT_OF_MEMORY`. A rejected put still prints its reply in that line's place and the remaining stdin lines are still put, but the run then exits 1 with `error: N of M puts rejected`. An idempotency dedup (`INSERTED <id> <state>`) is not a rejection — that is the key doing its job.

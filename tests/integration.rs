@@ -2027,6 +2027,56 @@ async fn test_idempotency_flush_clears_keys() {
     c.ckresp("INSERTED 2\r\n").await;
 }
 
+/// Dedups are counted per tube by the state of the job they hit. A dedup
+/// against a BURIED job queues nothing, and nothing runs until the job is
+/// kicked: a recurring put that keeps hitting one is silently dropped work,
+/// with `current-jobs-buried: 1` as the only other sign.
+#[tokio::test]
+async fn test_idempotency_dedups_counted_by_state() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
+    c.mustsend("world\r\n").await;
+    c.ckresp("INSERTED 1 READY\r\n").await;
+
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+    for _ in 0..2 {
+        c.mustsend("put 0 0 60 5 idp:key1\r\n").await;
+        c.mustsend("world\r\n").await;
+        c.ckresp("INSERTED 1 BURIED\r\n").await;
+    }
+
+    // A hit on a cooldown tombstone is a dedup too.
+    c.mustsend("put 0 0 60 5 idp:key2:60\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+    c.mustsend("delete 2\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("put 0 0 60 5 idp:key2:60\r\n").await;
+    c.mustsend("world\r\n").await;
+    c.ckresp("INSERTED 2 DELETED\r\n").await;
+
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    for line in [
+        "total-idp-dedups-ready: 1\n",
+        "total-idp-dedups-reserved: 0\n",
+        "total-idp-dedups-delayed: 0\n",
+        "total-idp-dedups-buried: 2\n",
+        "total-idp-dedups-deleted: 1\n",
+    ] {
+        assert!(body.contains(line), "missing {line:?} in: {body}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Job processing stats tests
 // ---------------------------------------------------------------------------
@@ -6269,9 +6319,12 @@ async fn test_metrics_exposition_format() {
     // Some activity so global and per-tube series have data
     c.mustsend("use mtube\r\n").await;
     c.ckresp("USING mtube\r\n").await;
-    c.mustsend("put 0 0 60 3\r\n").await;
+    c.mustsend("put 0 0 60 3 idp:k\r\n").await;
     c.mustsend("abc\r\n").await;
     c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 0 60 3 idp:k\r\n").await;
+    c.mustsend("abc\r\n").await;
+    c.ckresp("INSERTED 1 READY\r\n").await;
 
     // Metrics server on an ephemeral port, pointed at the queue
     let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6368,6 +6421,12 @@ async fn test_metrics_exposition_format() {
         body.contains("tuber_tube_ready_jobs{tube=\"mtube\"} 1"),
         "per-tube gauge missing: {body}"
     );
+    for series in [
+        "tuber_tube_idp_dedups_total{tube=\"mtube\",state=\"ready\"} 1",
+        "tuber_tube_idp_dedups_total{tube=\"mtube\",state=\"buried\"} 0",
+    ] {
+        assert!(body.contains(series), "missing {series}: {body}");
+    }
     assert!(body.contains("tuber_jobs_ready 1"), "global gauge missing");
 }
 

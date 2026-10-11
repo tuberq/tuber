@@ -1190,13 +1190,15 @@ impl ServerState {
                 None
             };
 
-            let state_str = self
+            let state = self
                 .jobs
                 .get(&existing_id)
                 .expect("job must exist — just looked up by idempotency key")
-                .state
-                .as_protocol_str();
-            return Response::InsertedDup(existing_id, state_str, upgraded_pri);
+                .state;
+            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                tube.stat.count_idp_dedup(Some(state));
+            }
+            return Response::InsertedDup(existing_id, state.as_protocol_str(), upgraded_pri);
         }
 
         // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
@@ -1207,6 +1209,9 @@ impl ServerState {
                 .and_then(|t| t.idempotency_cooldowns.get(&key_tuple.0).copied());
             if let Some((original_id, expiry)) = cooldown {
                 if SystemTime::now() < expiry {
+                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                        tube.stat.count_idp_dedup(None);
+                    }
                     return Response::InsertedDup(original_id, "DELETED", None);
                 } else {
                     self.remove_tombstone(&tube_name, &key_tuple.0);
@@ -2835,7 +2840,12 @@ impl ServerState {
              queue-time-ewma: {:.6}\n\
              queue-time-min: {:.6}\n\
              queue-time-max: {:.6}\n\
-             queue-time-samples: {}\n",
+             queue-time-samples: {}\n\
+             total-idp-dedups-ready: {}\n\
+             total-idp-dedups-reserved: {}\n\
+             total-idp-dedups-delayed: {}\n\
+             total-idp-dedups-buried: {}\n\
+             total-idp-dedups-deleted: {}\n",
             tube.name,
             tube.stat.urgent_ct,
             tube.ready.len(),
@@ -2874,6 +2884,11 @@ impl ServerState {
             tube.stat.queue_time_min.unwrap_or(0.0),
             tube.stat.queue_time_max.unwrap_or(0.0),
             tube.stat.queue_time_samples,
+            tube.stat.idp_dedup_ready_ct,
+            tube.stat.idp_dedup_reserved_ct,
+            tube.stat.idp_dedup_delayed_ct,
+            tube.stat.idp_dedup_buried_ct,
+            tube.stat.idp_dedup_deleted_ct,
         );
         Response::Ok(yaml.into_bytes())
     }

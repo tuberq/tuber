@@ -530,6 +530,8 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         out.push_str("# TYPE tuber_tube_processing_time_p99 gauge\n");
         out.push_str("# HELP tuber_tube_queue_time_ewma Queue time EWMA per tube\n");
         out.push_str("# TYPE tuber_tube_queue_time_ewma gauge\n");
+        out.push_str("# HELP tuber_tube_idp_dedups_total idp: dedups per tube, by the state of the job matched. state=\"buried\": nothing was queued, and nothing runs until that job is kicked\n");
+        out.push_str("# TYPE tuber_tube_idp_dedups_total counter\n");
 
         for name in &tube_names {
             if let Ok(tube_yaml) = client.stats_tube(name).await {
@@ -579,6 +581,15 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
                 tube_metric(&mut out, "tuber_tube_processing_time_p95", name, &ts, "processing-time-p95");
                 tube_metric(&mut out, "tuber_tube_processing_time_p99", name, &ts, "processing-time-p99");
                 tube_metric(&mut out, "tuber_tube_queue_time_ewma", name, &ts, "queue-time-ewma");
+                for state in ["ready", "reserved", "delayed", "buried", "deleted"] {
+                    let key = format!("total-idp-dedups-{state}");
+                    if let Some(val) = ts.get(key.as_str()) {
+                        let tube = escape_label(name);
+                        out.push_str(&format!(
+                            "tuber_tube_idp_dedups_total{{tube=\"{tube}\",state=\"{state}\"}} {val}\n"
+                        ));
+                    }
+                }
             }
         }
         out.push('\n');

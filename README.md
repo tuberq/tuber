@@ -407,6 +407,8 @@ Running the same cron on multiple hosts? Idempotency keys prevent duplicate work
 tuber put -i "nightly-report:86400" "./generate-report.sh"
 ```
 
+If the original job is buried, every later put dedups against it and nothing runs until it is kicked. `tuber put` warns on stderr when that happens (so cron mails it), and `tuber_tube_idp_dedups_total{state="buried"}` counts it.
+
 ### Rate-limited processing
 
 Use concurrency keys to ensure only one job per key is processed at a time. Different keys run in parallel.

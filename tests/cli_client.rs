@@ -225,6 +225,36 @@ fn put_that_is_accepted_or_deduplicated_exits_zero() {
     // A dedup hit is the idempotency key working, not a failure.
     assert_eq!(stdout(&dup), "INSERTED 1 READY\n");
     assert!(dup.status.success(), "stderr: {}", stderr(&dup));
+    assert_eq!(stderr(&dup), "", "a dedup against a live job is no news");
+}
+
+#[test]
+fn put_deduplicated_against_a_buried_job_warns() {
+    let server = Server::start(&[]);
+    let first = run(&["put", "-a", &server.addr(), "-i", "k", "x"], &[], None);
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    conn.write_all(b"reserve-with-timeout 0\r\nbury 1 0\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(conn);
+    for expected in ["RESERVED 1 1", "x", "BURIED"] {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), expected);
+    }
+
+    let dup = run(&["put", "-a", &server.addr(), "-i", "k", "x"], &[], None);
+    assert_eq!(stdout(&dup), "INSERTED 1 BURIED\n");
+    // Still the key doing its job, so it exits 0 -- but nothing was queued,
+    // and nothing will run until job 1 is kicked. From cron, stderr is the
+    // only place that gets noticed.
+    assert!(dup.status.success(), "stderr: {}", stderr(&dup));
+    assert!(
+        stderr(&dup).contains("buried job 1"),
+        "a dedup against a buried job should warn: {:?}",
+        stderr(&dup)
+    );
 }
 
 // --- server address ----------------------------------------------------------

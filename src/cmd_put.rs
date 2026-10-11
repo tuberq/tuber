@@ -19,7 +19,18 @@ impl Tally {
         if !resp.starts_with("INSERTED ") {
             self.rejected += 1;
         }
-        crate::outln!("{resp}")
+        crate::outln!("{resp}")?;
+        // A dedup hit on a buried job is still not a rejection, but nothing
+        // was queued and nothing runs until that job is kicked. Run from
+        // cron, a put like that drops its work every time without a word.
+        let mut words = resp.split_whitespace().skip(1);
+        if let (Some(id), Some("BURIED")) = (words.next(), words.next()) {
+            crate::errln!(
+                "warning: idempotency key matched buried job {id}; nothing was \
+                 queued, and nothing will run until it is kicked"
+            );
+        }
+        Ok(())
     }
 }
 

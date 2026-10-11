@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::heap::IndexHeap;
+use crate::job::JobState;
 
 /// Ready heap key: (priority, job_id). Lower priority = higher urgency.
 pub type ReadyKey = (u32, u64);
@@ -45,11 +46,33 @@ pub struct TubeStats {
     pub queue_time_min: Option<f64>,
     pub queue_time_max: Option<f64>,
     pub queue_time_samples: u64,
+
+    // idp: dedups, by the state of the job the put matched
+    pub idp_dedup_ready_ct: u64,
+    pub idp_dedup_reserved_ct: u64,
+    pub idp_dedup_delayed_ct: u64,
+    pub idp_dedup_buried_ct: u64,
+    pub idp_dedup_deleted_ct: u64,
 }
 
 const RING_CAPACITY: usize = 1000;
 
 impl TubeStats {
+    /// Count an `idp:` dedup by the state of the job it matched; `None` is a
+    /// hit on a cooldown tombstone, whose job is already deleted. Hits on a
+    /// buried job are the ones to alert on: nothing was queued, and nothing
+    /// runs until the job is kicked.
+    pub fn count_idp_dedup(&mut self, state: Option<JobState>) {
+        let ct = match state {
+            Some(JobState::Ready) => &mut self.idp_dedup_ready_ct,
+            Some(JobState::Reserved) => &mut self.idp_dedup_reserved_ct,
+            Some(JobState::Delayed) => &mut self.idp_dedup_delayed_ct,
+            Some(JobState::Buried) => &mut self.idp_dedup_buried_ct,
+            None => &mut self.idp_dedup_deleted_ct,
+        };
+        *ct += 1;
+    }
+
     pub fn update_ewma(ewma: &mut f64, samples: &mut u64, value: f64, alpha: f64) {
         *samples += 1;
         if *samples == 1 {
