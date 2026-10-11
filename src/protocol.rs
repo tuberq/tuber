@@ -1,4 +1,8 @@
+use std::fmt;
+
 use crate::job::MAX_TUBE_NAME_LEN;
+use crate::schedule::spec::Spec;
+use crate::schedule::{Catchup, Line};
 
 /// Commands parsed from the beanstalkd text protocol.
 #[derive(Debug, Clone, PartialEq)]
@@ -102,7 +106,117 @@ pub enum Command {
     },
     Drain,
     Undrain,
+    /// Start staging a replacement set of schedule entries for `owner`.
+    ScheduleBegin {
+        owner: String,
+    },
+    /// One staged entry. `bytes` is the declared body length when the line
+    /// gives one, so the body can be read or drained even when the rest of
+    /// the line is refused; a refused line still goes to the engine, as
+    /// `Err`, so the sync it belongs to can't commit without it.
+    SchedulePut {
+        bytes: Option<u32>,
+        line: Result<Box<Line>, Response>,
+    },
+    ScheduleCommit,
+    ScheduleAbort,
+    ListSchedules {
+        owner: Option<String>,
+    },
+    StatsSchedule {
+        owner: String,
+        name: String,
+    },
     Quit,
+}
+
+/// The tuber tags a put can carry after `<bytes>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PutTags {
+    pub idempotency_key: Option<(String, u32)>,
+    pub group: Option<String>,
+    pub after_group: Option<String>,
+    pub concurrency_key: Option<(String, u32)>,
+}
+
+impl PutTags {
+    /// Parse one `idp:`/`grp:`/`aft:`/`con:` tag into `self`. `Ok(false)`
+    /// when `part` is none of them.
+    fn parse_tag(&mut self, part: &str) -> Result<bool, Response> {
+        if let Some(val) = part.strip_prefix("idp:") {
+            // Parse idp:key or idp:key:N
+            if let Some(colon_pos) = val.rfind(':') {
+                let key_part = &val[..colon_pos];
+                let ttl_part = &val[colon_pos + 1..];
+                if !is_valid_key(key_part) {
+                    return Err(Response::BadFormat);
+                }
+                let ttl: u32 = ttl_part.parse().map_err(|_| Response::BadFormat)?;
+                self.idempotency_key = Some((key_part.to_string(), ttl));
+            } else {
+                if !is_valid_key(val) {
+                    return Err(Response::BadFormat);
+                }
+                self.idempotency_key = Some((val.to_string(), 0));
+            }
+        } else if let Some(val) = part.strip_prefix("grp:") {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            self.group = Some(val.to_string());
+        } else if let Some(val) = part.strip_prefix("aft:") {
+            if !is_valid_key(val) {
+                return Err(Response::BadFormat);
+            }
+            self.after_group = Some(val.to_string());
+        } else if let Some(val) = part.strip_prefix("con:") {
+            // Parse con:key or con:key:N
+            if let Some(colon_pos) = val.rfind(':') {
+                let key_part = &val[..colon_pos];
+                let limit_part = &val[colon_pos + 1..];
+                if !is_valid_key(key_part) {
+                    return Err(Response::BadFormat);
+                }
+                let limit: u32 = limit_part.parse().map_err(|_| Response::BadFormat)?;
+                if limit == 0 {
+                    return Err(Response::BadFormat);
+                }
+                self.concurrency_key = Some((key_part.to_string(), limit));
+            } else {
+                if !is_valid_key(val) {
+                    return Err(Response::BadFormat);
+                }
+                self.concurrency_key = Some((val.to_string(), 1));
+            }
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// The tags as a put line would carry them, defaults left out.
+impl fmt::Display for PutTags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut tags = Vec::new();
+        match &self.idempotency_key {
+            Some((key, 0)) => tags.push(format!("idp:{key}")),
+            Some((key, ttl)) => tags.push(format!("idp:{key}:{ttl}")),
+            None => {}
+        }
+        if let Some(group) = &self.group {
+            tags.push(format!("grp:{group}"));
+        }
+        if let Some(after) = &self.after_group {
+            tags.push(format!("aft:{after}"));
+        }
+        match &self.concurrency_key {
+            Some((key, 1)) => tags.push(format!("con:{key}")),
+            Some((key, limit)) => tags.push(format!("con:{key}:{limit}")),
+            None => {}
+        }
+        f.write_str(&tags.join(" "))
+    }
 }
 
 /// Responses sent back to the client.
@@ -144,6 +258,17 @@ pub enum Response {
     UnknownCommand,
     ExpectedCrlf,
     JobTooBig,
+    Syncing(String),
+    Staged,
+    Synced {
+        added: u32,
+        changed: u32,
+        removed: u32,
+        unchanged: u32,
+    },
+    Aborted,
+    BadSchedule,
+    NotSyncing,
 }
 
 impl Response {
@@ -205,6 +330,14 @@ impl Response {
             Response::UnknownCommand => buf.extend_from_slice(b"UNKNOWN_COMMAND\r\n"),
             Response::ExpectedCrlf => buf.extend_from_slice(b"EXPECTED_CRLF\r\n"),
             Response::JobTooBig => buf.extend_from_slice(b"JOB_TOO_BIG\r\n"),
+            Response::Syncing(owner) => { let _ = write!(buf, "SYNCING {owner}\r\n"); }
+            Response::Staged => buf.extend_from_slice(b"STAGED\r\n"),
+            Response::Synced { added, changed, removed, unchanged } => {
+                let _ = write!(buf, "SYNCED {added} {changed} {removed} {unchanged}\r\n");
+            }
+            Response::Aborted => buf.extend_from_slice(b"ABORTED\r\n"),
+            Response::BadSchedule => buf.extend_from_slice(b"BAD_SCHEDULE\r\n"),
+            Response::NotSyncing => buf.extend_from_slice(b"NOT_SYNCING\r\n"),
         }
     }
 
@@ -309,6 +442,20 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         parse_flush_tube(rest)
     } else if let Some(rest) = line.strip_prefix("flush-buried ") {
         parse_flush_buried(rest)
+    } else if let Some(rest) = line.strip_prefix("schedule-begin ") {
+        parse_schedule_begin(rest)
+    } else if let Some(rest) = line.strip_prefix("schedule-put ") {
+        Ok(parse_schedule_put(rest))
+    } else if line == "schedule-commit" {
+        Ok(Command::ScheduleCommit)
+    } else if line == "schedule-abort" {
+        Ok(Command::ScheduleAbort)
+    } else if line == "list-schedules" {
+        Ok(Command::ListSchedules { owner: None })
+    } else if let Some(rest) = line.strip_prefix("list-schedules ") {
+        parse_list_schedules(rest)
+    } else if let Some(rest) = line.strip_prefix("stats-schedule ") {
+        parse_stats_schedule(rest)
     } else if line == "drain" {
         Ok(Command::Drain)
     } else if line == "undrain" {
@@ -367,58 +514,9 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
     let ttr = parts[2].parse::<u32>().map_err(|_| Response::BadFormat)?;
     let bytes = parts[3].parse::<u32>().map_err(|_| Response::BadFormat)?;
 
-    let mut idempotency_key = None;
-    let mut group = None;
-    let mut after_group = None;
-    let mut concurrency_key = None;
-
+    let mut tags = PutTags::default();
     for part in &parts[4..] {
-        if let Some(val) = part.strip_prefix("idp:") {
-            // Parse idp:key or idp:key:N
-            if let Some(colon_pos) = val.rfind(':') {
-                let key_part = &val[..colon_pos];
-                let ttl_part = &val[colon_pos + 1..];
-                if !is_valid_key(key_part) {
-                    return Err(Response::BadFormat);
-                }
-                let ttl: u32 = ttl_part.parse().map_err(|_| Response::BadFormat)?;
-                idempotency_key = Some((key_part.to_string(), ttl));
-            } else {
-                if !is_valid_key(val) {
-                    return Err(Response::BadFormat);
-                }
-                idempotency_key = Some((val.to_string(), 0));
-            }
-        } else if let Some(val) = part.strip_prefix("grp:") {
-            if !is_valid_key(val) {
-                return Err(Response::BadFormat);
-            }
-            group = Some(val.to_string());
-        } else if let Some(val) = part.strip_prefix("aft:") {
-            if !is_valid_key(val) {
-                return Err(Response::BadFormat);
-            }
-            after_group = Some(val.to_string());
-        } else if let Some(val) = part.strip_prefix("con:") {
-            // Parse con:key or con:key:N
-            if let Some(colon_pos) = val.rfind(':') {
-                let key_part = &val[..colon_pos];
-                let limit_part = &val[colon_pos + 1..];
-                if !is_valid_key(key_part) {
-                    return Err(Response::BadFormat);
-                }
-                let limit: u32 = limit_part.parse().map_err(|_| Response::BadFormat)?;
-                if limit == 0 {
-                    return Err(Response::BadFormat);
-                }
-                concurrency_key = Some((key_part.to_string(), limit));
-            } else {
-                if !is_valid_key(val) {
-                    return Err(Response::BadFormat);
-                }
-                concurrency_key = Some((val.to_string(), 1));
-            }
-        } else {
+        if !tags.parse_tag(part)? {
             return Err(Response::BadFormat);
         }
     }
@@ -428,10 +526,99 @@ fn parse_put(rest: &str) -> Result<Command, Response> {
         delay,
         ttr,
         bytes,
-        idempotency_key,
-        group,
-        after_group,
-        concurrency_key,
+        idempotency_key: tags.idempotency_key,
+        group: tags.group,
+        after_group: tags.after_group,
+        concurrency_key: tags.concurrency_key,
+    })
+}
+
+fn parse_schedule_begin(rest: &str) -> Result<Command, Response> {
+    if !is_valid_tube_name(rest) {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::ScheduleBegin {
+        owner: rest.to_string(),
+    })
+}
+
+/// `schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>`.
+/// Tags are the tokens with a `prefix:`; the spec is everything after them,
+/// and no spec token has a colon.
+fn parse_schedule_put(rest: &str) -> Command {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    Command::SchedulePut {
+        bytes: parts.get(5).and_then(|b| b.parse().ok()),
+        line: parse_schedule_line(&parts).map(Box::new),
+    }
+}
+
+fn parse_schedule_line(parts: &[&str]) -> Result<Line, Response> {
+    let [name, tube, pri, delay, ttr, bytes, rest @ ..] = parts else {
+        return Err(Response::BadFormat);
+    };
+    if !is_valid_tube_name(name) || !is_valid_tube_name(tube) {
+        return Err(Response::BadFormat);
+    }
+    let pri = pri.parse::<u32>().map_err(|_| Response::BadFormat)?;
+    let delay = delay.parse::<u32>().map_err(|_| Response::BadFormat)?;
+    let ttr = ttr.parse::<u32>().map_err(|_| Response::BadFormat)?;
+    bytes.parse::<u32>().map_err(|_| Response::BadFormat)?;
+
+    let mut tags = PutTags::default();
+    let mut catchup = Catchup::Once;
+    let spec_at = rest.iter().position(|t| !t.contains(':')).unwrap_or(rest.len());
+    for part in &rest[..spec_at] {
+        if let Some(secs) = part.strip_prefix("catchup:") {
+            catchup = match secs.parse::<u32>().map_err(|_| Response::BadFormat)? {
+                0 => Catchup::Never,
+                secs => Catchup::Within(secs),
+            };
+        } else if !tags.parse_tag(part)? {
+            return Err(Response::BadFormat);
+        }
+    }
+    if spec_at == rest.len() {
+        return Err(Response::BadFormat);
+    }
+    let spec_text = rest[spec_at..].join(" ");
+    let spec = Spec::parse(&spec_text).map_err(|e| {
+        tracing::info!(name, error = %e, "schedule-put refused");
+        Response::BadSchedule
+    })?;
+    Ok(Line {
+        name: name.to_string(),
+        tube: tube.to_string(),
+        pri,
+        delay,
+        ttr,
+        tags,
+        catchup,
+        spec,
+        spec_text,
+    })
+}
+
+fn parse_list_schedules(rest: &str) -> Result<Command, Response> {
+    if !is_valid_tube_name(rest) {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::ListSchedules {
+        owner: Some(rest.to_string()),
+    })
+}
+
+fn parse_stats_schedule(rest: &str) -> Result<Command, Response> {
+    let parts: Vec<&str> = rest.split(' ').collect();
+    let [owner, name] = parts[..] else {
+        return Err(Response::BadFormat);
+    };
+    if !is_valid_tube_name(owner) || !is_valid_tube_name(name) {
+        return Err(Response::BadFormat);
+    }
+    Ok(Command::StatsSchedule {
+        owner: owner.to_string(),
+        name: name.to_string(),
     })
 }
 
@@ -1234,5 +1421,82 @@ mod tests {
             not_found: 1,
         };
         assert_eq!(resp.serialize(), b"DELETED_BATCH 3 1\r\n");
+    }
+
+    fn schedule_line(line: &str) -> (Option<u32>, Result<Box<Line>, Response>) {
+        match parse_command(line).unwrap() {
+            Command::SchedulePut { bytes, line } => (bytes, line),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_put_splits_tags_from_spec() {
+        let (bytes, line) = schedule_line(
+            "schedule-put rollup splat.maint 1024 0 120 40 idp:rollup con:1 catchup:300 5 * * * * Australia/Melbourne",
+        );
+        let line = line.unwrap();
+        assert_eq!(bytes, Some(40));
+        assert_eq!(line.name, "rollup");
+        assert_eq!(line.tube, "splat.maint");
+        assert_eq!((line.pri, line.delay, line.ttr), (1024, 0, 120));
+        assert_eq!(line.tags.idempotency_key, Some(("rollup".to_string(), 0)));
+        assert_eq!(line.tags.concurrency_key, Some(("1".to_string(), 1)));
+        assert_eq!(line.tags.to_string(), "idp:rollup con:1");
+        assert_eq!(line.catchup, Catchup::Within(300));
+        assert_eq!(line.spec_text, "5 * * * * Australia/Melbourne");
+
+        let (_, line) = schedule_line("schedule-put a t 0 0 1 2 catchup:0 every 60s");
+        assert_eq!(line.unwrap().catchup, Catchup::Never);
+        let (_, line) = schedule_line("schedule-put a t 0 0 1 2 @daily");
+        assert_eq!(line.unwrap().catchup, Catchup::Once);
+    }
+
+    #[test]
+    fn test_parse_schedule_put_keeps_the_body_length_of_a_refused_line() {
+        for (line, bytes, err) in [
+            ("schedule-put a t x 0 1 2 @daily", Some(2), Response::BadFormat),
+            ("schedule-put a t 0 0 1 2 idp:", Some(2), Response::BadFormat),
+            ("schedule-put a t 0 0 1 2 nope:x @daily", Some(2), Response::BadFormat),
+            ("schedule-put a t 0 0 1 2", Some(2), Response::BadFormat),
+            ("schedule-put a t 0 0 1 2 0 0 30 2 *", Some(2), Response::BadSchedule),
+            ("schedule-put a t 0 0 1 x @daily", None, Response::BadFormat),
+            ("schedule-put a t", None, Response::BadFormat),
+            ("schedule-put -a t 0 0 1 2 @daily", Some(2), Response::BadFormat),
+        ] {
+            let (got_bytes, got) = schedule_line(line);
+            assert_eq!(got_bytes, bytes, "{line}");
+            assert_eq!(got.unwrap_err(), err, "{line}");
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_commands() {
+        assert_eq!(parse_command("schedule-begin splat").unwrap(), Command::ScheduleBegin { owner: "splat".into() });
+        assert_eq!(parse_command("schedule-begin a b").unwrap_err(), Response::BadFormat);
+        assert_eq!(parse_command("schedule-commit").unwrap(), Command::ScheduleCommit);
+        assert_eq!(parse_command("schedule-abort").unwrap(), Command::ScheduleAbort);
+        assert_eq!(parse_command("list-schedules").unwrap(), Command::ListSchedules { owner: None });
+        assert_eq!(
+            parse_command("list-schedules splat").unwrap(),
+            Command::ListSchedules { owner: Some("splat".into()) }
+        );
+        assert_eq!(
+            parse_command("stats-schedule splat rollup").unwrap(),
+            Command::StatsSchedule { owner: "splat".into(), name: "rollup".into() }
+        );
+        assert_eq!(parse_command("stats-schedule splat").unwrap_err(), Response::BadFormat);
+        assert_eq!(parse_command("stats-schedule a b c").unwrap_err(), Response::BadFormat);
+    }
+
+    #[test]
+    fn test_serialize_schedule_responses() {
+        assert_eq!(Response::Syncing("splat".into()).serialize(), b"SYNCING splat\r\n");
+        assert_eq!(Response::Staged.serialize(), b"STAGED\r\n");
+        let synced = Response::Synced { added: 1, changed: 2, removed: 3, unchanged: 4 };
+        assert_eq!(synced.serialize(), b"SYNCED 1 2 3 4\r\n");
+        assert_eq!(Response::Aborted.serialize(), b"ABORTED\r\n");
+        assert_eq!(Response::BadSchedule.serialize(), b"BAD_SCHEDULE\r\n");
+        assert_eq!(Response::NotSyncing.serialize(), b"NOT_SYNCING\r\n");
     }
 }

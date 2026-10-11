@@ -406,6 +406,8 @@ struct ServerState {
     /// tick; the accept loop reads the derived ceiling. Also the source for the
     /// `fd-*` and `current-connections`-adjacent stats fields.
     fd_budget: Arc<FdBudget>,
+    /// Recurring schedule entries; see `crate::schedule`.
+    schedules: crate::schedule::Schedules,
 }
 
 impl ServerState {
@@ -515,6 +517,7 @@ impl ServerState {
             deferred_replies: Vec::new(),
             wal_failed: false,
             fd_budget,
+            schedules: crate::schedule::Schedules::default(),
         }
     }
 
@@ -575,10 +578,17 @@ impl ServerState {
     }
 
     /// True iff adding `additional` bytes would exceed the configured budget.
-    /// Returns false (allow) when `max_job_bytes` is `None`.
+    /// Returns false (allow) when `max_job_bytes` is `None`. Schedule entries
+    /// share the budget with jobs; their bytes are kept apart from
+    /// `total_job_bytes` so its drift detector stays about jobs alone.
     fn memory_limit_exceeded(&self, additional: u64) -> bool {
         match self.max_job_bytes {
-            Some(limit) => self.total_job_bytes.saturating_add(additional) > limit,
+            Some(limit) => {
+                self.total_job_bytes
+                    .saturating_add(self.schedules.bytes())
+                    .saturating_add(additional)
+                    > limit
+            }
             None => false,
         }
     }
@@ -1070,6 +1080,12 @@ impl ServerState {
                 tracing::info!("exiting drain mode (requested by connection {})", conn_id);
                 Response::NotDraining
             }
+            Command::ScheduleBegin { owner } => self.cmd_schedule_begin(conn_id, owner),
+            Command::SchedulePut { line, .. } => self.cmd_schedule_put(conn_id, line, body),
+            Command::ScheduleCommit => self.cmd_schedule_commit(conn_id),
+            Command::ScheduleAbort => self.cmd_schedule_abort(conn_id),
+            Command::ListSchedules { owner } => self.cmd_list_schedules(owner.as_deref()),
+            Command::StatsSchedule { owner, name } => self.cmd_stats_schedule(&owner, &name),
             Command::Quit => Response::Deleted, // handled at connection level
         }
     }
@@ -5069,7 +5085,7 @@ async fn handle_connection(
         };
 
         // Parse command
-        let cmd = match protocol::parse_command(cmd_str) {
+        let mut cmd = match protocol::parse_command(cmd_str) {
             Ok(cmd) => cmd,
             Err(resp) => {
                 resp_buf.clear();
@@ -5104,13 +5120,23 @@ async fn handle_connection(
             break;
         }
 
-        // If it's a put command, read the body
-        let body = if let Command::Put { bytes, .. } = &cmd {
-            let body_size = *bytes as usize;
+        // If it's a put or schedule-put, read the body
+        let declared = match &cmd {
+            Command::Put { bytes, .. } => Some(*bytes),
+            Command::SchedulePut { bytes, .. } => *bytes,
+            _ => None,
+        };
+        let body = if let Some(bytes) = declared {
+            let body_size = bytes as usize;
 
             // Check size BEFORE allocating to prevent OOM from malicious clients
             if body_size > max_job_size as usize {
-                let _ = writer.write_all(b"JOB_TOO_BIG\r\n").await;
+                // A refused schedule-put still has to reach the engine, so
+                // that the sync it belongs to aborts; the engine replies.
+                let schedule_put = matches!(cmd, Command::SchedulePut { .. });
+                if !schedule_put {
+                    let _ = writer.write_all(b"JOB_TOO_BIG\r\n").await;
+                }
                 // Drain the body + \r\n so the connection stays usable
                 let to_drain = body_size as u64 + 2;
                 match drain_bytes(
@@ -5126,52 +5152,58 @@ async fn handle_connection(
                     Ok(true) => {}
                     Ok(false) | Err(_) => break,
                 }
-                continue;
-            }
-
-            let mut body_buf = vec![0u8; body_size + 2]; // +2 for \r\n
-            match read_body_exact(
-                &mut reader,
-                &mut body_buf,
-                conn_id,
-                &engine_tx,
-                idle_timeout,
-                &mut last_activity,
-            )
-            .await
-            {
-                // Deadline fired mid-body and the engine agreed to close. The
-                // partial body is discarded with the connection; nothing was
-                // acked, so the client's put simply never happened.
-                Ok(false) => {
-                    tracing::debug!(conn_id, "closing idle connection mid-body");
-                    break;
+                if !schedule_put {
+                    continue;
                 }
-                Ok(true) => {
-                    // Verify trailing \r\n
-                    if body_buf[body_size] != b'\r' || body_buf[body_size + 1] != b'\n' {
-                        let _ = writer.write_all(b"EXPECTED_CRLF\r\n").await;
-                        // Close rather than continue. A missing trailer means the
-                        // declared `<bytes>` disagreed with what the client sent, so
-                        // the stream is desynchronised and there is no way to locate
-                        // the next command boundary — the excess is an unknown length
-                        // by definition. Resuming the parse loop would interpret the
-                        // remainder of the *body* as commands, which turns a client
-                        // that miscounts bytes (UTF-16 `.length`, `String#length`
-                        // instead of `#bytesize`) into a command-injection path for
-                        // whoever controls the payload.
-                        //
-                        // beanstalkd resumes here; tuber deliberately does not. See
-                        // the over-long command line above for the same reasoning.
+                if let Command::SchedulePut { line, .. } = &mut cmd {
+                    *line = Err(Response::JobTooBig);
+                }
+                None
+            } else {
+                let mut body_buf = vec![0u8; body_size + 2]; // +2 for \r\n
+                match read_body_exact(
+                    &mut reader,
+                    &mut body_buf,
+                    conn_id,
+                    &engine_tx,
+                    idle_timeout,
+                    &mut last_activity,
+                )
+                .await
+                {
+                    // Deadline fired mid-body and the engine agreed to close. The
+                    // partial body is discarded with the connection; nothing was
+                    // acked, so the client's put simply never happened.
+                    Ok(false) => {
+                        tracing::debug!(conn_id, "closing idle connection mid-body");
                         break;
                     }
-                    body_buf.truncate(body_size);
+                    Ok(true) => {
+                        // Verify trailing \r\n
+                        if body_buf[body_size] != b'\r' || body_buf[body_size + 1] != b'\n' {
+                            let _ = writer.write_all(b"EXPECTED_CRLF\r\n").await;
+                            // Close rather than continue. A missing trailer means the
+                            // declared `<bytes>` disagreed with what the client sent, so
+                            // the stream is desynchronised and there is no way to locate
+                            // the next command boundary — the excess is an unknown length
+                            // by definition. Resuming the parse loop would interpret the
+                            // remainder of the *body* as commands, which turns a client
+                            // that miscounts bytes (UTF-16 `.length`, `String#length`
+                            // instead of `#bytesize`) into a command-injection path for
+                            // whoever controls the payload.
+                            //
+                            // beanstalkd resumes here; tuber deliberately does not. See
+                            // the over-long command line above for the same reasoning.
+                            break;
+                        }
+                        body_buf.truncate(body_size);
 
-                    Some(body_buf)
-                }
-                Err(e) => {
-                    tracing::debug!("body read error for conn {}: {}", conn_id, e);
-                    break;
+                        Some(body_buf)
+                    }
+                    Err(e) => {
+                        tracing::debug!("body read error for conn {}: {}", conn_id, e);
+                        break;
+                    }
                 }
             }
         } else {
@@ -5212,6 +5244,7 @@ async fn handle_connection(
         .await;
 }
 
+mod schedules;
 mod tick;
 
 #[cfg(test)]

@@ -46,6 +46,9 @@ pub struct ConnState {
     /// O(1) instead of walking every reserved job; both were O(n) per call,
     /// which `reserve-batch` turned from trivial into the dominant cost.
     pub min_deadline: Option<Instant>,
+    /// A schedule sync this connection has begun and not yet committed or
+    /// aborted. Dropped with the connection, which aborts it.
+    pub schedule_sync: Option<crate::schedule::Staging>,
 }
 
 impl ConnState {
@@ -61,6 +64,7 @@ impl ConnState {
             conn_type: 0,
             reserved_jobs: Vec::new(),
             min_deadline: None,
+            schedule_sync: None,
         }
     }
 
