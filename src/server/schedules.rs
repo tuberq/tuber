@@ -4,7 +4,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use super::*;
 use crate::schedule::spec::format_time;
-use crate::schedule::{self, Catchup, Line, MAX_ENTRIES, Staging};
+use crate::schedule::{self, Catchup, Entry, Line, MAX_ENTRIES, Staging};
 
 impl ServerState {
     pub(super) fn cmd_schedule_begin(&mut self, conn_id: u64, owner: String) -> Response {
@@ -196,6 +196,57 @@ const ON_TIME: SignedDuration = SignedDuration::from_secs(5);
 /// would silence the entry for as long as the clock was out.
 const CLOCK_STEP_TOLERANCE: SignedDuration = SignedDuration::from_hours(1);
 
+/// If `e` was recorded (fired or synced) beyond `horizon`, the clock was
+/// wrong then: resume it from `now` rather than wait for the clock to pass
+/// the bogus time. Returns whether it did.
+fn correct_future_clock(e: &mut Entry, now: Timestamp, horizon: Timestamp) -> bool {
+    let recorded = e.recorded();
+    if recorded <= horizon {
+        return false;
+    }
+    tracing::warn!(
+        owner = %e.owner,
+        name = %e.line.name,
+        recorded = %format_time(recorded, &e.line.spec.time_zone()),
+        "schedule's last fire or sync is in the future: the clock was wrong \
+         then; resuming from now",
+    );
+    e.last_fire = e.last_fire.filter(|&last| last <= now);
+    e.synced_at = e.synced_at.min(now);
+    e.next_fire = e.line.spec.next_after(now);
+    true
+}
+
+/// Whether `e`'s due `tick` should fire at `now`. A run of missed ticks
+/// fires once unless `catchup:` bounds how stale the latest of them may be;
+/// a tick within [`ON_TIME`] is on time, not missed, whatever the bound.
+fn catchup_allows(e: &Entry, tick: Timestamp, now: Timestamp) -> bool {
+    let bound = match e.line.catchup {
+        Catchup::Once => return true,
+        Catchup::Within(secs) => SignedDuration::from_secs(secs.into()),
+        Catchup::Never => SignedDuration::ZERO,
+    };
+    // The latest tick is no older than `tick`: if that's on time, so is it.
+    if now.duration_since(tick) <= ON_TIME {
+        return true;
+    }
+    let since = tick
+        .checked_sub(SignedDuration::from_nanos(1))
+        .unwrap_or(tick);
+    let latest = e.line.spec.latest_at_or_before(now, since).unwrap_or(tick);
+    let fire = now.duration_since(latest) <= ON_TIME.max(bound);
+    if !fire {
+        tracing::info!(
+            owner = %e.owner,
+            name = %e.line.name,
+            missed = %format_time(latest, &e.line.spec.time_zone()),
+            catchup = %e.line.catchup.describe(),
+            "schedule skipping a missed tick",
+        );
+    }
+    fire
+}
+
 impl ServerState {
     /// Fire every entry whose next tick is at or before `now`, once however
     /// many of its ticks have passed: a run of missed ticks (tuber down, or
@@ -204,46 +255,13 @@ impl ServerState {
     pub(super) fn fire_due_schedules(&mut self, now: Timestamp) {
         let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
         let mut corrected = false;
+        let horizon = now + CLOCK_STEP_TOLERANCE;
         for e in self.schedules.iter_mut() {
-            let recorded = e.recorded();
-            if recorded > now + CLOCK_STEP_TOLERANCE {
-                tracing::warn!(
-                    owner = %e.owner,
-                    name = %e.line.name,
-                    recorded = %format_time(recorded, &e.line.spec.time_zone()),
-                    "schedule's last fire or sync is in the future: the clock was wrong \
-                     then; resuming from now",
-                );
-                e.last_fire = e.last_fire.filter(|&last| last <= now);
-                e.synced_at = e.synced_at.min(now);
-                e.next_fire = e.line.spec.next_after(now);
-                corrected = true;
-            }
+            corrected |= correct_future_clock(e, now, horizon);
             let Some(tick) = e.next_fire.filter(|&t| t <= now) else {
                 continue;
             };
-            let fire = match e.line.catchup {
-                Catchup::Once => true,
-                bound => {
-                    let since = tick
-                        .checked_sub(SignedDuration::from_nanos(1))
-                        .unwrap_or(tick);
-                    let latest = e.line.spec.latest_at_or_before(now, since).unwrap_or(tick);
-                    let age = now.duration_since(latest);
-                    let fire = age <= ON_TIME
-                        || matches!(bound, Catchup::Within(secs) if age <= SignedDuration::from_secs(secs.into()));
-                    if !fire {
-                        tracing::info!(
-                            owner = %e.owner,
-                            name = %e.line.name,
-                            missed = %format_time(latest, &e.line.spec.time_zone()),
-                            catchup = %e.line.catchup.describe(),
-                            "schedule skipping a missed tick",
-                        );
-                    }
-                    fire
-                }
-            };
+            let fire = catchup_allows(e, tick, now);
             e.next_fire = e.line.spec.next_after(now);
             if fire {
                 due.push((e.owner.clone(), e.line.name.clone(), e.last_fire));
