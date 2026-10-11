@@ -38,6 +38,25 @@ impl TestServer {
         .await
     }
 
+    async fn start_with_binlog(dir: &std::path::Path) -> Self {
+        let dir = dir.to_path_buf();
+        Self::spawn(move |listener| async move {
+            tuber::server::run_with_listener(listener, 65535, Some(&dir), None)
+                .await
+                .ok();
+        })
+        .await
+    }
+
+    /// Stop the server the way a crash would, as far as schedules go:
+    /// nothing gets a chance to write on the way down.
+    async fn kill(self) {
+        self.handle.abort();
+        // Let the engine task notice its channel close before a new server
+        // opens the same directory.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     async fn spawn<F, Fut>(run: F) -> Self
     where
         F: FnOnce(tokio::net::TcpListener) -> Fut,
@@ -489,4 +508,161 @@ async fn a_fire_deduped_against_a_buried_job_is_visible() {
         "{s}"
     );
     assert_eq!(stat(&s, "last-result"), format!("\"INSERTED {id} BURIED\""));
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/// A spec whose only tick in the next hour is `secs` from now:
+/// `every 1h offset <n>s`, with `n` the second of the hour then.
+fn tick_in(secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    format!("every 1h offset {}s", (now + secs) % 3600)
+}
+
+async fn ready_jobs(c: &mut TestConn, tube: &str) -> u64 {
+    c.send(&format!("stats-tube {tube}\r\n")).await;
+    let line = c.readline().await;
+    if line == "NOT_FOUND" {
+        return 0;
+    }
+    let len: usize = line.strip_prefix("OK ").unwrap().parse().unwrap();
+    let mut body = vec![0u8; len + 2];
+    c.reader.read_exact(&mut body).await.unwrap();
+    let yaml = String::from_utf8(body).unwrap();
+    stat(&yaml, "current-jobs-ready").parse().unwrap()
+}
+
+#[tokio::test]
+async fn entries_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin splat", "SYNCING splat").await;
+    c.schedule_put(
+        "retention",
+        "maint",
+        "con:1 catchup:600 0 2 * * * Australia/Melbourne",
+        r#"{"class":"DataRetentionJob"}"#,
+    )
+    .await;
+    c.schedule_put("checkpoint", "checkins", "idp:checkpoint every 10m", "{}")
+        .await;
+    c.ck("schedule-commit", "SYNCED 2 0 0 0").await;
+    let before = c.stats_schedule("splat", "retention").await;
+    drop(c);
+    srv.kill().await;
+
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    assert_eq!(
+        c.list("list-schedules").await,
+        ["splat checkpoint", "splat retention"]
+    );
+    let after = c.stats_schedule("splat", "retention").await;
+    for key in [
+        "spec",
+        "tube",
+        "pri",
+        "delay",
+        "ttr",
+        "tags",
+        "catchup",
+        "synced-at",
+        "next-fire",
+    ] {
+        assert_eq!(stat(&after, key), stat(&before, key), "{key}");
+    }
+
+    // The restored set is the one a sync compares against.
+    c.ck("schedule-begin splat", "SYNCING splat").await;
+    c.schedule_put(
+        "retention",
+        "maint",
+        "con:1 catchup:600 CRON_TZ=Australia/Melbourne 0 2 * * *",
+        r#"{"class":"DataRetentionJob"}"#,
+    )
+    .await;
+    c.ck("schedule-commit", "SYNCED 0 0 1 1").await;
+    drop(c);
+    srv.kill().await;
+
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    assert_eq!(c.list("list-schedules").await, ["splat retention"]);
+}
+
+#[tokio::test]
+async fn a_tick_missed_while_down_fires_once_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("hourly", "jobs", &tick_in(2), "{}").await;
+    c.schedule_put(
+        "strict",
+        "strict",
+        &format!("catchup:0 {}", tick_in(2)),
+        "{}",
+    )
+    .await;
+    c.ck("schedule-commit", "SYNCED 2 0 0 0").await;
+    drop(c);
+    srv.kill().await;
+
+    // Down across the tick, and for longer than the 5 s within which a late
+    // tick still counts as on time.
+    tokio::time::sleep(Duration::from_millis(8000)).await;
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut c = srv.connect().await;
+    assert_eq!(ready_jobs(&mut c, "jobs").await, 1, "one catch-up fire");
+    assert_eq!(ready_jobs(&mut c, "strict").await, 0, "catchup:0 skips it");
+    let s = c.stats_schedule("app", "strict").await;
+    assert_eq!(stat(&s, "total-fires"), "0");
+}
+
+#[tokio::test]
+async fn a_fire_is_stamped_before_it_is_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("hourly", "jobs", &tick_in(1), "{}").await;
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
+
+    // Wait for the fire, then crash.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let s = c.stats_schedule("app", "hourly").await;
+    assert_eq!(stat(&s, "total-fires"), "1", "{s}");
+    drop(c);
+    srv.kill().await;
+
+    // The restart knows the tick was fired: it doesn't fire it again.
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut c = srv.connect().await;
+    let after = c.stats_schedule("app", "hourly").await;
+    assert_eq!(stat(&after, "total-fires"), "0", "{after}");
+    assert_eq!(stat(&after, "last-fire"), stat(&s, "last-fire"));
+}
+
+#[tokio::test]
+async fn a_damaged_schedules_file_is_set_aside_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("schedules"), b"TSCH not really").unwrap();
+
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    assert!(c.list("list-schedules").await.is_empty());
+    assert!(dir.path().join("schedules.damaged").exists());
+
+    // And schedules work again from the next sync.
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("a", "jobs", "@daily", "{}").await;
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
 }

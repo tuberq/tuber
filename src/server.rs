@@ -408,6 +408,10 @@ struct ServerState {
     fd_budget: Arc<FdBudget>,
     /// Recurring schedule entries; see `crate::schedule`.
     schedules: crate::schedule::Schedules,
+    /// Where `schedules` is persisted. Present iff a binlog directory is
+    /// configured; without one, schedules live in memory and the next app to
+    /// boot syncs them back.
+    schedule_files: Option<crate::schedule::store::ScheduleFiles>,
 }
 
 impl ServerState {
@@ -518,6 +522,7 @@ impl ServerState {
             wal_failed: false,
             fd_budget,
             schedules: crate::schedule::Schedules::default(),
+            schedule_files: None,
         }
     }
 
@@ -634,8 +639,10 @@ impl ServerState {
             ),
             None => (0, 0),
         };
+        let schedule_bytes = self.schedule_files.as_ref().map_or(0, |f| f.disk_bytes());
         let projected = wal_bytes
             .saturating_add(toast_bytes)
+            .saturating_add(schedule_bytes)
             .saturating_add(body_len)
             .saturating_add(BODY_OVERHEAD)
             .saturating_add(wal_reserve);
@@ -4086,6 +4093,26 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         }
 
         state.restore_jobs(jobs, next_id, tombstones, buried_order);
+
+        // Schedule entries live beside the WAL; see `crate::schedule::store`.
+        let (files, schedules) = match crate::schedule::store::ScheduleFiles::open(dir) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // A damaged schedule file mustn't keep the queue down. Set
+                // it aside and start without schedules: each app's next sync
+                // restores its own.
+                let damaged = dir.join(crate::schedule::store::DEFS_FILE);
+                let aside = dir.join("schedules.damaged");
+                tracing::error!("{e}; moved to {aside:?}, no schedules until apps re-sync");
+                std::fs::rename(&damaged, &aside)?;
+                crate::schedule::store::ScheduleFiles::open(dir)?
+            }
+            other => other?,
+        };
+        if !schedules.is_empty() {
+            tracing::info!("schedules: restored {} entries from {:?}", schedules.len(), dir);
+        }
+        state.schedules = schedules;
+        state.schedule_files = Some(files);
 
         // Enforce the in-memory budget after replay. The WAL on-disk size
         // is not a reliable proxy (tombstones, superseded records, and format

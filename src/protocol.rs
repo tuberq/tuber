@@ -553,6 +553,12 @@ fn parse_schedule_put(rest: &str) -> Command {
     }
 }
 
+/// Parse `schedule-put`'s arguments (everything after the verb). Also how
+/// stored entries are read back, so they pass the same checks.
+pub fn parse_schedule_put_line(rest: &str) -> Result<Line, Response> {
+    parse_schedule_line(&rest.split_whitespace().collect::<Vec<_>>())
+}
+
 fn parse_schedule_line(parts: &[&str]) -> Result<Line, Response> {
     let [name, tube, pri, delay, ttr, bytes, rest @ ..] = parts else {
         return Err(Response::BadFormat);

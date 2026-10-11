@@ -2374,3 +2374,23 @@ fn schedule_fire_is_refused_like_any_put() {
     // Not retried: the next attempt is the next tick.
     assert_eq!(next_fire(&s, "ping"), t + mins(1));
 }
+
+#[test]
+fn a_fire_that_cannot_be_stamped_is_not_put() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    // A directory that isn't there: every write fails.
+    let gone = std::env::temp_dir().join("tuber-test-no-such-dir/nested");
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(&gone).unwrap();
+    s.schedule_files = Some(files);
+
+    s.fire_due_schedules(t);
+    assert_eq!(ready_in(&s, "jobs"), 0, "at most once: unstamped means unfired");
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!(e.last_fire, None);
+    assert_eq!((e.stats.rejected, e.stats.inserted), (1, 0));
+    assert_eq!(e.stats.last_result.as_deref(), Some("INTERNAL_ERROR"));
+}

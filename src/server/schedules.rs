@@ -86,8 +86,21 @@ impl ServerState {
         {
             return Response::OutOfMemory;
         }
+        // An entry's memory cost over-estimates its share of the file.
+        if self.storage_limit_exceeded(sync.bytes.saturating_sub(held_bytes)) {
+            return Response::OutOfStorage;
+        }
         let owner = sync.owner.clone();
         let counts = self.schedules.commit(sync, Timestamp::now());
+        // Durable before the reply. On failure the new set stands in memory
+        // and the client hears INTERNAL_ERROR, as a put whose WAL write
+        // fails does; the next commit or fire writes the files again.
+        if let Some(files) = self.schedule_files.as_mut()
+            && let Err(e) = files.write_all(&self.schedules)
+        {
+            tracing::error!(owner, "schedule sync not persisted: {e}");
+            return Response::InternalError;
+        }
         tracing::info!(
             owner,
             added = counts.added,
@@ -203,7 +216,7 @@ impl ServerState {
     /// the clock stepped forward) is caught up with one fire, subject to the
     /// entry's `catchup:`. Called from the tick with the wall clock.
     pub(super) fn fire_due_schedules(&mut self, now: Timestamp) {
-        let mut due: Vec<(String, String)> = Vec::new();
+        let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
         for e in self.schedules.iter_mut() {
             let Some(tick) = e.next_fire.filter(|&t| t <= now) else {
                 continue;
@@ -232,12 +245,31 @@ impl ServerState {
             };
             e.next_fire = e.line.spec.next_after(now);
             if fire {
+                due.push((e.owner.clone(), e.line.name.clone(), e.last_fire));
                 e.last_fire = Some(now);
-                due.push((e.owner.clone(), e.line.name.clone()));
             }
         }
+        if due.is_empty() {
+            return;
+        }
 
-        for (owner, name) in due {
+        // Stamp first: once the stamps are on disk a crash can lose these
+        // fires but never repeat them. If they can't be written, don't fire —
+        // the same at-most-once promise, kept by losing the tick now.
+        if let Some(files) = self.schedule_files.as_mut()
+            && let Err(e) = files.write_stamps(&self.schedules)
+        {
+            tracing::error!("schedule fires not stamped, so not fired: {e}");
+            for (owner, name, previous) in due {
+                if let Some(entry) = self.schedules.get_mut(&owner, &name) {
+                    entry.last_fire = previous;
+                }
+                self.record_fire(&owner, &name, &Response::InternalError);
+            }
+            return;
+        }
+
+        for (owner, name, _) in due {
             let Some(e) = self.schedules.get(&owner, &name) else {
                 continue;
             };

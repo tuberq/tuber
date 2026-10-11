@@ -9,6 +9,7 @@
 //! next fire, last fire and counters.
 
 pub mod spec;
+pub mod store;
 
 use std::collections::BTreeMap;
 
@@ -169,6 +170,15 @@ impl Schedules {
 
     pub fn get(&self, owner: &str, name: &str) -> Option<&Entry> {
         self.entries.get(&(owner.to_string(), name.to_string()))
+    }
+
+    /// Add an entry read back from disk.
+    pub fn restore(&mut self, entry: Entry) {
+        self.bytes += memory_cost(&entry.owner, &entry.line, &entry.body);
+        let key = (entry.owner.clone(), entry.line.name.clone());
+        if let Some(old) = self.entries.insert(key, entry) {
+            self.bytes -= memory_cost(&old.owner, &old.line, &old.body);
+        }
     }
 
     pub fn get_mut(&mut self, owner: &str, name: &str) -> Option<&mut Entry> {
