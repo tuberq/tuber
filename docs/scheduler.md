@@ -435,10 +435,27 @@ the durability promise doesn't, and the client is told.
 A fire goes through the same code path as a client `put`: validation,
 idempotency, groups, concurrency keys, the memory and storage budgets, the WAL
 record. The tube is created if absent; a paused tube accepts the job (pause
-only holds reserves). Its result is recorded as `last-result`. A rejected fire
-(`DRAINING`, `OUT_OF_MEMORY`, `OUT_OF_STORAGE`, `INTERNAL_ERROR`) is counted
-and not retried — the next tick tries again. A fire that dedups against a
-buried job is logged as a warning each time, with the streak.
+only holds reserves). Its result is recorded as `last-result`.
+
+While the server is draining, or after its WAL has failed, nothing fires and
+nothing is stamped: due ticks stay due, as if tuber were down. When the drain
+ends (`undrain`) or the server restarts, they are missed ticks like any other,
+and `catchup:` decides whether one fire catches them up. So the usual
+maintenance routine of drain, wait, restart doesn't silently skip a daily job
+due in between.
+
+A fire refused by the put itself (`OUT_OF_MEMORY`, `OUT_OF_STORAGE`,
+`JOB_TOO_BIG`, `INTERNAL_ERROR`) is counted and not retried — the next tick
+tries again. One that queued nothing has the entry's last fire put back (in
+memory and in `schedules.fired`): the staleness alert on
+`tuber_schedule_last_fire_timestamp_seconds` still sees the gap, and after a
+restart the tick counts as missed. That is all of them except the
+`INTERNAL_ERROR` of the put that failed the WAL, which keeps its stamp: its
+record may still have reached disk, and a restart can bring the job back.
+An `INTERNAL_ERROR` from a failed TOAST write, or from a put refused because
+an earlier fire in the tick failed the WAL, wrote nothing. A fire that
+dedups against a buried job is logged as a warning each time, with the
+streak.
 
 The scheduler runs in the existing 100 ms tick, comparing each entry's next
 fire with the wall clock (`jiff::Timestamp::now()`), not `Instant`, because

@@ -818,6 +818,31 @@ async fn a_tick_missed_while_down_fires_once_on_restart() {
 }
 
 #[tokio::test]
+async fn a_tick_due_while_draining_fires_once_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.ck("schedule-begin app", "SYNCING app").await;
+    c.schedule_put("hourly", "jobs", &tick_in(1), "{}").await;
+    c.ck("schedule-commit", "SYNCED 1 0 0 0").await;
+
+    // Drain, let the tick fall due, restart: the usual maintenance routine.
+    c.ck("drain", "DRAINING").await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    drop(c);
+    srv.kill().await;
+
+    let srv = TestServer::start_with_binlog(dir.path()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut c = srv.connect().await;
+    assert_eq!(
+        ready_jobs(&mut c, "jobs").await,
+        1,
+        "the drained tick catches up"
+    );
+}
+
+#[tokio::test]
 async fn a_fire_is_stamped_before_it_is_put() {
     let dir = tempfile::tempdir().unwrap();
     let srv = TestServer::start_with_binlog(dir.path()).await;

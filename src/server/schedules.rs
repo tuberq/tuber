@@ -255,6 +255,13 @@ impl ServerState {
     /// the clock stepped forward) is caught up with one fire, subject to the
     /// entry's `catchup:`. Called from the tick with the wall clock.
     pub(super) fn fire_due_schedules(&mut self, now: Timestamp) {
+        // Every put would be refused. Leave due ticks due, unstamped: they
+        // are missed, not fired, and `catchup:` decides their fate once the
+        // drain ends or the server restarts. Stamping them would hide them
+        // from both, and from the last-fire staleness alert.
+        if self.drain_mode || self.wal_failed {
+            return;
+        }
         let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
         let mut corrected = false;
         let horizon = now + CLOCK_STEP_TOLERANCE;
@@ -298,14 +305,39 @@ impl ServerState {
             return;
         }
 
-        for (owner, name, _) in due {
+        let mut unstamped = false;
+        for (owner, name, previous) in due {
             let Some(e) = self.schedules.get(&owner, &name) else {
                 continue;
             };
             let (tube, tags, body) = (e.line.tube.clone(), e.line.tags.clone(), e.body.clone());
             let (pri, delay, ttr) = (e.line.pri, e.line.delay, e.line.ttr);
+            let wal_was_failed = self.wal_failed;
             let resp = self.put_job(None, tube, pri, delay, ttr, Some(body), tags);
             self.record_fire(&owner, &name, &resp);
+            // Refused before anything was queued: the tick is lost, as for
+            // any refused put, but it wasn't a fire, so last-fire keeps its
+            // age. That includes INTERNAL_ERROR from a failed TOAST write, or
+            // after an earlier fire failed the WAL, but not from the put
+            // that failed it: its record may be on disk, and a restart bring
+            // the job back.
+            let queued_nothing = match resp {
+                Response::OutOfMemory | Response::OutOfStorage | Response::JobTooBig => true,
+                Response::InternalError => wal_was_failed || !self.wal_failed,
+                _ => false,
+            };
+            if queued_nothing && let Some(e) = self.schedules.get_mut(&owner, &name) {
+                e.last_fire = previous;
+                unstamped = true;
+            }
+        }
+        // After a restart the refused tick counts as missed and `catchup:`
+        // may fire it: still at most once, since nothing was queued.
+        if unstamped
+            && let Some(files) = self.schedule_files.as_mut()
+            && let Err(e) = files.write_stamps(&self.schedules)
+        {
+            tracing::error!("refused schedule fires not unstamped: {e}");
         }
     }
 

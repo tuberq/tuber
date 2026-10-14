@@ -2661,7 +2661,7 @@ fn schedule_fire_records_dedups_and_buried_streak() {
 }
 
 #[test]
-fn schedule_fire_is_refused_like_any_put() {
+fn a_tick_due_while_draining_waits_for_the_drain_to_end() {
     let mut s = make_state();
     let c = register(&mut s);
     sync_schedules(&mut s, c, &[("ping", "every 60s")]);
@@ -2669,11 +2669,121 @@ fn schedule_fire_is_refused_like_any_put() {
 
     s.handle_command(c, Command::Drain, None);
     s.fire_due_schedules(t);
-    let st = &s.schedules.get("app", "ping").unwrap().stats;
-    assert_eq!((st.rejected, st.inserted), (1, 0));
-    assert_eq!(st.last_result.as_deref(), Some("DRAINING"));
-    // Not retried: the next attempt is the next tick.
+    // Neither fired nor stamped: the tick is still due, and `catchup:`
+    // decides what becomes of it when the drain ends or the server restarts.
+    assert_eq!(fired(&s, "ping"), 0);
+    assert_eq!(s.schedules.get("app", "ping").unwrap().last_fire, None);
+    assert_eq!(next_fire(&s, "ping"), t);
+
+    s.handle_command(c, Command::Undrain, None);
+    s.fire_due_schedules(t + jiff::SignedDuration::from_secs(2));
+    assert_eq!(ready_in(&s, "jobs"), 1);
+}
+
+#[test]
+fn a_tick_due_after_the_wal_failed_waits_for_the_restart() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    s.wal_failed = true;
+    s.fire_due_schedules(t);
+    assert_eq!(fired(&s, "ping"), 0);
+    assert_eq!(s.schedules.get("app", "ping").unwrap().last_fire, None);
+    assert_eq!(next_fire(&s, "ping"), t);
+}
+
+#[test]
+fn a_fire_refused_for_memory_is_lost_but_not_recorded_as_a_fire() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_state();
+    let c = register(&mut s);
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    s.schedule_files = Some(files);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+
+    s.max_job_bytes = Some(s.memory_in_use());
+    s.fire_due_schedules(t);
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!((e.stats.rejected, e.stats.inserted), (1, 0));
+    assert_eq!(e.stats.last_result.as_deref(), Some("OUT_OF_MEMORY"));
+    // Lost like any refused put: the next attempt is the next tick.
     assert_eq!(next_fire(&s, "ping"), t + mins(1));
+    // But no job was queued, so last-fire doesn't move — in memory or on
+    // disk — and an alert on its staleness still sees the gap.
+    assert_eq!(e.last_fire, None);
+    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    assert_eq!(restored.get("app", "ping").unwrap().last_fire, None);
+}
+
+#[test]
+fn a_fire_whose_body_store_write_fails_is_not_recorded_as_a_fire() {
+    // Refused before anything was queued, like a fire refused for memory.
+    // The put answers INTERNAL_ERROR, but nothing reached the WAL to come
+    // back at a restart.
+    let dir = tempfile::tempdir().unwrap();
+    let toast = tempfile::tempdir().unwrap();
+    let mut s = make_state();
+    let c = register(&mut s);
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    s.schedule_files = Some(files);
+    s.body_store = Some(Arc::new(
+        crate::body_store::BodyStore::open(toast.path(), 4096).unwrap(),
+    ));
+    // The first write can't create its segment.
+    std::fs::remove_dir_all(toast.path()).unwrap();
+
+    let body = vec![b'x'; crate::job::HEAP_INLINE_MAX + 1];
+    let resp = s.handle_command(
+        c,
+        Command::ScheduleBegin {
+            owner: "app".into(),
+        },
+        None,
+    );
+    assert_eq!(resp, Response::Syncing("app".into()));
+    let line = format!("schedule-put ping jobs 0 0 60 {} every 60s", body.len());
+    let cmd = protocol::parse_line(line.as_bytes()).unwrap();
+    assert_eq!(s.handle_command(c, cmd, Some(body)), Response::Staged);
+    let resp = s.handle_command(c, Command::ScheduleCommit, None);
+    assert!(matches!(resp, Response::Synced(_)), "got {resp:?}");
+    let t = next_fire(&s, "ping");
+
+    s.fire_due_schedules(t);
+    assert!(!s.wal_failed);
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!(e.stats.last_result.as_deref(), Some("INTERNAL_ERROR"));
+    assert_eq!(ready_in(&s, "jobs"), 0);
+    assert_eq!(e.last_fire, None);
+    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    assert_eq!(restored.get("app", "ping").unwrap().last_fire, None);
+}
+
+#[test]
+fn of_a_tick_s_fires_only_the_one_that_failed_the_wal_is_recorded() {
+    // Its record may be on disk and come back at a restart, so it counts
+    // as fired. The fires after it are refused before anything is
+    // written, like a tick due once the WAL has failed.
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(wal_dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    s.schedule_files = Some(files);
+    sync_schedules(&mut s, c, &[("ping", "every 60s"), ("pong", "every 60s")]);
+    let t = next_fire(&s, "ping").max(next_fire(&s, "pong"));
+
+    s.wal.as_mut().unwrap().inject_io_failure();
+    s.fire_due_schedules(t);
+    assert!(s.wal_failed);
+    let last_fire = |s: &crate::schedule::Schedules, name| s.get("app", name).unwrap().last_fire;
+    assert_eq!(last_fire(&s.schedules, "ping"), Some(t));
+    assert_eq!(last_fire(&s.schedules, "pong"), None);
+    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    assert!(last_fire(&restored, "ping").is_some());
+    assert_eq!(last_fire(&restored, "pong"), None);
 }
 
 #[test]
