@@ -24,8 +24,9 @@
 //! "compatible" disambiguation, as in RFC 5545.
 
 use jiff::civil::{Date, DateTime};
-use jiff::tz::TimeZone;
+use jiff::tz::{TimeZone, TimeZoneDatabase};
 use jiff::{SignedDuration, Timestamp};
+use std::sync::LazyLock;
 
 /// A parsed spec. Two specs are equal when they fire at the same times, so
 /// `CRON_TZ=X 0 2 * * *` equals `0 2 * * * X`; the text is kept by the caller.
@@ -58,8 +59,15 @@ impl Zone {
         }
     }
 
+    /// The host's database first, since it's updated more often; then the
+    /// copy built into tuber (`jiff-tzdb`). Debian trixie and Ubuntu 24.04
+    /// moved legacy names such as `US/Pacific` to `tzdata-legacy`, and a
+    /// distroless image has no database at all.
     fn get(name: &str) -> Result<Zone, String> {
-        let tz = TimeZone::get(name).map_err(|e| format!("unknown time zone {name:?}: {e}"))?;
+        static BUNDLED: LazyLock<TimeZoneDatabase> = LazyLock::new(TimeZoneDatabase::bundled);
+        let tz = TimeZone::get(name)
+            .or_else(|e| BUNDLED.get(name).map_err(|_| e))
+            .map_err(|e| format!("unknown time zone {name:?}: {e}"))?;
         let name = tz.iana_name().unwrap_or(name).to_string();
         Ok(Zone { name, tz })
     }

@@ -220,3 +220,44 @@ fn tcp_keepalive_beyond_the_kernel_limit_is_refused_at_startup() {
     let (early, _) = settle(spawn_server(&[], &["--tcp-keepalive", "40000"]));
     assert!(early.is_some_and(|s| !s.success()), "{early:?}");
 }
+
+#[test]
+fn a_zone_the_host_database_lacks_comes_from_the_bundled_copy() {
+    // Debian trixie and Ubuntu 24.04 ship /usr/share/zoneinfo but moved the
+    // legacy names, US/Pacific among them, to tzdata-legacy. A host database
+    // holding only UTC stands in for one like that.
+    let zoneinfo = tempfile::tempdir().unwrap();
+    std::fs::copy("/usr/share/zoneinfo/UTC", zoneinfo.path().join("UTC"))
+        .expect("copy the host's UTC zone");
+    let port = free_port().to_string();
+    let mut cmd = Command::new(bin());
+    cmd.args(["server", "-l", "127.0.0.1", "-p", &port])
+        .env("TZDIR", zoneinfo.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for e in PERSIST_ENVS {
+        cmd.env_remove(e);
+    }
+    let mut child = cmd.spawn().expect("spawn tuber binary");
+    let mut conn = (0..50)
+        .find_map(|_| {
+            std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
+                .ok()
+                .or_else(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                })
+        })
+        .expect("connect to server");
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    let begin = roundtrip(&mut conn, "schedule-begin app");
+    let put = roundtrip(
+        &mut conn,
+        "schedule-put ping jobs 0 0 60 2 0 9 * * * US/Pacific\r\n{}",
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(begin.unwrap(), "SYNCING app\r\n");
+    assert_eq!(put.unwrap(), "STAGED\r\n");
+}

@@ -404,8 +404,8 @@ startup with an explanation rather than being thrown away. Every format
 version keeps the magic, version field and trailing CRC-32, so the two can be
 told apart. A damaged `schedules.fired` only loses last
 fires, so missed ticks are judged from each entry's sync time. A stored entry
-that no longer parses (most likely a zone the system's tzdata dropped) is
-logged and skipped.
+that no longer parses (most likely a zone gone from both the host's tzdata
+and tuber's own copy) is logged and skipped.
 
 Without `-b`, schedules live in memory like everything else, and the next app
 process to boot syncs them back.
@@ -512,13 +512,15 @@ Open when the proposal was written; settled 2026-10-11.
 
 ## Dependencies
 
-- **jiff** (0.2) for zones, DST and civil-time arithmetic: two crates on
-  Linux, `jiff` and `jiff-core`. Tuber had no date/time crate before it.
-  jiff reads the system zone database;
-  `debian:bookworm-slim` ships tzdata (checked: `tzdata 2026c`,
-  `/usr/share/zoneinfo/Australia/Melbourne` present). Only a scratch or
-  distroless image would need the `tzdb-bundle-always` feature, which adds
-  `jiff-tzdb`.
+- **jiff** (0.2) for zones, DST and civil-time arithmetic: three crates on
+  Linux, `jiff`, `jiff-core` and `jiff-tzdb`. Tuber had no date/time crate
+  before it. A zone comes from the host's database first, since it's updated
+  more often, then from the copy of the IANA database built into tuber
+  (`jiff-tzdb`, the `tzdb-bundle-always` feature). The fallback is per zone:
+  Debian trixie and Ubuntu 24.04 ship `/usr/share/zoneinfo` but moved legacy
+  names such as `US/Pacific` to `tzdata-legacy`, and jiff on its own falls
+  back only when there's no database at all, as in a scratch or distroless
+  image.
 - **The cron parser and next-fire search, written here.** jiff has none. croner
   4.0 (2026-08-31) can now run on jiff and its DST rules are close to the
   rule chosen here, but it is six weeks old and its README contradicts the OCPS spec it

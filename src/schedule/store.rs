@@ -93,7 +93,8 @@ impl ScheduleFiles {
             let line = match crate::protocol::parse_schedule_put_line(&line_text) {
                 Ok(line) => line,
                 Err(resp) => {
-                    // Most likely a zone the system's tzdata no longer has.
+                    // Most likely a zone gone from both the host's tzdata
+                    // and the copy built into tuber.
                     // The app's next sync puts it back, or is told why not.
                     tracing::error!(
                         owner,
