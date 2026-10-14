@@ -9,7 +9,7 @@ Two command-line tools talk to a tuber server:
 
 | Tool | Use it for |
 | --- | --- |
-| `tuber-cli` | One-shot protocol commands with JSON output: inspect, put, delete, kick, flush, pause, drain. The default choice. |
+| `tuber-cli` | One-shot protocol commands with JSON output: inspect, put, delete, kick, flush, pause, drain, recurring schedules. The default choice. |
 | `tuber` (the server binary) | `tuber work` to *run* jobs as shell commands, `tuber put` to enqueue one job per stdin line, `tuber tubes` for a per-tube count table, `tuber schedules` for [recurring schedules](#recurring-schedules-tuber-only). |
 
 Drop to raw protocol over `nc` only for the connection-scoped commands listed
@@ -37,8 +37,21 @@ server. Despite the name it takes a bare address, not a URL: `host:port`,
 
 Output is pretty-printed JSON on stdout. Stats keys are snake_case
 (`current_jobs_ready`), not the protocol's hyphenated names — use those with
-`jq`. A failure prints the server's reply as `Error: NOT_FOUND`,
-`Error: TIMED_OUT`, `Error: DRAINING`, … on stderr and exits 1.
+`jq`. A job body that isn't UTF-8 comes out base64-encoded as `body_base64`
+instead of `body`.
+
+A failure prints one JSON object on stderr, `{"error": "NOT_FOUND", "message":
+"NOT_FOUND"}` (with `--format text`, a line: `Error: NOT_FOUND`), and its exit
+code says what kind of failure it was:
+
+| Exit | `error` | Meaning |
+| --- | --- | --- |
+| 1 | `ERROR` | Anything else |
+| 2 | `INVALID_INPUT` | Bad arguments, refused before anything was sent |
+| 3 | `NOT_FOUND` | No such job/tube/entry; `delete-batch` with any id not found |
+| 4 | `TIMED_OUT`, `DEADLINE_SOON` | A reserve that got no job |
+| 5 | `DRAINING`, `OUT_OF_MEMORY`, `INTERNAL_ERROR`, `BAD_SCHEDULE`, … | Tuber refused it |
+| 6 | `UNREACHABLE`, `NO_REPLY`, `PROTOCOL_ERROR` | No server, or no answer within 30s |
 
 ---
 
@@ -110,8 +123,8 @@ Tuber adds four optional tags to `put`:
 | --- | --- | --- | --- |
 | `idp:<key>[:<ttl>]` | `--idempotent <key>` `[--idempotent-ttl <n>]` | `-i <key>[:<ttl>]` | Drop the put if a job with this key is already in the tube |
 | `grp:<name>` | `--group <name>` | `-g <name>` | Add the job to a group (fan-out) |
-| `aft:<name>` | `--after <name>` | `--aft <name>` | Hold the job until every job in the group is deleted (fan-in) |
-| `con:<key>[:<n>]` | `--concurrency <key>[:<n>]` | `-c <key>[:<n>]` | At most `n` (default 1) jobs with this key reserved at once |
+| `aft:<name>` | `--after <name>` | `--aft <name>` | Hold the job until every job in the group is deleted (fan-in); checked once, see below |
+| `con:<key>[:<n>]` | `--concurrency <key>[:<n>]` | `-c <key>[:<n>]` | At most `n` (default 1) jobs with this key reserved at once; mixed limits take the smallest, see below |
 
 ```bash
 # Idempotent put -- drops the put if a job with this key exists in the tube
@@ -133,7 +146,20 @@ tuber-cli put --tube work --concurrency user-42:3 "resize avatar"
 
 Without a TTL the idempotency key is freed the moment its job is deleted. A
 `con:` key's other jobs stay ready but are hidden from `reserve` until a
-reservation ends (delete, release, bury, TTR timeout, or disconnect).
+reservation ends (delete, release, bury, TTR timeout, or disconnect). When jobs
+sharing a key declare different limits, the key's limit is the smallest among
+its ready and reserved jobs; a delayed or buried job doesn't tighten it until
+it can run.
+
+**An `aft:` job checks its group once**, when it is put (or when its delay is
+up). If the group has no pending jobs then, the job is released, and it stays
+released even if the group gets new jobs later or the server restarts. So put
+a group's jobs *before* the `aft:` job that waits on them.
+
+A put answered **`INTERNAL_ERROR`** (tuber run with `-b`, when its write-ahead
+log fails) was not queued, but its record may already be on disk, so a tuber
+restart can bring the job back. Retry such a put with an `idp:` key, so the
+retry and the revived job can't both run.
 
 A deduplicated put is **not an error**. It reports the job already there:
 
@@ -144,15 +170,22 @@ A deduplicated put is **not an error**. It reports the job already there:
 `id` is the *existing* job's id and nothing was enqueued. `state` is where that
 job sits — `READY`, `RESERVED`, `DELAYED`, `BURIED`, or `DELETED` during an
 `--idempotent-ttl` cooldown. A fresh insert returns just `{ "id": 7 }`, so
-branch on the `duplicate` key. A duplicate with a more urgent (lower)
+branch on the `duplicate` key. A dedup against a `BURIED` job also warns on
+stderr (both `tuber-cli put` and `tuber put`), still exiting 0: nothing was
+queued, and nothing runs until that job is kicked, so a put from cron that
+keeps hitting it drops its work every time. `stats-tube` counts these as
+`total_idp_dedups_buried`. A duplicate with a more urgent (lower)
 priority ratchets the existing job's priority down — never up; `stats-job`
-shows the result.
+shows the result, and `tuber-cli put` reports the new priority as
+`"raised_pri"`.
 
 > **Colons in keys are a trap.** Keys and group names allow letters, digits
 > and `- + / ; . $ _ ( )` — no colon. In `idp:` and `con:` the **last** colon
-> separates the key from its number, so `--idempotent series:123` means key
-> `series` with TTL 123, *not* key `series:123`, and `--idempotent user:abc`
-> is `BAD_FORMAT`. Prefer dashes or dots: `--idempotent series-123`.
+> separates the key from its number, so `idp:series:123` means key `series`
+> with TTL 123, *not* key `series:123`. `tuber-cli` refuses a colon in
+> `--idempotent` (exit 2; give a TTL with `--idempotent-ttl`) and reads
+> `--concurrency key:N` as key and limit, but `tuber put -i series:123` and raw
+> `put` lines still misread it. Prefer dashes or dots: `series-123`.
 
 ## Managing jobs
 
@@ -160,7 +193,7 @@ shows the result.
 # Delete a job by ID (NOT_FOUND if another connection has it reserved)
 tuber-cli delete 42
 
-# Delete multiple jobs by ID -- exits 1 if any were not found
+# Delete multiple jobs by ID -- exits 3 if any were not found
 tuber-cli delete-batch 1 2 3 4 5
 # {"deleted": 3, "not_found": 2}
 
@@ -171,7 +204,7 @@ tuber-cli kick 10 --tube emails
 tuber-cli kick-job 42
 
 # Reserve -- see the trap below: these hand the job straight back on exit
-tuber-cli reserve --tube emails --timeout 5      # exits 1 with TIMED_OUT if empty
+tuber-cli reserve --tube emails --timeout 5      # exits 4 with TIMED_OUT if empty
 tuber-cli reserve-batch 10 --tube emails --timeout 5   # {"jobs": [], "reserved": 0} if empty
 tuber-cli reserve-job 42                         # one specific job, ignoring tube and watch list
 ```
@@ -209,8 +242,7 @@ Tuber can put jobs on a timer itself. An app registers its schedule at boot
 under a name of its choosing, the **owner** (`splat`, `booko`), and tuber puts
 each entry's body into its tube at the times its spec names. A fire is an
 ordinary put: the job lands in the tube like any other, with the entry's
-priority, ttr and tags. Beanstalkd has none of this, and `tuber-cli` has no
-schedule commands yet — use `tuber schedules` and raw protocol.
+priority, ttr and tags. Beanstalkd has none of this.
 
 ```bash
 # One line per entry: spec, tube, next fire, last fire's reply
@@ -219,13 +251,16 @@ tuber schedules
 #   splat rollup: 5 * * * * -> splat.maintenance next=2026-10-11T05:05:00+00:00 last=INSERTED 47101 BURIED (deduped against a buried job 70 times running)
 tuber schedules -o splat          # one owner
 
-# Everything about one entry, including its next three fires in its own zone
-printf 'stats-schedule splat rollup\r\n' | nc -w 1 localhost 11300
-printf 'list-schedules\r\n' | nc -w 1 localhost 11300     # - <owner> <name> per line
+# The same as JSON
+tuber-cli list-schedules                  # [{"name": "rollup", "owner": "splat"}, ...]
+tuber-cli list-schedules --owner splat
+# Everything about one entry, including its next three fires in its own zone.
+# Times are RFC 3339 in the entry's zone, "" when there is none yet.
+tuber-cli stats-schedule splat rollup     # spec, tags, next_fire..next_fire_3, last_result, buried_streak, ...
 ```
 
 **An entry that "fires" but nothing runs** shows `last=INSERTED <id> BURIED`
-and a non-zero `buried-streak`: it has an `idp:` key, and the job from an
+and a non-zero `buried-streak` (`buried_streak` in `tuber-cli stats-schedule`): it has an `idp:` key, and the job from an
 earlier fire is buried, so every fire dedups against it and queues nothing.
 Find the job with `tuber-cli peek-buried --tube <tube>` (or `stats-job <id>`),
 fix the cause, and `tuber-cli kick-job <id>` or delete it; the next fire
@@ -243,8 +278,35 @@ re-syncs at its next boot, undoing a hand edit anyway — so:
 - For ad-hoc schedules, use an owner of your own (`ops`) and send its full set
   every time.
 
-A sync is staged on one connection and committed by it, so it must be a single
-`nc` session (closing the connection mid-sync aborts it):
+`tuber-cli schedule-sync <owner> <file>` sends a whole set from a JSON file
+(`-` for stdin) as one sync, and refuses an empty file unless given
+`--allow-empty`:
+
+```bash
+cat > ops-schedule.json <<'JSON'
+[
+  {"name": "nightly-report", "tube": "reports", "cron": "0 2 * * *",
+   "zone": "Australia/Melbourne", "idp": "nightly-report", "ttr": 600,
+   "body": "./generate-report.sh"},
+  {"name": "heartbeat", "tube": "ops", "every": "5m", "ttr": 60, "body": "true"}
+]
+JSON
+tuber-cli schedule-sync ops ops-schedule.json
+# {"added": 2, "changed": 0, "owner": "ops", "removed": 0, "unchanged": 0}
+```
+
+Each entry takes `name`, `tube`, `body` (a string is put verbatim; a JSON
+object or array is put as written, less whitespace), and exactly one of
+`cron` (with an optional `zone`), `every` (seconds, or `"10m"`, with an
+optional `offset`) or `spec` (as tuber reads it). Optional: `pri`, `delay`,
+`ttr` (defaults 65536, 0, 120, as tuber-gem has them; not `put`'s urgent
+priority 0), `idp`, `con`, `grp`, `aft` (the tag's value, e.g.
+`"con": "maintenance:2"`), and `catchup` (`"once"`, the default; `"never"` or
+`false`; or seconds). An unknown key is an error, so a misspelled `zone` can't
+silently mean UTC.
+
+Without tuber-cli, a sync is staged on one connection and committed by it, so
+it must be a single `nc` session (closing the connection mid-sync aborts it):
 
 ```bash
 # schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>\r\n<body>\r\n
@@ -260,7 +322,10 @@ printf 'schedule-begin ops\r\nschedule-commit\r\n' | nc -w 1 localhost 11300
 If any line is refused — `BAD_SCHEDULE` (unknown zone, a cron that never
 matches), `BAD_FORMAT`, `JOB_TOO_BIG` — the commit replies `ABORTED` and
 **nothing changes**: the old set keeps running. Fix the line and resend the
-whole sync.
+whole sync. `tuber-cli schedule-sync` aborts at the refused entry and exits 5
+naming it: `{"error": "BAD_SCHEDULE", "message": "tuber refused schedule
+nightly-report for ops: BAD_SCHEDULE; nothing changed, the previous schedule is
+still running"}`.
 
 Specs: 5-field cron (`5 * * * *`, names like `MON-FRI`), optionally followed
 by an IANA zone (`0 2 * * * Australia/Melbourne`; default UTC) or prefixed
@@ -338,8 +403,8 @@ released. Commands that only make sense inside one live session:
 `tuber-cli reserve` / `reserve-batch` / `reserve-job` are therefore for
 *inspection* — seeing what a worker would get. To actually consume a job,
 reserve and finish it on one connection: `tuber work` for shell-command jobs,
-otherwise `tuber-lib`'s `TuberClient`, a beanstalkd client library, or a single
-`printf`/`nc` session.
+otherwise `tuber-lib`'s `TuberClient` (which has `release`, `bury`, `touch` and
+`touch_all`), a beanstalkd client library, or a single `printf`/`nc` session.
 
 ---
 
