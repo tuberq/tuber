@@ -16,6 +16,8 @@
 
 **`flush-tube` wakes a worker waiting on a `con:` key it frees.** Flushing a reserved `con:` job frees its slot, and flushing a ready one can loosen the key's limit, but a worker waiting for the same key in another tube got the job only at the next tick, up to 100 ms later. `delete` already woke it at once.
 
+**An `aft:` job its group has released stays released.** A running server checks an `aft:` job's group once, when the job is put or when its delay is up, and a job that joins the group later doesn't hold back one already released. That only matters when a group name is reused, but then the rule was broken in four places. A restart held every such job again, even one that was running. A release with a delay held it again once the delay ran out. `kick`, `kick-job` and `reserve-job` passed over it if it was buried, and `reserve-job` if it was ready. 0.16.0 made `kick` match the restart; now the restart matches the running server. A group's release of its waiting jobs is written to the WAL, one record per job, so a restart keeps it.
+
 **A restart after the upgrade no longer needs `--migrate-wal` again.** The check refused to start while any WAL segment was older than v8, and an old segment stays until compaction or GC empties it: on a busy queue, as long as its oldest job lives. Every restart in that time was refused. Only the newest segment counts now; a current one means an earlier start already had the flag. On 0.16.0, leave `--migrate-wal` set until the old segments are gone. It does nothing on a current WAL.
 
 ## v0.16.0

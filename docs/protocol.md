@@ -15,7 +15,7 @@ Optional extension tags (space-separated, after `<bytes>`):
 |---|---|
 | `idp:<key>` or `idp:<key>:<ttl>` | Idempotency key. Deduplicates within the tube — if a live job with the same key exists, returns the original ID and state. Optional TTL (seconds) keeps deduplicating after the job is deleted. |
 | `grp:<name>` | Assign the job to a named group for fan-out/fan-in. |
-| `aft:<name>` | Hold the job until all jobs in the named group are deleted. |
+| `aft:<name>` | Hold the job until all jobs in the named group are deleted. The group is checked when the job is put, or when its delay is up; once released, the job isn't held again. |
 | `con:<key>` or `con:<key>:<N>` | Concurrency key. Limits parallel reservations sharing this key. Default limit is 1. Jobs with different limits for one key get the smallest declared by any of them that is ready or reserved. |
 
 Responses:
@@ -239,13 +239,13 @@ Response: `FOUND <id> <bytes>\r\n<body>\r\n` or `NOT_FOUND\r\n`
 
 ### kick \<bound\>\r\n
 
-Kick up to `<bound>` buried/delayed jobs in the use tube. Buried jobs are kicked if any can be, otherwise delayed ones. An `aft:` job whose group is incomplete is passed over.
+Kick up to `<bound>` buried/delayed jobs in the use tube. Buried jobs are kicked if any can be, otherwise delayed ones. An `aft:` job its group still holds is passed over.
 
 Response: `KICKED <count>\r\n`
 
 ### kick-job \<id\>\r\n
 
-Kick a specific job. `NOT_FOUND` also covers a job that isn't buried or delayed, and an `aft:` job whose group is incomplete.
+Kick a specific job. `NOT_FOUND` also covers a job that isn't buried or delayed, and an `aft:` job its group still holds.
 
 Response: `KICKED\r\n` or `NOT_FOUND\r\n`
 

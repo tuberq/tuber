@@ -2710,22 +2710,61 @@ async fn test_restored_con_key_takes_the_strictest_limit() {
 }
 
 #[tokio::test]
-async fn test_restored_delayed_and_held_jobs_do_not_hold_their_con_key() {
-    // Jobs 1, 3 and 4 ask for one at a time, but none can run: job 3 isn't
-    // due for an hour, and jobs 1 and 4 wait on group g. Job 1 was put
-    // before g had a job, so it was ready, but restore holds it again. After
-    // the restart, none holds jobs 5 and 6 to one at a time.
+async fn test_restart_does_not_hold_a_released_after_job_again() {
+    // Three aft:g jobs, each released: job 1 at put, as g had no job yet;
+    // job 3 when g's job 2 was deleted; job 4 when its delay ran out. Then
+    // job 5 joins g. A restart doesn't hold any of them again, not even
+    // job 1, which was running.
     let dir = tempfile::tempdir().unwrap();
     with_wal_server(dir.path(), |mut c| async move {
-        c.mustsend("put 0 0 60 1 aft:g con:k\r\nh\r\n").await;
+        c.mustsend("put 0 0 60 1 aft:g\r\na\r\n").await;
         c.ckresp("INSERTED 1\r\n").await;
         c.mustsend("put 10 0 60 1 grp:g\r\ng\r\n").await;
         c.ckresp("INSERTED 2\r\n").await;
-        c.mustsend("put 0 3600 60 1 con:k\r\nd\r\n").await;
+        c.mustsend("put 0 0 60 1 aft:g\r\na\r\n").await;
         c.ckresp("INSERTED 3\r\n").await;
-        c.mustsend("put 0 0 60 1 aft:g con:k\r\nh\r\n").await;
+        c.mustsend("delete 2\r\n").await;
+        c.ckresp("DELETED\r\n").await;
+        c.mustsend("put 0 1 60 1 aft:g\r\na\r\n").await;
         c.ckresp("INSERTED 4\r\n").await;
-        for id in 5..=6 {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for id in [3, 4] {
+            c.mustsend(&format!("stats-job {id}\r\n")).await;
+            let body = c.read_ok_body().await;
+            assert!(body.contains("state: ready"), "job {id}: {body}");
+        }
+        c.mustsend("put 10 0 60 1 grp:g\r\ng\r\n").await;
+        c.ckresp("INSERTED 5\r\n").await;
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp("RESERVED 1 1\r\n").await;
+        c.ckresp("a\r\n").await;
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        for id in [1, 3, 4, 5] {
+            c.mustsend(&format!("stats-job {id}\r\n")).await;
+            let body = c.read_ok_body().await;
+            assert!(body.contains("state: ready"), "job {id}: {body}");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_restored_delayed_and_held_jobs_do_not_hold_their_con_key() {
+    // Jobs 2 and 3 ask for one at a time, but job 2 isn't due for an hour
+    // and job 3 waits on group g. After a restart, neither holds jobs 4 and
+    // 5 to one at a time.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 10 0 60 1 grp:g\r\ng\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("put 0 3600 60 1 con:k\r\nd\r\n").await;
+        c.ckresp("INSERTED 2\r\n").await;
+        c.mustsend("put 0 0 60 1 aft:g con:k\r\nh\r\n").await;
+        c.ckresp("INSERTED 3\r\n").await;
+        for id in 4..=5 {
             c.mustsend("put 0 0 60 1 con:k:2\r\nr\r\n").await;
             c.ckresp(&format!("INSERTED {id}\r\n")).await;
         }
@@ -2733,7 +2772,7 @@ async fn test_restored_delayed_and_held_jobs_do_not_hold_their_con_key() {
     .await;
 
     with_wal_server(dir.path(), |mut c| async move {
-        for id in 5..=6 {
+        for id in 4..=5 {
             c.mustsend("reserve-with-timeout 0\r\n").await;
             c.ckresp(&format!("RESERVED {id} 1\r\n")).await;
             c.ckresp("r\r\n").await;

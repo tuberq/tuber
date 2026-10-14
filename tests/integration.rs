@@ -2695,45 +2695,52 @@ async fn test_kick_job_refuses_delayed_after_job_until_group_completes() {
     c.ckresp("z\r\n").await;
 }
 
-/// A buried after-job whose group has new members again stays buried under
-/// `kick` and `kick-job`, as it would on replay or `reserve-job`. With no
-/// other buried job to kick, `kick` moves on to the delayed jobs.
+/// An after-job is held only until its group first completes. Once released,
+/// new members of the group don't hold it again: `kick`, `kick-job` and
+/// `reserve-job` take it, buried or ready, as they would any other job.
 #[tokio::test]
-async fn test_kick_skips_buried_after_job_while_group_reopened() {
+async fn test_released_after_job_is_not_held_when_its_group_reopens() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    // An after-job for an empty group is ready at once; bury it.
+    // An after-job for an empty group is released at once. Then the group
+    // gets a member.
     c.mustsend("put 0 0 60 1 aft:ro\r\nz\r\n").await;
     c.ckresp("INSERTED 1\r\n").await;
-    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:ro\r\na\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("reserve-job 1\r\n").await;
     c.ckresp("RESERVED 1 1\r\n").await;
     c.ckresp("z\r\n").await;
     c.mustsend("bury 1 0\r\n").await;
     c.ckresp("BURIED\r\n").await;
 
-    // The group gets a member, and there is a plain delayed job.
-    c.mustsend("put 0 0 60 1 grp:ro\r\na\r\n").await;
-    c.ckresp("INSERTED 2\r\n").await;
+    // With a plain delayed job behind it, `kick` takes the buried one.
     c.mustsend("put 0 30 60 1\r\nd\r\n").await;
     c.ckresp("INSERTED 3\r\n").await;
 
     c.mustsend("kick 5\r\n").await;
     c.ckresp("KICKED 1\r\n").await;
-    assert_eq!(job_state(&mut c, 1).await, "buried");
-    assert_eq!(job_state(&mut c, 3).await, "ready");
-    c.mustsend("kick-job 1\r\n").await;
-    c.ckresp("NOT_FOUND\r\n").await;
-
-    // Completing the group makes it kickable again.
-    c.mustsend("reserve-job 2\r\n").await;
-    c.ckresp("RESERVED 2 1\r\n").await;
-    c.ckresp("a\r\n").await;
-    c.mustsend("delete 2\r\n").await;
-    c.ckresp("DELETED\r\n").await;
-    c.mustsend("kick 5\r\n").await;
-    c.ckresp("KICKED 1\r\n").await;
     assert_eq!(job_state(&mut c, 1).await, "ready");
+    assert_eq!(job_state(&mut c, 3).await, "delayed");
+
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("z\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+    c.mustsend("kick-job 1\r\n").await;
+    c.ckresp("KICKED\r\n").await;
+
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("z\r\n").await;
+    c.mustsend("bury 1 0\r\n").await;
+    c.ckresp("BURIED\r\n").await;
+    c.mustsend("reserve-job 1\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("z\r\n").await;
 }
 
 // ---------------------------------------------------------------------------

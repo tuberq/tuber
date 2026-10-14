@@ -41,6 +41,7 @@ impl ServerState {
                             gs.waiting_jobs.push(job_id);
                         }
                     } else if let Some(job) = self.jobs.get_mut(&job_id) {
+                        let released_by_group = job.after_group().is_some() && job.reserve_ct == 0;
                         Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                         job.deadline_at = None;
                         let key = job.ready_key();
@@ -53,6 +54,9 @@ impl ServerState {
                             if let Some(tube) = self.tubes.get_mut(tube_name) {
                                 tube.stat.urgent_ct += 1;
                             }
+                        }
+                        if released_by_group {
+                            self.wal_write_group_release(job_id);
                         }
                     }
                 }
@@ -365,9 +369,6 @@ impl ServerState {
         // index pass below only needs ids plus small cloned fields.
         let ids = self.adopt_jobs(jobs);
 
-        // Collect after_group job IDs for a second pass
-        let mut after_group_jobs: Vec<u64> = Vec::new();
-
         // `ids` is in hash order, but tube.buried is a FIFO whose front
         // must stay the oldest bury (kick semantics). Buried jobs are
         // collected during the loop and queued afterwards in the replay's
@@ -390,7 +391,6 @@ impl ServerState {
             let delay = job.delay;
             let idempotency_key = job.idempotency_key().cloned();
             let group = job.group().cloned();
-            let after_group = job.after_group().cloned();
 
             self.ensure_tube(&tube_name);
 
@@ -414,6 +414,9 @@ impl ServerState {
                     }
                 }
                 JobState::Delayed => {
+                    // An after-job its group still holds replays as delayed,
+                    // and the tick holds it again when it comes due. One its
+                    // group released stays released (`held_by_group`).
                     let deadline = deadline_at.unwrap_or_else(|| Instant::now() + delay);
                     if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                         tube.delay.insert((deadline, id), id);
@@ -458,10 +461,6 @@ impl ServerState {
                     gs.buried += 1;
                 }
             }
-
-            if after_group.is_some() {
-                after_group_jobs.push(id);
-            }
         }
 
         // Rebuild each tube's buried FIFO oldest-bury-first. Buried jobs
@@ -471,49 +470,6 @@ impl ServerState {
         for (_, id, tube_name) in buried_pending {
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.buried.push_back(id);
-            }
-        }
-
-        // Second pass: check after-group jobs and hold if group is not complete
-        for job_id in after_group_jobs {
-            let ag = self.jobs.get(&job_id).and_then(|j| j.after_group().cloned());
-            if let Some(ag) = ag {
-                let group_incomplete = self
-                    .groups
-                    .get(&ag)
-                    .map(|gs| !gs.is_complete())
-                    .unwrap_or(false);
-
-                if group_incomplete {
-                    // If the job is currently ready, move it to held (delayed with no deadline)
-                    if let Some(job) = self.jobs.get(&job_id)
-                        && job.state == JobState::Ready
-                    {
-                        let tube_name = job.tube_name.clone();
-                        let pri = job.priority;
-                        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                            tube.ready.remove_by_id(job_id);
-                        }
-                        self.ready_ct = self.ready_ct.saturating_sub(1);
-                        if pri < URGENT_THRESHOLD {
-                            self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
-                            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                                tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
-                            }
-                        }
-                        if let Some(job) = self.jobs.get_mut(&job_id) {
-                            Self::set_job_state(
-                                &mut self.concurrency_limits,
-                                job,
-                                JobState::Delayed,
-                            );
-                            job.deadline_at = None;
-                        }
-                    }
-                    // Add to group waiting list
-                    let gs = self.groups.entry(ag).or_insert_with(GroupState::new);
-                    gs.waiting_jobs.push(job_id);
-                }
             }
         }
 

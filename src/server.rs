@@ -1019,13 +1019,23 @@ impl ServerState {
         true
     }
 
-    /// True for an `aft:` job whose group still has members outstanding. Such
-    /// a job must not become ready: the tick holds it when its delay runs
-    /// out, and `reserve-job`, `kick` and `kick-job` pass it over.
+    /// True for an `aft:` job its group hasn't released, while the group
+    /// still has members outstanding. Such a job must not become ready: the
+    /// tick holds it when its delay runs out, and `reserve-job`, `kick` and
+    /// `kick-job` pass it over.
+    ///
+    /// The group is checked once. A job is released when it first becomes
+    /// ready, and members that join the group later don't hold it again,
+    /// across a restart too (`wal_write_group_release`). So only a delayed
+    /// job that has never been reserved can be unreleased: a release with a
+    /// delay puts a released job back in the delay heap.
     fn held_by_group(&self, job: &Job) -> bool {
-        job.after_group()
-            .and_then(|ag| self.groups.get(ag))
-            .is_some_and(|gs| !gs.is_complete())
+        job.state == JobState::Delayed
+            && job.reserve_ct == 0
+            && job
+                .after_group()
+                .and_then(|ag| self.groups.get(ag))
+                .is_some_and(|gs| !gs.is_complete())
     }
 
     /// Check if a job's concurrency key already has an active reservation.
@@ -3624,6 +3634,7 @@ impl ServerState {
                 promoted = Some((job.tube_name.clone(), job.ready_key()));
             }
             if let Some((tn, key)) = promoted {
+                self.wal_write_group_release(*job_id);
                 self.ensure_tube(&tn);
                 if let Some(tube) = self.tubes.get_mut(&*tn)
                     && let Some(job) = self.jobs.get(job_id)
@@ -4073,6 +4084,23 @@ impl ServerState {
             }
             self.insert_job(job_id, job);
         }
+    }
+
+    /// Journal an `aft:` job's release by its group as a change to Ready, so
+    /// a restart doesn't hold it again (see `held_by_group`).
+    fn wal_write_group_release(&mut self, job_id: u64) {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let (pri, delay) = (job.priority, job.delay);
+        self.wal_write_state_change(
+            job_id,
+            Some(JobState::Ready),
+            pri,
+            delay,
+            0,
+            StateChangeReason::None,
+        );
     }
 
     fn wal_write_state_change(

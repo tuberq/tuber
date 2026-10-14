@@ -2435,6 +2435,72 @@ fn test_parse_bytes_variants() {
 }
 
 #[test]
+fn a_released_aft_job_is_not_held_again_after_a_delayed_release() {
+    // Job 1 is put before group g has a job, so it is released at once.
+    // Job 2 then joins g. That doesn't hold job 1 again when a release with
+    // a delay puts it back in the delay heap, however it comes out.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let put = |s: &mut ServerState, pri: u32, group: Option<&str>, after: Option<&str>| {
+        let cmd = Command::Put {
+            pri,
+            delay: 0,
+            ttr: 120,
+            bytes: 1,
+            idempotency_key: None,
+            group: group.map(Into::into),
+            after_group: after.map(Into::into),
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"x".to_vec()))
+    };
+    assert_eq!(put(&mut s, 0, None, Some("g")), Response::Inserted(1));
+    assert_eq!(put(&mut s, 10, Some("g"), None), Response::Inserted(2));
+    let reserve_and_delay = |s: &mut ServerState| {
+        assert!(matches!(
+            s.handle_command(c, Command::Reserve, None),
+            Response::Reserved { id: 1, .. }
+        ));
+        assert_eq!(
+            s.handle_command(
+                c,
+                Command::Release {
+                    id: 1,
+                    pri: 0,
+                    delay: 60
+                },
+                None
+            ),
+            Response::Released
+        );
+    };
+
+    reserve_and_delay(&mut s);
+    make_due(&mut s, 1);
+    s.tick();
+    assert_eq!(s.jobs[&1].state, JobState::Ready, "due");
+
+    reserve_and_delay(&mut s);
+    assert_eq!(
+        s.handle_command(c, Command::Kick { bound: 1 }, None),
+        Response::Kicked(1)
+    );
+    assert_eq!(s.jobs[&1].state, JobState::Ready, "kick");
+
+    reserve_and_delay(&mut s);
+    assert_eq!(
+        s.handle_command(c, Command::KickJob { id: 1 }, None),
+        Response::KickedOne
+    );
+
+    reserve_and_delay(&mut s);
+    assert!(matches!(
+        s.handle_command(c, Command::ReserveJob { id: 1 }, None),
+        Response::Reserved { id: 1, .. }
+    ));
+}
+
+#[test]
 fn test_reserve_job_respects_after_group() {
     // reserve-job by ID must not bypass after_group dependencies.
     let mut s = make_state();
