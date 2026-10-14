@@ -1596,15 +1596,16 @@ impl ServerState {
         // WAL: write put record
         self.wal_write_put(id);
 
-        if !self.waiters.is_empty() {
-            self.process_queue();
+        // The write failed, so the put is answered INTERNAL_ERROR: take the
+        // job back before any worker sees it, or a producer retrying after
+        // the error gets it run twice.
+        if self.wal_failed {
+            self.unput(id);
+            return Response::InternalError;
         }
 
-        // The write failed: the job is queued in memory but will never be
-        // persisted, so it isn't acked. Same shape as a failed strict-mode
-        // fsync (`fail_pending`): the in-memory state stands, the ack doesn't.
-        if self.wal_failed {
-            return Response::InternalError;
+        if !self.waiters.is_empty() {
+            self.process_queue();
         }
 
         Response::Inserted(id)
@@ -3937,12 +3938,112 @@ impl ServerState {
         !self.wal_failed
     }
 
+    /// Take back a put answered INTERNAL_ERROR because its WAL record failed,
+    /// as if it had never been made: out of its queue or group, and away from
+    /// a worker woken by it in the same strict-mode batch, whose reply is
+    /// INTERNAL_ERROR too. Unlike a delete it starts no `idp:` cooldown and
+    /// counts no delete. The id isn't reused: the record may be on disk yet,
+    /// and a restart may bring the job back, which is why a client should
+    /// retry such a put with an `idp:` key.
+    fn unput(&mut self, id: u64) {
+        let Some(job) = self.jobs.get(&id) else {
+            return;
+        };
+        let state = job.state;
+        let tube_name = job.tube_name.clone();
+        let pri = job.priority;
+        let reserver = job.reserver_id;
+        let idempotency_key = job.idempotency_key().map(|(key, _)| key.clone());
+        let group_name = job.group().cloned();
+        let after_group_name = job.after_group().cloned();
+        let has_concurrency_key = job.concurrency_key().is_some();
+
+        match state {
+            JobState::Reserved => {
+                if has_concurrency_key {
+                    self.release_concurrency_key(id);
+                }
+                if let Some(conn_id) = reserver {
+                    self.unreserve(conn_id, id);
+                }
+                self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                    tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
+                }
+            }
+            JobState::Ready => {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                    tube.ready.remove_by_id(id);
+                }
+                self.ready_ct = self.ready_ct.saturating_sub(1);
+                if pri < URGENT_THRESHOLD {
+                    self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
+                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                        tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
+                    }
+                }
+            }
+            JobState::Buried => {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                    tube.buried.retain(|&jid| jid != id);
+                    tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
+                }
+                self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
+            }
+            JobState::Delayed => {
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                    tube.delay.remove_by_id(id);
+                }
+            }
+        }
+
+        self.stats.total_jobs_ct = self.stats.total_jobs_ct.saturating_sub(1);
+        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+            tube.stat.total_jobs_ct = tube.stat.total_jobs_ct.saturating_sub(1);
+            if let Some(key) = idempotency_key
+                && tube.idempotency_keys.get(&key) == Some(&id)
+            {
+                tube.idempotency_keys.remove(&key);
+            }
+        }
+        if let Some(ref grp) = group_name
+            && let Some(gs) = self.groups.get_mut(grp)
+        {
+            gs.pending = gs.pending.saturating_sub(1);
+            if state == JobState::Buried {
+                gs.buried = gs.buried.saturating_sub(1);
+            }
+        }
+        if let Some(ref ag) = after_group_name
+            && let Some(gs) = self.groups.get_mut(ag)
+        {
+            gs.remove_waiting_job(id);
+        }
+
+        self.delete_job(id);
+
+        if let Some(ref grp) = group_name {
+            self.check_group_completion(grp);
+        }
+        if has_concurrency_key && !self.waiters.is_empty() {
+            self.process_queue();
+        }
+    }
+
     /// Drop the WAL after an I/O error and refuse puts until restart. The
     /// fd isn't retried: after a failed fsync the kernel may have discarded
     /// the dirty pages, so a later fsync on it can report success falsely.
     fn fail_wal(&mut self, op: &str, e: io::Error) {
         tracing::error!("WAL {op} error: {e}; persistence lost, refusing puts until restart");
-        self.wal = None;
+        // Strict mode: nothing in the buffer was acked, and the batch is
+        // about to be answered INTERNAL_ERROR, so keep it off the disk.
+        // Relaxed mode: the buffer holds acked writes, deletes among them,
+        // so the drop still flushes it, as far as the fd allows.
+        if let Some(wal) = self.wal.take()
+            && wal.sync_interval().is_zero()
+        {
+            wal.abandon();
+        }
         self.wal_failed = true;
     }
 
@@ -4749,6 +4850,38 @@ fn process_message(
     }
 }
 
+/// End a strict-mode group-commit batch: fsync, then release its acks, or
+/// fail them all if the fsync failed. Waiter acks deferred during the batch
+/// ride along.
+fn commit_batch(state: &mut ServerState, pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
+    pending.append(&mut state.deferred_replies);
+    // A non-empty `pending` implies a dirty WAL for the command acks; the
+    // merged waiter acks may ride along on an already-clean WAL, but
+    // sync_wal() is a no-op in that case, so a single guarded fsync covers
+    // both.
+    if pending.is_empty() {
+        return;
+    }
+    if state.sync_wal() {
+        drain_pending(pending);
+    } else {
+        // fsync failed: writes aren't durable, so in strict mode we must not
+        // ack them as success. The batch's puts are answered INTERNAL_ERROR,
+        // so take them back too, from any worker woken by one.
+        let puts: Vec<u64> = pending
+            .iter()
+            .filter_map(|(_, r)| match r {
+                Response::Inserted(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        fail_pending(pending);
+        for id in puts {
+            state.unput(id);
+        }
+    }
+}
+
 /// Drain every deferred ack. Disconnected clients silently ignored —
 /// the WAL write is durable regardless of whether the client hears about it.
 fn drain_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
@@ -4760,8 +4893,9 @@ fn drain_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
 /// Drain deferred acks after a *failed* strict-mode fsync: the writes they
 /// represent are not durable, so replacing each success ack with
 /// `INTERNAL_ERROR` keeps the ack ⇒ durable contract honest rather than lying
-/// to the client. The in-memory state stands; only the on-disk guarantee is
-/// gone (and the WAL is now disabled).
+/// to the client. `commit_batch` takes back the batch's puts; other state
+/// changes stand in memory, with only the on-disk guarantee gone (and the WAL
+/// now disabled).
 fn fail_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
     for (tx, _) in pending.drain(..) {
         let _ = tx.send(Response::InternalError);
@@ -4899,23 +5033,10 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                         // Move any waiter acks that process_queue deferred
                         // during this batch (RESERVED for consumers woken by a
                         // put/delete/release/bury) into `pending` so they are
-                        // released only after the fsync below — the woken
-                        // consumer must not hold a job whose reserve record
-                        // could still be lost to a crash.
-                        pending.append(&mut state.deferred_replies);
-                        // A non-empty `pending` implies a dirty WAL for the
-                        // command acks; the merged waiter acks may ride along
-                        // on an already-clean WAL, but sync_wal() is a no-op in
-                        // that case, so a single guarded fsync covers both.
-                        if !pending.is_empty() {
-                            if state.sync_wal() {
-                                drain_pending(&mut pending);
-                            } else {
-                                // fsync failed: writes aren't durable, so in
-                                // strict mode we must not ack them as success.
-                                fail_pending(&mut pending);
-                            }
-                        }
+                        // released only after the fsync in `commit_batch` —
+                        // the woken consumer must not hold a job whose
+                        // reserve record could still be lost to a crash.
+                        commit_batch(&mut state, &mut pending);
                     }
 
                     if shutdown_seen {

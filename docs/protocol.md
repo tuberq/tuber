@@ -26,6 +26,10 @@ Responses:
 - `JOB_TOO_BIG\r\n`
 - `DRAINING\r\n`
 - `NOT_DRAINING\r\n`
+- `INTERNAL_ERROR\r\n` — the job couldn't be persisted (`-b`). It won't run
+  now, but its record may have reached disk, so a restart can bring it back:
+  retry with an `idp:` key, which dedups against it if it does. Every put is
+  refused this way until restart once the WAL has failed.
 
 #### Getting `<bytes>` wrong
 

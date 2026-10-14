@@ -2735,6 +2735,154 @@ fn test_wal_failure_refuses_later_puts() {
     assert!(matches!(resp, Response::Deleted), "got {resp:?}");
 }
 
+/// Relaxed mode: a put whose WAL write fails is answered INTERNAL_ERROR, so
+/// it must not run either. It used to be queued anyway and handed straight
+/// to a parked worker, so a producer retrying after the error got it run
+/// twice.
+#[test]
+fn a_put_whose_wal_write_fails_is_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let (producer, worker) = (register(&mut s), register(&mut s));
+    let (tx, mut rx) = oneshot::channel();
+    s.add_waiter(worker, tx, None, None);
+
+    s.wal.as_mut().unwrap().inject_io_failure();
+    let resp = s.handle_command(producer, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+    assert_eq!(resp, Response::InternalError);
+    assert!(rx.try_recv().is_err(), "the worker must not get the job");
+    assert!(s.jobs.is_empty(), "nor may it wait in a queue");
+    assert_eq!(ready_in(&s, "default"), 0);
+}
+
+/// Strict mode: a batch whose fsync fails answers its puts INTERNAL_ERROR,
+/// and the worker woken by one of them INTERNAL_ERROR too. The job used to
+/// stay reserved by that worker, which never heard of it, and go to the next
+/// worker when its TTR ran out.
+#[test]
+fn a_put_in_a_strict_batch_whose_fsync_fails_is_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::ZERO);
+    let strict = s.wal_is_strict();
+    let (producer, worker) = (register(&mut s), register(&mut s));
+    let (tx, mut worker_rx) = oneshot::channel();
+    s.add_waiter(worker, tx, None, None);
+
+    let mut pending = Vec::new();
+    let mut put_rx = send_put(&mut s, strict, producer, b"a", &mut pending);
+    s.wal.as_mut().unwrap().inject_io_failure();
+    commit_batch(&mut s, &mut pending);
+
+    assert_eq!(put_rx.try_recv(), Ok(Response::InternalError));
+    assert_eq!(worker_rx.try_recv(), Ok(Response::InternalError));
+    assert!(s.jobs.is_empty(), "the job must be gone, not left reserved");
+    assert!(s.conns[&worker].reserved_jobs.is_empty());
+    assert_eq!(s.stats.reserved_ct, 0);
+}
+
+/// A put taken back leaves nothing behind: its idp: key is free, its group
+/// no longer waits on it, its con: limit is gone, and the memory accounting
+/// matches the jobs left.
+#[test]
+fn a_put_taken_back_leaves_no_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::ZERO);
+    let strict = s.wal_is_strict();
+    let c = register(&mut s);
+    let (reply_tx, mut rx) = oneshot::channel();
+    let msg = EngineMsg {
+        conn_id: c,
+        payload: EnginePayload::Command {
+            cmd: Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 60,
+                bytes: 1,
+                idempotency_key: Some(("k".into(), 60)),
+                group: Some("g".into()),
+                after_group: None,
+                concurrency_key: Some(("c".into(), 2)),
+            },
+            body: Some(b"a".to_vec()),
+            reply_tx,
+        },
+    };
+    let mut pending = Vec::new();
+    process_message(&mut s, strict, msg, &mut pending);
+    s.wal.as_mut().unwrap().inject_io_failure();
+    commit_batch(&mut s, &mut pending);
+
+    assert_eq!(rx.try_recv(), Ok(Response::InternalError));
+    let tube = &s.tubes["default"];
+    assert!(tube.idempotency_keys.is_empty());
+    assert!(
+        tube.idempotency_cooldowns.is_empty(),
+        "no cooldown, as a delete would"
+    );
+    assert_eq!(tube.stat.total_jobs_ct, 0);
+    assert_eq!(s.stats.total_jobs_ct, 0);
+    assert_eq!(s.ready_ct, 0);
+    assert_eq!(s.stats.urgent_ct, 0);
+    assert_eq!(s.groups.get("g").map_or(0, |g| g.pending), 0);
+    assert!(s.concurrency_limits.is_empty());
+    assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+    assert_eq!(s.total_job_bytes, 0);
+}
+
+/// The segment file a test WAL in `dir` writes to.
+fn wal_segment(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("binlog.")
+        })
+        .unwrap()
+}
+
+/// Strict mode: dropping a failed WAL flushed its write buffer, putting on
+/// disk the records of a batch just answered INTERNAL_ERROR, so a restart
+/// could bring them back.
+#[test]
+fn a_failed_strict_wal_does_not_flush_its_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::ZERO);
+    let c = register(&mut s);
+    s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+    assert!(s.sync_wal());
+    let synced = std::fs::metadata(wal_segment(dir.path())).unwrap().len();
+
+    s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"b".to_vec()));
+    s.wal.as_mut().unwrap().inject_io_failure();
+    assert!(!s.sync_wal());
+    assert_eq!(
+        std::fs::metadata(wal_segment(dir.path())).unwrap().len(),
+        synced
+    );
+}
+
+/// Relaxed mode: the buffer holds writes already acked, such as a delete,
+/// which a crash would lose but a failed WAL needn't. It is flushed as
+/// before; dropping it would bring a deleted job back on restart.
+#[test]
+fn a_failed_relaxed_wal_still_flushes_acked_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+    s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+    assert!(s.sync_wal());
+    let synced = std::fs::metadata(wal_segment(dir.path())).unwrap().len();
+
+    let resp = s.handle_command(c, Command::Delete { id: 1 }, None);
+    assert_eq!(resp, Response::Deleted);
+    s.wal.as_mut().unwrap().inject_io_failure();
+    assert!(!s.sync_wal());
+    assert!(std::fs::metadata(wal_segment(dir.path())).unwrap().len() > synced);
+}
+
 /// `stats` output, as text.
 fn stats_text(s: &mut ServerState, c: u64) -> String {
     match s.handle_command(c, Command::Stats, None) {

@@ -2168,6 +2168,20 @@ impl Wal {
         self.sync_count
     }
 
+    /// Close a WAL that has failed without flushing its write buffer.
+    /// Dropping it would flush, putting on disk records whose writes were
+    /// just reported as failed, and a restart would replay them. What
+    /// already reached the kernel can't be called back, so this narrows the
+    /// window rather than closing it. Only for a strict-mode WAL, whose
+    /// buffer holds nothing acked.
+    pub fn abandon(mut self) {
+        for f in &mut self.files {
+            if let Some(fd) = f.fd.take() {
+                let _ = fd.into_parts();
+            }
+        }
+    }
+
     /// Test-only: make every later write and sync fail, as a full disk would.
     #[cfg(test)]
     pub fn inject_io_failure(&mut self) {
