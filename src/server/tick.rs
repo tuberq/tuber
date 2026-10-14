@@ -41,7 +41,7 @@ impl ServerState {
                             gs.waiting_jobs.push(job_id);
                         }
                     } else if let Some(job) = self.jobs.get_mut(&job_id) {
-                        job.state = JobState::Ready;
+                        Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                         job.deadline_at = None;
                         let key = job.ready_key();
                         if let Some(tube) = self.tubes.get_mut(tube_name) {
@@ -117,7 +117,7 @@ impl ServerState {
                 let mut requeue = None;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.timeout_ct += 1;
-                    job.state = JobState::Ready;
+                    Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                     job.reserver_id = None;
                     job.reserved_at = None;
                     job.deadline_at = None;
@@ -502,7 +502,11 @@ impl ServerState {
                             }
                         }
                         if let Some(job) = self.jobs.get_mut(&job_id) {
-                            job.state = JobState::Delayed;
+                            Self::set_job_state(
+                                &mut self.concurrency_limits,
+                                job,
+                                JobState::Delayed,
+                            );
                             job.deadline_at = None;
                         }
                     }

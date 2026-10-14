@@ -711,6 +711,136 @@ fn test_concurrency_key_default_limit_one() {
 }
 
 #[test]
+fn a_con_key_takes_the_strictest_limit_of_its_jobs() {
+    let mut s = make_state();
+    let (c1, c2) = (register(&mut s), register(&mut s));
+    let put = |s: &mut ServerState, pri: u32, limit: u32| {
+        s.handle_command(
+            c1,
+            put_con_cmd(pri, 120, 1, "k", limit),
+            Some(b"x".to_vec()),
+        )
+    };
+    assert_eq!(put(&mut s, 0, 3), Response::Inserted(1));
+    assert_eq!(put(&mut s, 10, 1), Response::Inserted(2));
+    assert_eq!(put(&mut s, 0, 3), Response::Inserted(3));
+
+    // Job 2 asked for one at a time, so nothing runs beside job 1, however
+    // job 1 was declared or which was reserved first.
+    assert!(matches!(
+        s.handle_command(c1, Command::Reserve, None),
+        Response::Reserved { id: 1, .. }
+    ));
+    assert_eq!(
+        s.handle_command(c2, Command::ReserveWithTimeout { timeout: 0 }, None),
+        Response::TimedOut
+    );
+
+    // Once job 2 is gone, the key's limit is 3.
+    assert_eq!(
+        s.handle_command(c1, Command::Delete { id: 2 }, None),
+        Response::Deleted
+    );
+    assert!(matches!(
+        s.handle_command(c2, Command::Reserve, None),
+        Response::Reserved { id: 3, .. }
+    ));
+}
+
+#[test]
+fn a_buried_job_does_not_hold_its_con_key_to_its_limit() {
+    let mut s = make_state();
+    let (c1, c2) = (register(&mut s), register(&mut s));
+    let put = |s: &mut ServerState, limit: u32| {
+        s.handle_command(c1, put_con_cmd(0, 120, 1, "k", limit), Some(b"x".to_vec()))
+    };
+    put(&mut s, 1);
+    put(&mut s, 3);
+    put(&mut s, 3);
+    assert!(matches!(
+        s.handle_command(c1, Command::Reserve, None),
+        Response::Reserved { id: 1, .. }
+    ));
+    assert_eq!(
+        s.handle_command(c1, Command::Bury { id: 1, pri: 0 }, None),
+        Response::Buried
+    );
+
+    // Buried, job 1 doesn't count: an old job left buried after a deploy
+    // raised the limit would otherwise hold it down indefinitely.
+    for (conn, id) in [(c1, 2), (c2, 3)] {
+        assert!(matches!(
+            s.handle_command(conn, Command::Reserve, None),
+            Response::Reserved { id: got, .. } if got == id
+        ));
+    }
+    // Kicked, it counts again: with two running it has to wait.
+    assert_eq!(
+        s.handle_command(c1, Command::Kick { bound: 1 }, None),
+        Response::Kicked(1)
+    );
+    let c3 = register(&mut s);
+    assert_eq!(
+        s.handle_command(c3, Command::ReserveWithTimeout { timeout: 0 }, None),
+        Response::TimedOut
+    );
+}
+
+/// Bring delayed job `id`'s deadline forward to now, so the next tick
+/// promotes it.
+fn make_due(s: &mut ServerState, id: u64) {
+    let now = Instant::now();
+    let job = s.jobs.get_mut(&id).unwrap();
+    job.deadline_at = Some(now);
+    let delay = &mut s.tubes.get_mut(&*job.tube_name).unwrap().delay;
+    delay.remove_by_id(id);
+    delay.insert((now, id), id);
+}
+
+#[test]
+fn a_delayed_job_does_not_hold_its_con_key_to_its_limit() {
+    let mut s = make_state();
+    let (c1, c2, c3) = (register(&mut s), register(&mut s), register(&mut s));
+    let delayed = Command::Put {
+        pri: 10,
+        delay: 3600,
+        ttr: 120,
+        bytes: 1,
+        idempotency_key: None,
+        group: None,
+        after_group: None,
+        concurrency_key: Some(("k".to_string(), 1)),
+    };
+    assert_eq!(
+        s.handle_command(c1, delayed, Some(b"x".to_vec())),
+        Response::Inserted(1)
+    );
+    for id in [2, 3, 4] {
+        assert_eq!(
+            s.handle_command(c1, put_con_cmd(0, 120, 1, "k", 3), Some(b"x".to_vec())),
+            Response::Inserted(id)
+        );
+    }
+
+    // Job 1 asks for one at a time, but isn't due for an hour. Until then it
+    // doesn't hold the others to its limit.
+    for (conn, id) in [(c1, 2), (c2, 3)] {
+        assert!(matches!(
+            s.handle_command(conn, Command::Reserve, None),
+            Response::Reserved { id: got, .. } if got == id
+        ));
+    }
+    // Due, it counts: with two running, neither it nor job 4 can start.
+    make_due(&mut s, 1);
+    s.tick();
+    assert_eq!(s.jobs[&1].state, JobState::Ready);
+    assert_eq!(
+        s.handle_command(c3, Command::ReserveWithTimeout { timeout: 0 }, None),
+        Response::TimedOut
+    );
+}
+
+#[test]
 fn test_cmd_delete_wakes_concurrency_waiter() {
     // A reserver parked while a con: slot is held must be fulfilled
     // synchronously when the holder deletes the job. Without process_queue
@@ -754,6 +884,61 @@ fn test_cmd_delete_wakes_concurrency_waiter() {
         matches!(received, Response::Reserved { id: 2, .. }),
         "expected Reserved(2), got {:?}",
         received
+    );
+}
+
+#[test]
+fn flush_tube_wakes_a_worker_waiting_on_the_con_keys_it_frees() {
+    // Like delete: a flushed reserved job frees its slot, and a flushed
+    // ready one can loosen the key's strictest limit. Either can unblock a
+    // waiter in another tube, which shouldn't have to wait for the tick.
+    let mut s = make_state();
+    let c1 = register(&mut s);
+    let c2 = register(&mut s);
+    let c3 = register(&mut s);
+
+    let other = || Command::Use {
+        tube: "other".into(),
+    };
+    s.handle_command(c1, other(), None);
+    s.handle_command(
+        c1,
+        Command::Watch {
+            tube: "other".into(),
+            weight: 1,
+        },
+        None,
+    );
+    s.handle_command(
+        c1,
+        Command::Ignore {
+            tube: "default".into(),
+        },
+        None,
+    );
+    s.handle_command(c1, put_con_cmd(0, 120, 1, "k", 2), Some(b"a".to_vec()));
+    s.handle_command(c1, put_con_cmd(0, 120, 1, "k", 1), Some(b"b".to_vec()));
+    s.handle_command(c2, put_con_cmd(0, 120, 1, "k", 2), Some(b"c".to_vec()));
+    // Job 1 takes a slot, and job 2 holds the key to one.
+    let r = s.handle_command(c1, Command::Reserve, None);
+    assert!(matches!(r, Response::Reserved { id: 1, .. }), "got {r:?}");
+
+    let (tx, mut rx) = oneshot::channel();
+    s.add_waiter(c2, tx, None, None);
+    assert_eq!(s.stats.waiting_ct, 1, "job 3 is blocked by the key");
+
+    let resp = s.handle_command(
+        c3,
+        Command::FlushTube {
+            tube: "other".into(),
+        },
+        None,
+    );
+    assert_eq!(resp, Response::Flushed(2));
+    let received = rx.try_recv().expect("the flush should wake the waiter");
+    assert!(
+        matches!(received, Response::Reserved { id: 3, .. }),
+        "got {received:?}"
     );
 }
 
@@ -888,10 +1073,11 @@ fn brute_force_best_unblocked(s: &ServerState, tube: &str) -> Option<u64> {
 
 #[test]
 fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
-    // Random puts, reserves, deletes, releases, buries, kicks, idp: priority
-    // upgrades, aft: promotions, disconnects and flushes across two tubes
-    // sharing con: keys. After every step, each tube's pick must equal an
-    // exhaustive search, and its ready count must match the jobs in Ready.
+    // Random puts, reserves, deletes, releases, buries, kicks, delays coming
+    // due, idp: priority upgrades, aft: promotions, disconnects and flushes
+    // across two tubes sharing con: keys. After every step, each tube's pick
+    // must equal an exhaustive search, and its ready count must match the
+    // jobs in Ready.
     const TUBES: [&str; 2] = ["default", "other"];
     const KEYS: [&str; 4] = ["a", "b", "c", "d"];
 
@@ -948,7 +1134,7 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                     };
                     let cmd = Command::Put {
                         pri: next(4) as u32,
-                        delay: 0,
+                        delay: if next(10) == 0 { 60 } else { 0 },
                         ttr: 120,
                         bytes: 1,
                         idempotency_key,
@@ -977,7 +1163,8 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                 70..=79 => {
                     if let Some(id) = any_held(&mut next) {
                         let pri = next(4) as u32;
-                        s.handle_command(c, Command::Release { id, pri, delay: 0 }, None);
+                        let delay = if next(4) == 0 { 60 } else { 0 };
+                        s.handle_command(c, Command::Release { id, pri, delay }, None);
                     }
                 }
                 80..=84 => {
@@ -992,7 +1179,7 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                         );
                     }
                 }
-                85..=89 => {
+                85..=87 => {
                     let tube = TUBES[next(2) as usize];
                     s.handle_command(c, Command::Use { tube: tube.into() }, None);
                     s.handle_command(
@@ -1003,14 +1190,39 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                         None,
                     );
                 }
+                88..=89 => {
+                    // Let a delayed job come due.
+                    let mut delayed: Vec<u64> = s
+                        .jobs
+                        .values()
+                        .filter(|j| j.state == JobState::Delayed && j.deadline_at.is_some())
+                        .map(|j| j.id)
+                        .collect();
+                    delayed.sort_unstable();
+                    if !delayed.is_empty() {
+                        make_due(&mut s, delayed[next(delayed.len() as u64) as usize]);
+                    }
+                    s.tick();
+                }
                 90..=93 => {
-                    s.handle_command(
-                        c,
-                        Command::KickJob {
-                            id: 1 + next(max_id),
-                        },
-                        None,
-                    );
+                    // A random id is seldom a buried or delayed job; aim for one.
+                    let mut parked: Vec<u64> = s
+                        .jobs
+                        .values()
+                        .filter(|j| matches!(j.state, JobState::Buried | JobState::Delayed))
+                        .map(|j| j.id)
+                        .collect();
+                    parked.sort_unstable();
+                    let id = match next(2) {
+                        0 if !parked.is_empty() => parked[next(parked.len() as u64) as usize],
+                        _ => 1 + next(max_id),
+                    };
+                    let cmd = if next(2) == 0 {
+                        Command::KickJob { id }
+                    } else {
+                        Command::ReserveJob { id }
+                    };
+                    s.handle_command(c, cmd, None);
                 }
                 94..=97 => {
                     s.unregister_conn(c);
@@ -1049,6 +1261,25 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                 );
                 tube.ready.assert_consistent();
             }
+            // Each key's limits are those its ready and reserved jobs declare.
+            let mut declared: HashMap<String, BTreeMap<u32, u32>> = HashMap::new();
+            for j in s
+                .jobs
+                .values()
+                .filter(|j| matches!(j.state, JobState::Ready | JobState::Reserved))
+            {
+                if let Some((key, limit)) = j.concurrency_key() {
+                    *declared
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(*limit)
+                        .or_default() += 1;
+                }
+            }
+            assert_eq!(
+                s.concurrency_limits, declared,
+                "seed {seed} step {step}: con limits"
+            );
         }
     }
     eprintln!("steps with a blocked top: {blocked_tops}");
@@ -2392,6 +2623,29 @@ fn test_reserve_batch_partial_wins_over_body_store_error() {
     }
     // The unreadable job is auto-buried (not left ready to re-wedge the tube).
     assert_eq!(s.jobs.get(&2).unwrap().state, JobState::Buried);
+}
+
+#[test]
+fn an_unreadable_job_buried_by_a_reserve_stops_holding_its_con_key() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    s.handle_command(c, put_con_cmd(0, 10, 1, "k", 1), Some(b"a".to_vec()));
+    s.handle_command(c, put_con_cmd(0, 10, 1, "k", 3), Some(b"b".to_vec()));
+    poison_body(&mut s, 1);
+
+    // Nothing was reserved before the failed read, so the batch reports it.
+    let resp = s.handle_command(
+        c,
+        Command::ReserveBatch {
+            count: 5,
+            timeout: None,
+        },
+        None,
+    );
+    assert_eq!(resp, Response::InternalError);
+    assert_eq!(s.jobs.get(&1).unwrap().state, JobState::Buried);
+    let declared: Vec<u32> = s.concurrency_limits["k"].keys().copied().collect();
+    assert_eq!(declared, [3], "a buried job's limit doesn't count");
 }
 
 fn make_wal_state(dir: &std::path::Path, sync_interval: Duration) -> ServerState {

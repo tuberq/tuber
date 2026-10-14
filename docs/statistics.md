@@ -199,7 +199,7 @@ Returns per-job statistics in YAML format.
 | `group` | Group name (empty if none) |
 | `after-group` | After-group dependency (empty if none) |
 | `concurrency-key` | Concurrency key (empty if none) |
-| `concurrency-limit` | Max concurrent reservations for this key |
+| `concurrency-limit` | The limit this job declared. The key's limit is the smallest declared by its ready and reserved jobs |
 | `file` | WAL file sequence number (0 if no WAL) |
 
 ## Group Stats (`stats-group <name>`)

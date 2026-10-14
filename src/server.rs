@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -440,8 +440,12 @@ struct ServerState {
     groups: HashMap<String, GroupState>,
     /// Active reservation count per concurrency key.
     concurrency_keys: HashMap<String, u32>,
-    /// Concurrency limit per key (max concurrent reservations allowed).
-    concurrency_limits: HashMap<String, u32>,
+    /// The limits declared by each key's jobs, as limit → jobs declaring it:
+    /// every ready or reserved job with the key. The key's limit is the
+    /// smallest, so a job asking for one at a time never runs beside another,
+    /// whichever was reserved first. Kept by `insert_job`/`take_job` and
+    /// `set_job_state`.
+    concurrency_limits: HashMap<String, BTreeMap<u32, u32>>,
     /// Waiter replies that `process_queue` produced during the current engine
     /// step but must not be sent yet. In strict durability mode a `RESERVED`
     /// ack for a parked consumer has to wait for the same fsync as the write
@@ -708,6 +712,9 @@ impl ServerState {
         self.total_job_bytes = self
             .total_job_bytes
             .saturating_add(Self::job_memory_cost(&job));
+        if Self::counts_con_limit(job.state) {
+            Self::count_con_limit(&mut self.concurrency_limits, &job, true);
+        }
         self.jobs.insert(id, job);
     }
 
@@ -719,7 +726,58 @@ impl ServerState {
         self.total_job_bytes = self
             .total_job_bytes
             .saturating_sub(Self::job_memory_cost(&job));
+        if Self::counts_con_limit(job.state) {
+            Self::count_con_limit(&mut self.concurrency_limits, &job, false);
+        }
         Some(job)
+    }
+
+    /// Count `job`'s declared `con:` limit toward its key (`add`), or stop
+    /// counting it. A field-level helper so callers holding a job borrow can
+    /// use it.
+    fn count_con_limit(limits: &mut HashMap<String, BTreeMap<u32, u32>>, job: &Job, add: bool) {
+        let Some((key, limit)) = job.concurrency_key() else {
+            return;
+        };
+        if add {
+            *limits
+                .entry(key.clone())
+                .or_default()
+                .entry(*limit)
+                .or_insert(0) += 1;
+        } else if let Some(declared) = limits.get_mut(key) {
+            if let Some(n) = declared.get_mut(limit) {
+                *n -= 1;
+                if *n == 0 {
+                    declared.remove(limit);
+                }
+            }
+            if declared.is_empty() {
+                limits.remove(key);
+            }
+        }
+    }
+
+    /// Whether a job in `state` counts toward its key's `con:` limit: only
+    /// work that can run now or is running. A delayed or `aft:`-held job
+    /// tightens the limit once it's due, and a buried one once it's kicked.
+    fn counts_con_limit(state: JobState) -> bool {
+        matches!(state, JobState::Ready | JobState::Reserved)
+    }
+
+    /// Move a job in the map to `state`, counting its `con:` limit while
+    /// it's ready or reserved. Every state change of a job in the map goes
+    /// through here. A field-level helper, like `count_con_limit`.
+    fn set_job_state(
+        limits: &mut HashMap<String, BTreeMap<u32, u32>>,
+        job: &mut Job,
+        state: JobState,
+    ) {
+        let counted = Self::counts_con_limit(job.state);
+        job.state = state;
+        if Self::counts_con_limit(state) != counted {
+            Self::count_con_limit(limits, job, !counted);
+        }
     }
 
     /// Adopt a whole replayed job table at once (WAL replay). The wholesale
@@ -740,6 +798,9 @@ impl ServerState {
             self.total_job_bytes = self
                 .total_job_bytes
                 .saturating_add(Self::job_memory_cost(job));
+            if Self::counts_con_limit(job.state) {
+                Self::count_con_limit(&mut self.concurrency_limits, job, true);
+            }
         }
         self.jobs = jobs;
         ids
@@ -925,7 +986,7 @@ impl ServerState {
                 self.release_concurrency_key(job_id);
                 let mut requeue = None;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    job.state = JobState::Ready;
+                    Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                     job.reserver_id = None;
                     job.deadline_at = None;
                     requeue = Some((job.tube_name.clone(), job.ready_key()));
@@ -974,25 +1035,25 @@ impl ServerState {
         self.jobs
             .get(&job_id)
             .and_then(|j| j.concurrency_key())
-            .map(|(key, _limit)| {
+            .map(|(key, own)| {
                 let count = self.concurrency_keys.get(key).copied().unwrap_or(0);
-                let limit = self.concurrency_limits.get(key).copied().unwrap_or(1);
+                // A ready job's own limit is already in the key's; a buried
+                // or delayed one (`reserve-job`) isn't counted yet, so take
+                // it too.
+                let limit = self
+                    .concurrency_limits
+                    .get(key)
+                    .and_then(|declared| declared.keys().next())
+                    .map_or(*own, |&strictest| strictest.min(*own));
                 count >= limit
             })
             .unwrap_or(false)
     }
 
-    /// Increment the concurrency counter for a job's key and register limit.
+    /// Increment the concurrency counter for a job's key.
     fn acquire_concurrency_key(&mut self, job_id: u64) {
-        if let Some((key, limit)) = self
-            .jobs
-            .get(&job_id)
-            .and_then(|j| j.concurrency_key().cloned())
-        {
+        if let Some((key, _limit)) = self.jobs.get(&job_id).and_then(|j| j.concurrency_key()) {
             *self.concurrency_keys.entry(key.clone()).or_insert(0) += 1;
-            // Use max of existing and new limit (safest — never blocks more than intended)
-            let entry = self.concurrency_limits.entry(key).or_insert(0);
-            *entry = (*entry).max(limit);
         }
     }
 
@@ -1007,7 +1068,6 @@ impl ServerState {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.concurrency_keys.remove(&key);
-                self.concurrency_limits.remove(&key);
             }
         }
     }
@@ -1467,14 +1527,6 @@ impl ServerState {
         // put carried no tags — the common case)
         job.set_ext(ext);
 
-        // Concurrency limit is registered lazily in `acquire_concurrency_key`
-        // (on reserve), not here. Registering eagerly at put time leaked the
-        // limit for keys whose jobs were deleted before ever being reserved:
-        // `release_concurrency_key` only prunes a limit when the *active*
-        // counter drains to 0, which never happens for a never-reserved key.
-        // That leak both grew the map without bound and, via the `.max(limit)`
-        // rule, let a stale high limit widen concurrency for later jobs.
-
         // Register idempotency key in tube index
         if let Some(key_tuple) = job.idempotency_key()
             && let Some(tube) = self.tubes.get_mut(&*tube_name) {
@@ -1719,7 +1771,7 @@ impl ServerState {
 
         // Move to buried.
         if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.state = JobState::Buried;
+            Self::set_job_state(&mut self.concurrency_limits, job, JobState::Buried);
             job.reserver_id = None;
             job.reserved_at = None;
             job.deadline_at = None;
@@ -1797,7 +1849,7 @@ impl ServerState {
             Some(job) => {
                 let tube_name = job.tube_name.clone();
                 let created_at = job.created_at;
-                job.state = JobState::Reserved;
+                Self::set_job_state(&mut self.concurrency_limits, job, JobState::Reserved);
                 job.reserver_id = Some(conn_id);
                 job.reserved_at = Some(now);
                 job.deadline_at = Some(now + job.ttr);
@@ -2087,9 +2139,11 @@ impl ServerState {
         let mut urgent_removed = 0u64;
         let mut buried_removed = 0u64;
         let mut reserved_removed = 0u64;
+        let mut has_concurrency_key = false;
         // Categorize jobs by state for stats
         for &id in &job_ids {
             if let Some(job) = self.jobs.get(&id) {
+                has_concurrency_key |= job.concurrency_key().is_some();
                 match job.state {
                     JobState::Ready => {
                         ready_removed += 1;
@@ -2182,6 +2236,12 @@ impl ServerState {
         // Check if any affected groups completed
         for grp in &affected_groups {
             self.check_group_completion(grp);
+        }
+
+        // As in cmd_delete: freed slots, or a looser limit, can unblock a
+        // waiter on the same key in another tube.
+        if has_concurrency_key && !self.waiters.is_empty() {
+            self.process_queue();
         }
 
         Response::Flushed(count)
@@ -2315,7 +2375,7 @@ impl ServerState {
         if delay > 0 {
             let deadline = Instant::now() + Duration::from_secs(delay as u64);
             if let Some(job) = self.jobs.get_mut(&id) {
-                job.state = JobState::Delayed;
+                Self::set_job_state(&mut self.concurrency_limits, job, JobState::Delayed);
                 job.deadline_at = Some(deadline);
             }
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
@@ -2323,7 +2383,7 @@ impl ServerState {
             }
         } else {
             if let Some(job) = self.jobs.get_mut(&id) {
-                job.state = JobState::Ready;
+                Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                 job.deadline_at = None;
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                     tube.ready.insert(job);
@@ -2382,7 +2442,7 @@ impl ServerState {
 
         if let Some(job) = self.jobs.get_mut(&id) {
             job.priority = pri;
-            job.state = JobState::Buried;
+            Self::set_job_state(&mut self.concurrency_limits, job, JobState::Buried);
             job.reserver_id = None;
             job.reserved_at = None;
             job.deadline_at = None;
@@ -2642,7 +2702,7 @@ impl ServerState {
 
             // Re-enqueue as ready
             if let Some(job) = self.jobs.get_mut(&job_id) {
-                job.state = JobState::Ready;
+                Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                 job.deadline_at = None;
                 job.kick_ct += 1;
                 let key = job.ready_key();
@@ -2694,7 +2754,7 @@ impl ServerState {
                 }
 
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    job.state = JobState::Ready;
+                    Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                     job.deadline_at = None;
                     job.kick_ct += 1;
                     let key = job.ready_key();
@@ -2770,7 +2830,7 @@ impl ServerState {
         }
 
         if let Some(job) = self.jobs.get_mut(&id) {
-            job.state = JobState::Ready;
+            Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
             job.deadline_at = None;
             job.kick_ct += 1;
             let key = job.ready_key();
@@ -3559,7 +3619,7 @@ impl ServerState {
                 && job.state == JobState::Delayed
                 && job.deadline_at.is_none()
             {
-                job.state = JobState::Ready;
+                Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                 promoted = Some((job.tube_name.clone(), job.ready_key()));
             }
             if let Some((tn, key)) = promoted {

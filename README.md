@@ -286,6 +286,8 @@ payload2
 
 Up to 3 `con:api` jobs can be reserved simultaneously. `con:key` (no `:N`) defaults to a limit of 1.
 
+If jobs sharing a key declare different limits, the strictest wins: the key's limit is the smallest declared by any of its ready or reserved jobs. So a job that asked for one at a time never runs beside another, and after a deploy raises a key's limit, it takes effect once the jobs declaring the old one are done. A delayed job tightens the limit once it's due, an `aft:` job once its group completes, and a buried one once it's kicked.
+
 Burying or releasing-with-delay a job frees its concurrency slot immediately — the slot is only held while the job is reserved. Delayed jobs don't occupy a slot until they become ready and are reserved. Use `stats-job <id>` to check a job's current state if reserves are unexpectedly blocked.
 
 ### Recurring Schedules

@@ -2684,3 +2684,60 @@ async fn test_restored_con_limit_does_not_outlive_its_job() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn test_restored_con_key_takes_the_strictest_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 con:k:3\r\na\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("put 10 0 60 1 con:k\r\nb\r\n").await;
+        c.ckresp("INSERTED 2\r\n").await;
+        c.mustsend("put 0 0 60 1 con:k:3\r\nc\r\n").await;
+        c.ckresp("INSERTED 3\r\n").await;
+    })
+    .await;
+
+    // Job 2 still holds k to one at a time after the restart.
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp("RESERVED 1 1\r\n").await;
+        c.ckresp("a\r\n").await;
+        c.mustsend("reserve-with-timeout 0\r\n").await;
+        c.ckresp("TIMED_OUT\r\n").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_restored_delayed_and_held_jobs_do_not_hold_their_con_key() {
+    // Jobs 1, 3 and 4 ask for one at a time, but none can run: job 3 isn't
+    // due for an hour, and jobs 1 and 4 wait on group g. Job 1 was put
+    // before g had a job, so it was ready, but restore holds it again. After
+    // the restart, none holds jobs 5 and 6 to one at a time.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 aft:g con:k\r\nh\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("put 10 0 60 1 grp:g\r\ng\r\n").await;
+        c.ckresp("INSERTED 2\r\n").await;
+        c.mustsend("put 0 3600 60 1 con:k\r\nd\r\n").await;
+        c.ckresp("INSERTED 3\r\n").await;
+        c.mustsend("put 0 0 60 1 aft:g con:k\r\nh\r\n").await;
+        c.ckresp("INSERTED 4\r\n").await;
+        for id in 5..=6 {
+            c.mustsend("put 0 0 60 1 con:k:2\r\nr\r\n").await;
+            c.ckresp(&format!("INSERTED {id}\r\n")).await;
+        }
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        for id in 5..=6 {
+            c.mustsend("reserve-with-timeout 0\r\n").await;
+            c.ckresp(&format!("RESERVED {id} 1\r\n")).await;
+            c.ckresp("r\r\n").await;
+        }
+    })
+    .await;
+}
