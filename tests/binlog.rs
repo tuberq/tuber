@@ -2111,10 +2111,10 @@ async fn test_wal_skip_corrupt_starts_on_a_damaged_older_segment() {
     assert!(Path::new(&sidecar).exists(), "the damaged segment is kept");
 }
 
-/// Put ten jobs with 300-byte bodies (so they go to TOAST), shut down, then
-/// make TOAST segment 0 an older segment by adding an empty newer one.
-/// Returns the path of segment 0.
-async fn ten_toast_jobs_in_an_older_segment(dir: &Path) -> PathBuf {
+/// Put ten jobs with 300-byte bodies (so they go to TOAST) and shut down
+/// once they are synced. Returns the path of the one TOAST segment, which is
+/// also the newest.
+async fn ten_toast_jobs(dir: &Path) -> PathBuf {
     let body = "b".repeat(300);
     {
         let srv = TestServer::start_with_wal(dir).await;
@@ -2124,16 +2124,223 @@ async fn ten_toast_jobs_in_an_older_segment(dir: &Path) -> PathBuf {
                 .await;
             c.ckresp(&format!("INSERTED {id}\r\n")).await;
         }
+        // Let the 100 ms backstop sync run. `shutdown` aborts the server, a
+        // crash, and bodies not yet synced may rightly be lost to one.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         drop(c);
         let _ = srv.shutdown();
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let toast = dir.join("toast");
+    dir.join("toast").join("body.000000")
+}
+
+/// [`ten_toast_jobs`], then make TOAST segment 0 an older segment by adding
+/// an empty newer one. Returns the path of segment 0.
+async fn ten_toast_jobs_in_an_older_segment(dir: &Path) -> PathBuf {
+    let seg = ten_toast_jobs(dir).await;
     let mut header = Vec::from(*b"TBOD");
     header.extend_from_slice(&1u32.to_le_bytes());
     header.extend_from_slice(&0u64.to_le_bytes());
-    std::fs::write(toast.join("body.000001"), header).unwrap();
-    toast.join("body.000000")
+    std::fs::write(dir.join("toast").join("body.000001"), header).unwrap();
+    seg
+}
+
+/// Offset of body `n`'s (0-based) record header in a segment of 300-byte
+/// bodies: the 16-byte file header, then 20-byte headers each followed by
+/// its body.
+fn toast_record(n: usize) -> usize {
+    16 + n * (20 + 300)
+}
+
+/// Start `tuber server -b <dir>` with `extra` args, peek jobs 1 to 10, and
+/// kill it. Returns the ids found, each with its body.
+async fn peek_ten(dir: &Path, extra: &[&str]) -> Vec<(u64, String)> {
+    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp_listener.local_addr().unwrap().port();
+    drop(tmp_listener);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tuber"))
+        .args(["server", "-l", "127.0.0.1", "-p", &port.to_string()])
+        .args(["-b", dir.to_str().unwrap(), "--max-storage-bytes", "1g"])
+        .args(extra)
+        .env_remove("TUBER_WAL_SKIP_CORRUPT")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to start tuber subprocess");
+
+    let mut stream = None;
+    for _ in 0..40 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut c = BufReader::new(stream.expect("the server never started listening"));
+    let mut found = Vec::new();
+    for id in 1..=10 {
+        c.get_mut()
+            .write_all(format!("peek {id}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).await.unwrap();
+        if line.starts_with("FOUND") {
+            let mut body = String::new();
+            c.read_line(&mut body).await.unwrap();
+            found.push((id, body.trim_end().to_string()));
+        }
+    }
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    found
+}
+
+#[tokio::test]
+async fn test_server_refuses_to_start_on_a_damaged_newest_toast_segment() {
+    // The review's repro exactly: one segment, so it is also the newest, and
+    // a corrupt length in body 3 of 10. The scan took any damage in the
+    // newest segment for a torn tail and truncated it there, and startup
+    // dropped the eight jobs whose bodies went with it. But all ten bodies
+    // were synced, so the WAL's recovery point says a crash can't have torn
+    // them.
+    let dir = tempfile::tempdir().unwrap();
+    let seg = ten_toast_jobs(dir.path()).await;
+    let len_field = toast_record(2) + 8;
+    let mut data = std::fs::read(&seg).unwrap();
+    data[len_field..len_field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&seg, &data).unwrap();
+
+    let (status, log) = server_exit(dir.path(), &[])
+        .await
+        .expect("the server started on a damaged TOAST segment instead of refusing");
+    assert!(!status.success(), "{status:?}\n{log}");
+    assert!(log.contains("body.000000"), "{log}");
+    assert!(log.contains("--wal-skip-corrupt"), "{log}");
+    assert_eq!(std::fs::read(&seg).unwrap(), data, "segment left as found");
+}
+
+#[tokio::test]
+async fn test_wal_skip_corrupt_keeps_a_copy_of_a_damaged_newest_toast_segment() {
+    // The override starts with the bodies before the damage. The newest
+    // segment is truncated so appends can continue, but a copy is kept,
+    // and the next start needs no override.
+    let dir = tempfile::tempdir().unwrap();
+    let seg = ten_toast_jobs(dir.path()).await;
+    let len_field = toast_record(2) + 8;
+    let mut data = std::fs::read(&seg).unwrap();
+    data[len_field..len_field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&seg, &data).unwrap();
+
+    let found = peek_ten(dir.path(), &["--wal-skip-corrupt"]).await;
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    let mut copy = seg.clone().into_os_string();
+    copy.push(".corrupt");
+    assert_eq!(
+        std::fs::read(&copy).expect("no .corrupt copy of the newest segment"),
+        data
+    );
+
+    let ids: Vec<u64> = peek_ten(dir.path(), &[])
+        .await
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "a restart after the override needs no override"
+    );
+}
+
+#[tokio::test]
+async fn test_torn_tail_past_the_recovery_point_is_still_truncated() {
+    // What a crash leaves: a partial record after the last synced body. That
+    // is past the recovery point, so it is cut off quietly as before.
+    let dir = tempfile::tempdir().unwrap();
+    let seg = ten_toast_jobs(dir.path()).await;
+    let mut data = std::fs::read(&seg).unwrap();
+    let synced_len = data.len();
+    data.extend_from_slice(&[0xAB; 30]);
+    std::fs::write(&seg, &data).unwrap();
+
+    let found = peek_ten(dir.path(), &[]).await;
+    assert_eq!(found.len(), 10, "{found:?}");
+    assert_eq!(std::fs::metadata(&seg).unwrap().len(), synced_len as u64);
+}
+
+#[tokio::test]
+async fn test_a_v8_wal_without_body_crcs_upgrades_and_its_bodies_are_still_served() {
+    // A v8 FullJob names its TOAST body by id alone. After the upgrade the
+    // job takes the CRC TOAST holds, and is served as before, across
+    // restarts.
+    use tuber::job::{BodyRef, Job};
+    use tuber::wal::serialize_full_job;
+    let dir = tempfile::tempdir().unwrap();
+    let body = vec![b'v'; 300];
+    let body_id = {
+        let bs = tuber::body_store::BodyStore::open(
+            &dir.path().join("toast"),
+            tuber::body_store::DEFAULT_SEGMENT_SIZE,
+        )
+        .unwrap();
+        let id = bs.write_body(&body).unwrap();
+        bs.fsync().unwrap();
+        id
+    };
+    let mut job = Job::new(
+        1,
+        0,
+        Duration::ZERO,
+        Duration::from_secs(60),
+        Vec::new(),
+        "default",
+    );
+    job.body = BodyRef::External(body_id, None);
+    let mut wal = Vec::from(*b"TWAL");
+    wal.extend_from_slice(&8u32.to_le_bytes());
+    wal.extend_from_slice(&0u32.to_le_bytes());
+    wal.extend_from_slice(&serialize_full_job(&job));
+    std::fs::write(dir.path().join("binlog.000001"), wal).unwrap();
+
+    for _ in 0..2 {
+        let srv = TestServer::try_start_with_migrate_wal(dir.path(), true)
+            .await
+            .expect("starts with --migrate-wal");
+        let mut c = srv.connect().await;
+        c.mustsend("peek 1\r\n").await;
+        c.ckresp("FOUND 1 300\r\n").await;
+        c.ckresp(&format!("{}\r\n", String::from_utf8(body.clone()).unwrap()))
+            .await;
+        drop(c);
+        let _ = srv.shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_a_toast_body_that_is_not_the_one_the_wal_wrote_is_not_served() {
+    // An intact record with the wrong bytes: its header and body CRCs agree
+    // with each other, so TOAST alone can't tell. The WAL record carries the
+    // CRC of the body it wrote, and the job is dropped rather than served
+    // someone else's bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let seg = ten_toast_jobs(dir.path()).await;
+    let rec = toast_record(2);
+    let mut data = std::fs::read(&seg).unwrap();
+    let other = vec![b'c'; 300];
+    data[rec + 20..rec + 20 + 300].copy_from_slice(&other);
+    data[rec + 12..rec + 16].copy_from_slice(&crc32fast::hash(&other).to_le_bytes());
+    let header_crc = crc32fast::hash(&data[rec..rec + 16]);
+    data[rec + 16..rec + 20].copy_from_slice(&header_crc.to_le_bytes());
+    std::fs::write(&seg, &data).unwrap();
+
+    let found = peek_ten(dir.path(), &[]).await;
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2, 4, 5, 6, 7, 8, 9, 10], "{found:?}");
+    assert!(found.iter().all(|(_, body)| body == &"b".repeat(300)));
 }
 
 #[tokio::test]
@@ -2411,6 +2618,43 @@ async fn test_v7_wal_needs_migrate_wal_and_says_nothing_is_rewritten() {
         !msg.contains("TOAST"),
         "the inline-body note is for pre-v5 WALs only: {msg}"
     );
+}
+
+#[tokio::test]
+async fn test_restart_after_migrate_wal_needs_no_flag_while_a_v7_segment_remains() {
+    // What a --migrate-wal start leaves when compaction hasn't emptied the
+    // old segment: the v7 segment, still holding a live job, and the v8
+    // segment that start opened (header + IdMark, as create_next_file writes
+    // it). Compaction only runs once the WAL is two-thirds waste, so a busy
+    // queue keeps the v7 segment for as long as its jobs live. The gate
+    // looked at every segment and refused each restart until then.
+    let dir = tempfile::tempdir().unwrap();
+    let mut v7 = Vec::from(*b"TWAL");
+    v7.extend_from_slice(&7u32.to_le_bytes());
+    v7.extend_from_slice(&0u32.to_le_bytes());
+    v7.extend_from_slice(&tuber::wal::serialize_full_job(&tuber::job::Job::new(
+        1,
+        0,
+        Duration::ZERO,
+        Duration::from_secs(60),
+        b"a".to_vec(),
+        "default",
+    )));
+    std::fs::write(dir.path().join("binlog.000001"), v7).unwrap();
+    let mut v8 = Vec::from(*b"TWAL");
+    v8.extend_from_slice(&tuber::wal::WAL_VERSION.to_le_bytes());
+    v8.extend_from_slice(&0u32.to_le_bytes());
+    v8.extend_from_slice(&tuber::wal::serialize_id_mark(1));
+    std::fs::write(dir.path().join("binlog.000002"), v8).unwrap();
+
+    let srv = match TestServer::try_start_with_migrate_wal(dir.path(), false).await {
+        Ok(srv) => srv,
+        Err(e) => panic!("a WAL already upgraded to v8 must start without --migrate-wal: {e}"),
+    };
+    let mut c = srv.connect().await;
+    c.mustsend("peek 1\r\n").await;
+    c.ckresp("FOUND 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
 }
 
 #[tokio::test]

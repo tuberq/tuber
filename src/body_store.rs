@@ -65,6 +65,9 @@ pub enum BodyStoreError {
     BadMagic,
     BadVersion(u32),
     BadCrc { expected: u32, found: u32, body_id: BodyId },
+    /// The record is intact but its CRC isn't the one the WAL recorded for
+    /// this body: TOAST holds other bytes under its id.
+    NotTheWalsBody { body_id: BodyId, wal_crc: u32, toast_crc: u32 },
     NotFound(BodyId),
     /// A segment is damaged in a way a crash can't explain; the message
     /// names it and the way forward.
@@ -87,6 +90,15 @@ impl std::fmt::Display for BodyStoreError {
                 f,
                 "TOAST CRC mismatch for body {}: expected {:08x}, got {:08x}",
                 body_id.0, expected, found
+            ),
+            BodyStoreError::NotTheWalsBody {
+                body_id,
+                wal_crc,
+                toast_crc,
+            } => write!(
+                f,
+                "TOAST body {} is not the one the WAL wrote: WAL CRC {:08x}, TOAST CRC {:08x}",
+                body_id.0, wal_crc, toast_crc
             ),
             BodyStoreError::NotFound(id) => write!(f, "TOAST body {} not found", id.0),
             BodyStoreError::Damaged(msg) => f.write_str(msg),
@@ -114,6 +126,20 @@ pub struct BodyLocation {
     pub seq: u64,
     pub offset: u64, // offset of the body bytes (after the body header)
     pub len: u32,
+    /// The body's CRC32, as its record header holds it. Fills what would
+    /// otherwise be padding.
+    pub crc: u32,
+}
+
+/// How far TOAST is known durable: every segment before `seq`, and `seq`
+/// up to `offset`. The WAL records one after each TOAST fsync (its
+/// `ToastMark`), so startup can tell a write cut short by a crash, which
+/// can only lie past it, from damage to bodies that were fsynced. See
+/// `docs/toast-recovery-point.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DurablePoint {
+    pub seq: u64,
+    pub offset: u64,
 }
 
 struct Segment {
@@ -134,6 +160,8 @@ struct Inner {
     current_seq: Option<u64>,
     next_seq: u64,
     index: HashMap<BodyId, BodyLocation>,
+    /// The furthest point a completed fsync covered (`BodyStore::fsync`).
+    synced: Option<DurablePoint>,
 }
 
 pub struct BodyStore {
@@ -227,6 +255,21 @@ impl BodyStore {
         segment_size: u64,
         skip_corrupt: bool,
     ) -> Result<Self, BodyStoreError> {
+        Self::open_with_recovery_point(dir, segment_size, skip_corrupt, None)
+    }
+
+    /// [`BodyStore::open_with_skip_corrupt`], judging the newest segment by
+    /// the WAL's recovery point (`Wal::read_toast_mark`). Only bytes past it
+    /// can be a write cut short by a crash; damage before it is handled as
+    /// in an older segment. Without one, all of the newest segment counts as
+    /// possibly torn, as before WAL v9. Everything indexed is fsynced before
+    /// this returns, so [`BodyStore::synced_point`] is the end of the store.
+    pub fn open_with_recovery_point(
+        dir: &Path,
+        segment_size: u64,
+        skip_corrupt: bool,
+        recovery_point: Option<DurablePoint>,
+    ) -> Result<Self, BodyStoreError> {
         fs::create_dir_all(dir)?;
 
         let mut seqs: Vec<u64> = Vec::new();
@@ -267,11 +310,27 @@ impl BodyStore {
         for (idx, seq) in seqs.iter().enumerate() {
             let path = segment_path(dir, *seq);
             let newest = Some(*seq) == newest_seq;
+            // Where a crash could have cut this segment short: nowhere in an
+            // older one, and in the newest from the recovery point on — all
+            // of it when there is none, or the point is in an older segment.
+            let torn_from = newest.then_some(match recovery_point {
+                Some(p) if p.seq == *seq => p.offset,
+                _ => 0,
+            });
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-            let scan = scan_segment(&mut file, newest)?;
+            let scan = scan_segment(&mut file, torn_from)?;
             if let Some(damage) = &scan.damage {
                 if !skip_corrupt {
-                    return Err(damaged_segment_error(&path, &damage.what, !newest));
+                    let why = if !newest {
+                        "It is not the newest segment, so this is not a write cut short by a \
+                         crash: its bodies were fsynced. "
+                    } else if torn_from.is_some_and(|t| t > 0) {
+                        "It is before the TOAST recovery point the WAL recorded, so this is \
+                         not a write cut short by a crash: those bodies were fsynced. "
+                    } else {
+                        ""
+                    };
+                    return Err(damaged_segment_error(&path, &damage.what, why));
                 }
                 let aside = corrupt_copy_path(&path);
                 if damage.unusable {
@@ -308,6 +367,13 @@ impl BodyStore {
                         e,
                     ),
                 }
+                // Appends continue in the newest segment, so cut it at the
+                // damage: stray bytes left past a new record could later
+                // scan as a phantom body. An older segment is never cut.
+                if newest {
+                    file.set_len(scan.consumed)?;
+                    file.sync_data()?;
+                }
             }
             if newest && scan.version == TOAST_VERSION {
                 current_seq = Some(*seq);
@@ -318,7 +384,12 @@ impl BodyStore {
                 live_bytes += entry.len as u64;
                 index.insert(
                     entry.body_id,
-                    BodyLocation { seq: *seq, offset: entry.body_offset, len: entry.len },
+                    BodyLocation {
+                        seq: *seq,
+                        offset: entry.body_offset,
+                        len: entry.len,
+                        crc: entry.crc,
+                    },
                 );
             }
             total_bytes_acc += scan.consumed;
@@ -350,6 +421,21 @@ impl BodyStore {
 
         let next_seq = seqs.last().map(|s| s + 1).unwrap_or(0);
 
+        // Make what was scanned durable. A previous process killed before
+        // its fsync can leave bodies only in the page cache, and the
+        // recovery point the WAL records next must not vouch for them
+        // until they're on disk. Older segments were fsynced at rotation.
+        let synced = match segments.last_key_value() {
+            Some((seq, seg)) => {
+                seg.file.sync_data()?;
+                Some(DurablePoint {
+                    seq: *seq,
+                    offset: seg.total_bytes,
+                })
+            }
+            None => None,
+        };
+
         let segment_count = segments.len();
         let store = BodyStore {
             dir: dir.to_path_buf(),
@@ -362,7 +448,7 @@ impl BodyStore {
             bodies_migrated_total: AtomicU64::new(0),
             bodies_dropped_corrupted: AtomicU64::new(0),
             fd_warning_emitted: AtomicBool::new(false),
-            inner: Mutex::new(Inner { segments, current_seq, next_seq, index }),
+            inner: Mutex::new(Inner { segments, current_seq, next_seq, index, synced }),
         };
         // A restart with many existing segments can already be near the fd
         // limit before serving a single request.
@@ -376,6 +462,12 @@ impl BodyStore {
     /// Bytes hit the kernel via `pwrite`, but durability requires a
     /// subsequent [`BodyStore::fsync`].
     pub fn write_body(&self, bytes: &[u8]) -> Result<BodyId, BodyStoreError> {
+        self.write_body_with_crc(bytes).map(|(id, _)| id)
+    }
+
+    /// [`BodyStore::write_body`], also returning the body's CRC32 — the one
+    /// its record header holds, which the WAL records beside the `BodyId`.
+    pub fn write_body_with_crc(&self, bytes: &[u8]) -> Result<(BodyId, u32), BodyStoreError> {
         let body_id = BodyId(self.next_body_id.fetch_add(1, Ordering::SeqCst));
         let crc = crc32fast::hash(bytes);
         let mut inner = self.inner.lock().unwrap();
@@ -383,7 +475,7 @@ impl BodyStore {
         inner.index.insert(body_id, location);
         self.live_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        Ok(body_id)
+        Ok((body_id, crc))
     }
 
     /// Append a body to the current segment under the lock, rotating
@@ -437,6 +529,7 @@ impl BodyStore {
             seq: current_seq,
             offset: body_offset,
             len: bytes.len() as u32,
+            crc,
         })
     }
 
@@ -444,6 +537,22 @@ impl BodyStore {
     /// header recorded at write time. The inner lock is released before
     /// disk IO, so reads can proceed concurrently.
     pub fn read_body(&self, id: BodyId) -> Result<Vec<u8>, BodyStoreError> {
+        self.read_body_checked(id, None)
+    }
+
+    /// [`BodyStore::read_body`], first checking that the record is the body
+    /// the WAL wrote: its header's CRC must be `wal_crc`. A record whose
+    /// own CRCs agree but name other bytes — a misdirected write, a segment
+    /// from another backup — fails with [`BodyStoreError::NotTheWalsBody`].
+    pub fn read_body_expecting(&self, id: BodyId, wal_crc: u32) -> Result<Vec<u8>, BodyStoreError> {
+        self.read_body_checked(id, Some(wal_crc))
+    }
+
+    fn read_body_checked(
+        &self,
+        id: BodyId,
+        wal_crc: Option<u32>,
+    ) -> Result<Vec<u8>, BodyStoreError> {
         let (file, location) = {
             let inner = self.inner.lock().unwrap();
             let location = inner
@@ -461,6 +570,15 @@ impl BodyStore {
         let mut header = [0u8; BODY_HEADER_SIZE];
         file.read_exact_at(&mut header, location.offset - BODY_HEADER_SIZE as u64)?;
         let expected_crc = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        if let Some(wal_crc) = wal_crc
+            && wal_crc != expected_crc
+        {
+            return Err(BodyStoreError::NotTheWalsBody {
+                body_id: id,
+                wal_crc,
+                toast_crc: expected_crc,
+            });
+        }
 
         let mut buf = vec![0u8; location.len as usize];
         file.read_exact_at(&mut buf, location.offset)?;
@@ -545,19 +663,39 @@ impl BodyStore {
     }
 
     /// `fsync` the current segment file. Sealed segments are synced before
-    /// rotation, so they don't need re-syncing here.
-    pub fn fsync(&self) -> Result<(), BodyStoreError> {
-        let file = {
+    /// rotation, so they don't need re-syncing here. Returns the point now
+    /// known durable ([`BodyStore::synced_point`]), for the WAL to record.
+    pub fn fsync(&self) -> Result<Option<DurablePoint>, BodyStoreError> {
+        // Take the point before the fsync: bytes appended after it may or
+        // may not make this one, so only what was written before counts.
+        let current = {
             let inner = self.inner.lock().unwrap();
-            inner
-                .current_seq
-                .and_then(|seq| inner.segments.get(&seq))
-                .map(|seg| Arc::clone(&seg.file))
+            inner.current_seq.and_then(|seq| {
+                inner.segments.get(&seq).map(|seg| {
+                    (
+                        Arc::clone(&seg.file),
+                        DurablePoint {
+                            seq,
+                            offset: seg.total_bytes,
+                        },
+                    )
+                })
+            })
         };
-        if let Some(file) = file {
-            file.sync_data()?;
-        }
-        Ok(())
+        let Some((file, point)) = current else {
+            return Ok(self.synced_point());
+        };
+        file.sync_data()?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.synced = inner.synced.max(Some(point));
+        Ok(inner.synced)
+    }
+
+    /// The furthest point a completed fsync covered: the end of the store
+    /// at open, then advanced by every [`BodyStore::fsync`], compaction's
+    /// included.
+    pub fn synced_point(&self) -> Option<DurablePoint> {
+        self.inner.lock().unwrap().synced
     }
 
     /// Sum of bytes used across all segment files (file headers + body
@@ -600,6 +738,13 @@ impl BodyStore {
     /// `compact_segment`, etc.).
     pub fn contains_body(&self, id: BodyId) -> bool {
         self.inner.lock().unwrap().index.contains_key(&id)
+    }
+
+    /// The CRC32 that `id`'s record header holds, if the body is indexed.
+    /// From the index, so no IO: startup compares it with the WAL's for
+    /// every job without reading a body.
+    pub fn body_crc(&self, id: BodyId) -> Option<u32> {
+        self.inner.lock().unwrap().index.get(&id).map(|loc| loc.crc)
     }
 
     /// Drop every TOAST body whose `BodyId` is not in `live_ids`, then
@@ -998,6 +1143,7 @@ struct ScanEntry {
     body_id: BodyId,
     body_offset: u64,
     len: u32,
+    crc: u32,
 }
 
 struct SegmentScan {
@@ -1032,16 +1178,9 @@ impl SegmentScan {
     }
 }
 
-/// The error that stops startup at a damaged segment. `older` says a newer
-/// segment exists, which a crash can't explain: rotation fsyncs a segment
-/// before creating the next.
-fn damaged_segment_error(path: &Path, damage: &str, older: bool) -> BodyStoreError {
-    let why = if older {
-        "It is not the newest segment, so this is not a write cut short by a crash: \
-         its bodies were fsynced. "
-    } else {
-        ""
-    };
+/// The error that stops startup at a damaged segment. `why` says how we know
+/// a crash can't explain it (ending in a space), or is empty.
+fn damaged_segment_error(path: &Path, damage: &str, why: &str) -> BodyStoreError {
     BodyStoreError::Damaged(format!(
         "TOAST segment {} {damage}. {why}Starting without the bodies from there on would \
          drop the jobs they belong to. Restore the WAL directory from a backup, or start \
@@ -1052,18 +1191,21 @@ fn damaged_segment_error(path: &Path, damage: &str, older: bool) -> BodyStoreErr
     ))
 }
 
-/// Walk a segment's body headers. `newest` says no later segment exists:
-/// only then can damage be a write cut short by a crash, which is truncated
-/// here. Damage anywhere else is reported in `damage`, with the file left
-/// untouched.
-fn scan_segment(file: &mut File, newest: bool) -> Result<SegmentScan, BodyStoreError> {
+/// Walk a segment's body headers. `torn_from` is where a crash could have
+/// cut the segment short: `None` for an older segment, and for the newest
+/// the WAL's recovery point (0 without one). Damage from there on is a
+/// write cut short and is truncated here. Damage anywhere else is reported
+/// in `damage`, with the file left untouched.
+fn scan_segment(file: &mut File, torn_from: Option<u64>) -> Result<SegmentScan, BodyStoreError> {
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
+    let tearable = |offset: u64| torn_from.is_some_and(|t| offset >= t);
 
     if file_len < FILE_HEADER_SIZE as u64 {
-        if !newest {
+        if !tearable(0) {
             // rotate() fsyncs a segment's header before the next segment
-            // exists, so an older one this short was cut down afterwards.
+            // exists or a recovery point names it, so one this short there
+            // was cut down afterwards.
             return Ok(SegmentScan::unusable(format!(
                 "is {file_len} bytes, shorter than its file header"
             )));
@@ -1130,11 +1272,12 @@ fn scan_segment(file: &mut File, newest: bool) -> Result<SegmentScan, BodyStoreE
             ));
             break;
         }
-        entries.push(ScanEntry { body_id, body_offset, len });
+        let crc = u32::from_le_bytes([bh[12], bh[13], bh[14], bh[15]]);
+        entries.push(ScanEntry { body_id, body_offset, len, crc });
         offset = next_offset;
     }
 
-    if damage.is_some() && newest {
+    if damage.is_some() && tearable(offset) {
         // A torn tail: a partial record after the last complete one. Drop
         // it now. If left in place, a later append writes at `offset` but the
         // older stray bytes beyond the new record survive, where a subsequent
@@ -1838,6 +1981,132 @@ mod tests {
         let id = bs.write_body(b"after").unwrap();
         assert!(id.0 > ids[3].0);
         assert_eq!(bs.read_body(id).unwrap(), b"after");
+    }
+
+    /// Three 40-byte bodies in one segment, fsynced; their ids and the
+    /// point the fsync reached.
+    fn store_synced(dir: &Path) -> (Vec<BodyId>, DurablePoint) {
+        let bs = BodyStore::open(dir, 4096).unwrap();
+        let ids = (0..3u8).map(|n| bs.write_body(&[n; 40]).unwrap()).collect();
+        let point = bs.fsync().unwrap().expect("a write was fsynced");
+        (ids, point)
+    }
+
+    fn open_at(dir: &Path, point: Option<DurablePoint>) -> Result<BodyStore, BodyStoreError> {
+        BodyStore::open_with_recovery_point(dir, 4096, false, point)
+    }
+
+    #[test]
+    fn test_open_refuses_damage_before_the_recovery_point_in_the_newest_segment() {
+        // The review's H4 repro had one segment, so the newest. Its bodies
+        // were fsynced, so damage there is not a write cut short by a crash.
+        let tmp = TempDir::new().unwrap();
+        let (_, point) = store_synced(tmp.path());
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+
+        let msg = match open_at(tmp.path(), Some(point)) {
+            Ok(_) => panic!("open went ahead on damage before the recovery point"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("recovery point"), "{msg}");
+        assert!(msg.contains("--wal-skip-corrupt"), "{msg}");
+        assert_eq!(fs::read(segment_path(tmp.path(), 0)).unwrap(), damaged);
+    }
+
+    #[test]
+    fn test_open_truncates_damage_from_the_recovery_point_on() {
+        // A crash can tear only what was written after the last fsync.
+        let tmp = TempDir::new().unwrap();
+        let (ids, _) = store_synced(tmp.path());
+        patch_segment(tmp.path(), 0, header_offset(2) + 8, &u32::MAX.to_le_bytes());
+        let point = DurablePoint {
+            seq: 0,
+            offset: header_offset(2),
+        };
+
+        let bs = open_at(tmp.path(), Some(point)).unwrap();
+        assert_eq!(
+            fs::metadata(segment_path(tmp.path(), 0)).unwrap().len(),
+            header_offset(2)
+        );
+        assert_eq!(bs.read_body(ids[1]).unwrap(), vec![1; 40]);
+        assert!(!bs.contains_body(ids[2]));
+    }
+
+    #[test]
+    fn test_open_carries_on_when_the_newest_segment_is_shorter_than_the_recovery_point() {
+        // Bodies the WAL vouched for are gone, but nothing left is damaged.
+        // Open goes ahead, and replay reaps the jobs that lost them.
+        let tmp = TempDir::new().unwrap();
+        let (ids, point) = store_synced(tmp.path());
+        let file = OpenOptions::new()
+            .write(true)
+            .open(segment_path(tmp.path(), 0))
+            .unwrap();
+        file.set_len(header_offset(2)).unwrap();
+
+        let bs = open_at(tmp.path(), Some(point)).unwrap();
+        assert_eq!(bs.read_body(ids[1]).unwrap(), vec![1; 40]);
+        assert!(!bs.contains_body(ids[2]));
+    }
+
+    #[test]
+    fn test_open_without_a_recovery_point_truncates_the_newest_segment_as_before() {
+        // A WAL from before v9 has no mark: all of the newest segment counts
+        // as possibly torn.
+        let tmp = TempDir::new().unwrap();
+        store_synced(tmp.path());
+        patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+
+        open_at(tmp.path(), None).unwrap();
+        assert_eq!(
+            fs::metadata(segment_path(tmp.path(), 0)).unwrap().len(),
+            header_offset(1)
+        );
+    }
+
+    #[test]
+    fn test_index_keeps_each_body_crc_and_reads_check_the_wals() {
+        let tmp = TempDir::new().unwrap();
+        let bs = BodyStore::open(tmp.path(), 4096).unwrap();
+        let (id, crc) = bs.write_body_with_crc(b"the body the WAL wrote").unwrap();
+        assert_eq!(crc, crc32fast::hash(b"the body the WAL wrote"));
+        assert_eq!(bs.body_crc(id), Some(crc));
+        assert_eq!(
+            bs.read_body_expecting(id, crc).unwrap(),
+            b"the body the WAL wrote"
+        );
+        assert!(matches!(
+            bs.read_body_expecting(id, crc ^ 1),
+            Err(BodyStoreError::NotTheWalsBody { .. })
+        ));
+        drop(bs);
+        // The scan at open takes the CRC from the record header.
+        assert_eq!(
+            BodyStore::open(tmp.path(), 4096).unwrap().body_crc(id),
+            Some(crc)
+        );
+    }
+
+    #[test]
+    fn test_synced_point_starts_at_the_end_of_the_store_and_follows_fsyncs() {
+        let tmp = TempDir::new().unwrap();
+        let (_, point) = store_synced(tmp.path());
+        let bs = BodyStore::open(tmp.path(), 4096).unwrap();
+        assert_eq!(
+            bs.synced_point(),
+            Some(point),
+            "open fsyncs what it scanned"
+        );
+        bs.write_body(&[9; 40]).unwrap();
+        assert_eq!(
+            bs.synced_point(),
+            Some(point),
+            "a write alone isn't durable"
+        );
+        let after = bs.fsync().unwrap();
+        assert!(after > Some(point));
+        assert_eq!(bs.synced_point(), after);
     }
 
     #[test]

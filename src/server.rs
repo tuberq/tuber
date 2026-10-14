@@ -586,11 +586,15 @@ impl ServerState {
         if let Some(bytes) = job.body.as_inline_bytes() {
             return Some(bytes.to_vec());
         }
-        let BodyRef::External(id) = &job.body else {
+        let BodyRef::External(id, crc) = &job.body else {
             unreachable!("as_inline_bytes returned None ⇒ External");
         };
         let bs = self.body_store.as_ref()?;
-        match bs.read_body(*id) {
+        let read = match crc {
+            Some(crc) => bs.read_body_expecting(*id, *crc),
+            None => bs.read_body(*id),
+        };
+        match read {
             Ok(bytes) => Some(bytes),
             Err(e) => {
                 tracing::error!(
@@ -745,7 +749,7 @@ impl ServerState {
     /// The single correct entry point for delete/flush/expiry paths.
     fn delete_job(&mut self, id: u64) -> Option<Box<Job>> {
         let job = self.take_job(id)?;
-        if let (BodyRef::External(body_id), Some(bs)) = (&job.body, self.body_store.as_ref()) {
+        if let (BodyRef::External(body_id, _), Some(bs)) = (&job.body, self.body_store.as_ref()) {
             bs.delete(*body_id);
         }
         Some(job)
@@ -1429,8 +1433,8 @@ impl ServerState {
         // mutex hop and TOAST compaction churn for small bodies.
         let body_ref = match self.body_store.as_ref() {
             Some(bs) if crate::job::should_externalize(body.len(), true) => {
-                match bs.write_body(&body) {
-                    Ok(body_id) => BodyRef::External(body_id),
+                match bs.write_body_with_crc(&body) {
+                    Ok((body_id, crc)) => BodyRef::External(body_id, Some(crc)),
                     Err(e) => {
                         tracing::error!("body store write failed: {}", e);
                         return Response::InternalError;
@@ -2166,7 +2170,7 @@ impl ServerState {
         for &id in &job_ids {
             self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
             if let Some(job) = self.take_job(id)
-                && let BodyRef::External(body_id) = job.body
+                && let BodyRef::External(body_id, _) = job.body
             {
                 external_bodies.push(body_id);
             }
@@ -2249,7 +2253,7 @@ impl ServerState {
             // external body for a single batched release.
             self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
             if let Some(job) = self.take_job(id)
-                && let BodyRef::External(body_id) = job.body
+                && let BodyRef::External(body_id, _) = job.body
             {
                 external_bodies.push(body_id);
             }
@@ -4049,10 +4053,14 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // Legacy-format gate: pre-v5 records carry inline bodies that the
         // replay path lifts into the body store. We refuse to migrate
         // silently — operators who haven't reasoned about the upgrade
-        // should hit a clear stop sign before any data is touched.
+        // should hit a clear stop sign before any data is touched. Only
+        // the newest segment counts: a current-version one means an
+        // earlier start already had --migrate-wal, and older segments
+        // linger until compaction or GC empties them.
         let legacy_version = wal
-            .min_format_version()?
-            .filter(|v| *v < crate::wal::WAL_VERSION);
+            .format_versions()?
+            .filter(|vs| vs.newest < crate::wal::WAL_VERSION)
+            .map(|vs| vs.min);
         if let Some(min_version) = legacy_version {
             if !migrate_wal {
                 let what = if min_version < 5 {
@@ -4081,13 +4089,20 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // can resolve during replay. The directory is created on demand —
         // existing operators upgrading without TOAST data see an empty
         // index, which is correct.
+        //
+        // The WAL's TOAST recovery point decides how much of the newest
+        // segment a crash could have torn; damage before it stops startup
+        // as in an older segment. Once open, the body store's end is the
+        // point the new WAL segment opens with, superseding the old mark.
         let toast_dir = dir.join("toast");
         tracing::info!("TOAST: scanning body store at {:?}", toast_dir);
-        let body_store = Arc::new(BodyStore::open_with_skip_corrupt(
+        let body_store = Arc::new(BodyStore::open_with_recovery_point(
             &toast_dir,
             crate::body_store::DEFAULT_SEGMENT_SIZE,
             wal_skip_corrupt,
+            wal.read_toast_mark(),
         )?);
+        wal.set_toast_mark(body_store.synced_point());
 
         let on_disk = wal.total_disk_bytes();
 
@@ -4130,8 +4145,8 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             if job.body.len() > crate::job::HEAP_INLINE_MAX
                 && let Some(bytes) = job.body.take_inline()
             {
-                let body_id = body_store.write_body(&bytes)?;
-                job.body = BodyRef::External(body_id);
+                let (body_id, crc) = body_store.write_body_with_crc(&bytes)?;
+                job.body = BodyRef::External(body_id, Some(crc));
                 migrated += 1;
             }
         }
@@ -4143,8 +4158,10 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         }
 
         // Integrity check: WAL records that reference TOAST bodies which
-        // no longer exist (segment corruption, manual `rm`, or the
-        // CRC-failure drop in `compact_segment`). The TOAST-then-WAL
+        // no longer exist, or whose TOAST record isn't the body the WAL
+        // wrote (its CRC differs from the one the v9 record carries).
+        // Causes: segment corruption, manual `rm`, the
+        // CRC-failure drop in `compact_segment`. The TOAST-then-WAL
         // fsync ordering means a clean crash should never produce this,
         // but disk faults and operator mistakes can. Reap before
         // `restore_jobs` so we don't have to unwind heaps + stats — the
@@ -4163,16 +4180,31 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // `retain` pass also avoids re-hashing every reaped id.
         let mut recovered_missing_bodies = 0u64;
         jobs.retain(|id, job| {
-            let missing_body_id = match &job.body {
-                BodyRef::External(body_id) if !body_store.contains_body(*body_id) => *body_id,
+            let (body_id, wal_crc) = match &job.body {
+                BodyRef::External(body_id, crc) => (*body_id, *crc),
                 _ => return true,
+            };
+            // The index holds each record header's CRC, so this reads no
+            // body.
+            let problem = match (body_store.body_crc(body_id), wal_crc) {
+                (None, _) => "WAL references body missing from TOAST: reaping job (lost data)",
+                (Some(toast), Some(wal)) if toast != wal => {
+                    "TOAST holds a body other than the one the WAL wrote: reaping job (lost data)"
+                }
+                (Some(toast), _) => {
+                    // A pre-v9 record carries no CRC: take the one TOAST
+                    // holds, so every live job is checked on read and
+                    // writes one the next time its record is rewritten.
+                    job.body = BodyRef::External(body_id, Some(toast));
+                    return true;
+                }
             };
             tracing::error!(
                 job_id = id,
                 tube = %job.tube_name,
-                body_id = missing_body_id.0,
+                body_id = body_id.0,
                 state = job.state.as_str(),
-                "WAL references body missing from TOAST: reaping job (lost data)",
+                "{problem}",
             );
             recovered_missing_bodies += 1;
             // Best-effort: journal the delete so the warning doesn't
@@ -4843,6 +4875,12 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                     let toast_fds = state.body_store.as_ref().map_or(0, |bs| bs.segment_count());
                     let wal_fds = state.wal.as_ref().map_or(0, |w| w.file_count());
                     state.fd_budget.set_storage_fds(toast_fds + wal_fds);
+                    // Compaction fsyncs the bodies it moves with no WAL write
+                    // of its own; have the backstop record a recovery point
+                    // past them.
+                    if let Some(wal) = state.wal.as_mut() {
+                        wal.note_toast_progress();
+                    }
                     // SLA backstop. state.tick() can dirty the WAL via TTR
                     // expiry; pending is always empty here because the recv
                     // arm flushes its own before yielding.

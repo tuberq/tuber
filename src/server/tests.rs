@@ -2328,7 +2328,7 @@ fn test_waiting_ct_disconnect_clears() {
 // body_store, so fetch_body returns None and do_reserve yields INTERNAL_ERROR —
 // simulating a TOAST read failure without a real on-disk store.
 fn poison_body(s: &mut ServerState, id: u64) {
-    s.jobs.get_mut(&id).unwrap().body = BodyRef::External(BodyId(9999));
+    s.jobs.get_mut(&id).unwrap().body = BodyRef::External(BodyId(9999), None);
 }
 
 #[test]

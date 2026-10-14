@@ -63,12 +63,15 @@ pub fn should_externalize(body_len: usize, body_store_enabled: bool) -> bool {
 /// `Tiny` keeps very small bodies inside the enum slot itself (no heap
 /// allocation). `Heap` keeps medium bodies on the heap but still inline
 /// in the WAL record (no body-store traffic). `External` references a
-/// body owned by the `BodyStore` (TOAST).
+/// body owned by the `BodyStore` (TOAST), with the body's CRC32 as the WAL
+/// records it, so a read can check TOAST returned the body the WAL wrote.
+/// The CRC is `None` only between replaying a pre-v9 record, which has
+/// none, and startup taking it from the TOAST index.
 #[derive(Debug, Clone)]
 pub enum BodyRef {
     Tiny { len: u8, bytes: [u8; TINY_INLINE_BYTES] },
     Heap(Vec<u8>),
-    External(BodyId),
+    External(BodyId, Option<u32>),
 }
 
 impl BodyRef {
@@ -93,7 +96,7 @@ impl BodyRef {
         match self {
             BodyRef::Tiny { len, .. } => *len as usize,
             BodyRef::Heap(v) => v.len(),
-            BodyRef::External(_) => 0,
+            BodyRef::External(..) => 0,
         }
     }
 
@@ -107,7 +110,7 @@ impl BodyRef {
         match self {
             BodyRef::Tiny { len, bytes } => Some(&bytes[..*len as usize]),
             BodyRef::Heap(v) => Some(v.as_slice()),
-            BodyRef::External(_) => None,
+            BodyRef::External(..) => None,
         }
     }
 
@@ -128,7 +131,7 @@ impl BodyRef {
                 };
                 Some(bytes)
             }
-            BodyRef::External(_) => None,
+            BodyRef::External(..) => None,
         }
     }
 }
@@ -395,7 +398,7 @@ where
     use std::borrow::Borrow;
     jobs.into_iter()
         .filter_map(|j| match &j.borrow().body {
-            BodyRef::External(id) => Some(*id),
+            BodyRef::External(id, _) => Some(*id),
             BodyRef::Tiny { .. } | BodyRef::Heap(_) => None,
         })
         .collect()
@@ -594,9 +597,12 @@ mod tests {
 
     #[test]
     fn test_body_ref_take_inline_external_returns_none() {
-        let mut external = BodyRef::External(BodyId(7));
+        let mut external = BodyRef::External(BodyId(7), Some(0xC0FFEE));
         assert!(external.take_inline().is_none());
-        assert!(matches!(external, BodyRef::External(BodyId(7))));
+        assert!(matches!(
+            external,
+            BodyRef::External(BodyId(7), Some(0xC0FFEE))
+        ));
     }
 
     #[test]

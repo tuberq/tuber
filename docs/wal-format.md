@@ -1,6 +1,6 @@
 # WAL + TOAST Binary Format Specification
 
-WAL version 6 + TOAST version 1 — Tuber persistence layer.
+WAL version 9 + TOAST version 2 — Tuber persistence layer.
 
 ## Overview
 
@@ -65,8 +65,9 @@ zero and ignored on read.
 
 ## Record Types
 
-Four record types follow the header: FullJob and StateChange, plus
-Tombstone and IdMark from v8. All share a common envelope:
+Five record types follow the header: FullJob and StateChange, plus
+Tombstone and IdMark from v8 and ToastMark from v9. All share a common
+envelope:
 
 ```
 +-----------+------------------+------------------+---------+----------+
@@ -145,7 +146,15 @@ below.
   tier boundary is a runtime choice carried in code, not in the format.
 - `body_kind = 0x01` — External. Followed by `body_id (u64 LE)`. The body
   bytes themselves live in TOAST and are read at reserve/peek time using
-  this id.
+  this id. Written before v9, and read by every version since v6.
+- `body_kind = 0x02` — External with CRC (v9+). Followed by `body_id (u64
+  LE)` and `crc32 (u32 LE)`: the body's CRC32, the same value its TOAST
+  record header holds. Startup compares the two for every job, from the
+  TOAST index, without reading a body; a reserve or peek checks the record
+  header against it before sending the bytes. A record whose own CRCs agree
+  but whose CRC isn't this one holds another body's bytes, and its job is
+  reaped as if the body were missing. Compaction copies bodies unchanged,
+  so the value holds wherever a body moves.
 
 The decision of which kind to write happens at `put`-time based on body
 length and whether a body store is configured. Bodies up to
@@ -225,6 +234,28 @@ empty (`payload_len = 0`, record 17 bytes). GC never removes the newest
 segment, so replay always finds the mark, and job ids never go backwards
 when older segments are collected.
 
+### 0x05 — ToastMark (v9+)
+
+The TOAST recovery point: how far the body store was durable when the
+record was written. `job_id` holds the TOAST segment seq and the payload
+the offset in it (`u64 LE`, `payload_len = 8`, record 25 bytes): every
+segment before `seq`, and `seq` up to `offset`, had been fsynced.
+
+`Wal::sync` writes one after the TOAST fsync that precedes every WAL
+fsync, into the batch that fsync makes durable, whenever the point has
+moved. Every new segment repeats the latest after its IdMark, so GC never
+takes the last one. Compaction moves bodies and fsyncs them with no WAL
+write of its own, so the tick marks the WAL dirty when the body store's
+fsyncs have passed the last mark, and the backstop sync records a new one.
+
+At startup the latest mark is read from the newest WAL segment back
+(`Wal::read_toast_mark`) before TOAST is opened, and decides how much of
+the newest TOAST segment a crash could have torn: see TOAST Crash Safety.
+Replay itself ignores marks. A mark can lag safely; a stale one only
+widens the stretch treated as possibly torn. Once TOAST is open, its end
+is the point the replay's new segment opens with, superseding the old one.
+Design and alternatives: `docs/toast-recovery-point.md`.
+
 ## Encoding Details
 
 ### State Encoding
@@ -277,8 +308,9 @@ On startup, files are read in sequence order. For each record:
 - **FullJob (v6)**: Insert or replace in the job map. The `body_kind`
   discriminant decides: kind `0x00` → inline bytes materialised as
   `BodyRef::Tiny` (≤ 23 B) or `BodyRef::Heap`; kind `0x01` →
-  `BodyRef::External(BodyId)` whose bytes are looked up from TOAST at
-  reserve/peek time.
+  `BodyRef::External(BodyId, None)` whose bytes are looked up from TOAST
+  at reserve/peek time; kind `0x02` (v9) → the same with the body's CRC.
+  A job without one takes its CRC from the TOAST index after replay.
 - **FullJob (v5)**: `body` is set to `BodyRef::External(BodyId)` — every
   v5 body lives in TOAST.
 - **FullJob (v3/v4)**: Inline body bytes are read directly into the
@@ -296,6 +328,7 @@ On startup, files are read in sequence order. For each record:
   segment gains a reference; otherwise (expired, or cleared) the key is
   free.
 - **IdMark (v8)**: Raises the next job id to at least `job_id + 1`.
+- **ToastMark (v9)**: Ignored; read before replay by `read_toast_mark`.
 - **StateChange (other)**: Update the job's state, priority, and delay.
   Increment the counter named by `reason` (v4+).
 
@@ -317,9 +350,12 @@ runtime `BodyStore::delete` self-healing.
 
 ### Legacy migration (`--migrate-wal`)
 
-When the server detects pre-current-version WAL records on startup it
+When the newest WAL segment predates the current version, the server
 refuses to start unless `--migrate-wal` is set, since older tuber
-versions can't read the segments the new one writes. From v5 on nothing
+versions can't read the segments the new one writes. Only the newest
+segment counts: a started server opens a current-version segment, so
+older segments left behind (until compaction or GC empties them) don't
+ask for the flag again. From v5 on nothing
 is converted. For v3/v4, with the flag, the replay
 path lifts inline body bytes that exceed `HEAP_INLINE_MAX` from v3/v4
 FullJob records into TOAST (assigning fresh `BodyId`s), fsyncs TOAST, and
@@ -328,7 +364,8 @@ as v6 inline records the next time their owning job's state changes
 (or on a subsequent put of a successor). Subsequent fresh writes are v6.
 
 The migration is one-way and in-place. Back up the WAL directory first if
-you want a rollback option.
+you want a rollback option, and roll back by restoring it: tuber 0.15
+quarantines v8 segments as `.corrupt` and starts without them.
 
 ### Corruption handling
 
@@ -401,7 +438,8 @@ Each WAL file tracks a reference count (`refs`): the live jobs whose most
 recent FullJob record is in that file, plus the live cooldowns whose
 Tombstone record is. On each server tick, head files with `refs == 0`
 are deleted, oldest first. The current writable file is never removed;
-each opens with an IdMark, which keeps the job-id high-water mark.
+each opens with an IdMark, which keeps the job-id high-water mark, and
+then the latest ToastMark.
 
 ### WAL compaction
 
@@ -440,6 +478,7 @@ This prevents multiple tuber instances from writing to the same WAL.
 | 6       | 12 bytes    | FullJob body field becomes a 1-byte `body_kind` discriminant followed by inline (`body_len u32` + bytes) or external (`body_id u64`). Small bodies stay inline; only larger bodies go to TOAST. Per-record kind decouples the on-disk format from the runtime threshold. v3–v5 reads still supported (v3/v4 via `--migrate-wal`). |
 | 7       | 12 bytes    | StateChange payload gains `change_epoch_secs` (u64), so a delayed job replays with its remaining delay. |
 | 8       | 12 bytes    | Tombstone (0x03) and IdMark (0x04) records. A cooldown no longer depends on its job's FullJob record surviving GC, and job ids never go backwards. Deletes write `expiry_epoch_secs = 0`. Startup on an older WAL needs `--migrate-wal`; an older tuber can't read v8 segments. |
+| 9       | 12 bytes    | ToastMark (0x05) records the TOAST recovery point, so startup tells a torn TOAST tail from corruption. FullJob body kind 0x02 carries the TOAST body's CRC32. Startup on an older WAL needs `--migrate-wal`. An older tuber sets a v9 newest segment aside as `.corrupt` and starts without it, and refuses an older one. The header's `flags` word is still written as 0 and ignored on read. |
 
 ---
 
@@ -560,19 +599,28 @@ synchronisation point.
 - **TOAST-then-WAL fsync ordering** (see overview) — a WAL record never
   becomes durable before the body it references. A crash leaves orphan
   bodies, never dangling references.
-- **Torn tail recovery** — only the newest segment can end in a write a
-  crash cut short: rotation fsyncs a segment before creating the next,
-  and fsyncs the new segment's file header. In the newest segment,
-  `BodyStore::open` stops at the first partial record, failed header CRC
-  or length running past the end of the file, and truncates the segment
-  there. The next write resumes at that point.
-- **Damage** — the same findings in an older segment, or a segment with
-  a bad file header, mean bodies that were durable are gone, and the
-  server refuses to start, leaving the files alone. With
-  `--wal-skip-corrupt` it starts with the bodies before the damage, keeps
-  a copy of the segment as `<segment>.corrupt` (or moves it there when
-  its file header is bad), and never truncates an older segment. Jobs
-  whose bodies are lost are reaped as missing-body jobs (below).
+- **Torn tail recovery** — a crash can only cut short what was written
+  after the last completed fsync. Rotation fsyncs a segment before
+  creating the next, and fsyncs the new segment's file header, so that
+  is in the newest segment, and from the WAL's TOAST recovery point on
+  (its latest ToastMark; all of the newest segment without one, as
+  before WAL v9). There, `BodyStore::open` stops at the first partial
+  record, failed header CRC or length running past the end of the file,
+  and truncates the segment at it. The next write resumes at that point.
+
+  The newest segment is not just recent writes: compaction appends the
+  live bodies of older segments to it, then unlinks them. Without the
+  recovery point a bad header in the middle of it was taken for a torn
+  tail, and every body after it was truncated away, durable or not.
+- **Damage** — the same findings before the recovery point in the
+  newest segment, anywhere in an older segment, or a segment with a bad
+  file header, mean bodies that were durable are gone, and the server
+  refuses to start, leaving the files alone. With `--wal-skip-corrupt`
+  it starts with the bodies before the damage and keeps a copy of the
+  segment as `<segment>.corrupt` (or moves it there when its file header
+  is bad). The newest segment is then truncated at the damage, since
+  appends continue there; an older one never is. Jobs whose bodies are
+  lost are reaped as missing-body jobs (below).
 - **Version 1 segments** — read without the header check. A version 1
   newest segment is not appended to; the first write starts a version 2
   segment.
@@ -588,7 +636,8 @@ synchronisation point.
   WAL→missing-body direction *for clean crashes*, but disk corruption,
   manual file removal, and the corruption-drop path in `compact_segment`
   can all leave WAL FullJob records pointing at body ids that no longer
-  exist in the index. On startup, every such job is reaped (logged with
+  exist in the index, or (v9) at a record whose CRC isn't the one the
+  FullJob carries. On startup, every such job is reaped (logged with
   `body_id` / `tube` / `state`, deleted from the live set, and journalled
   as a state-change-delete so the warning doesn't re-fire). The reaped
   count is surfaced as `recovered-missing-bodies` in `stats`. A

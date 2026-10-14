@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::body_store::BodyStore;
+use crate::body_store::DurablePoint;
 use crate::job::{BodyId, BodyRef, Job, JobState};
 
 // --- Constants ---
@@ -38,21 +39,34 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 ///   segment until it expires; compaction carries it forward. An id mark
 ///   opens every segment with the highest job id assigned so far, so ids
 ///   never go backwards when older segments are collected.
-pub const WAL_VERSION: u32 = 8;
+/// - v9: a TOAST mark record names how far the body store was durable at
+///   each fsync (its recovery point), and a `FullJob` referencing a TOAST
+///   body also carries the body's CRC32 (body kind 2). Startup uses the
+///   first to tell a torn TOAST tail from corruption, and the second to
+///   check TOAST holds the body the WAL wrote. See
+///   `docs/toast-recovery-point.md`.
+pub const WAL_VERSION: u32 = 9;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 
 // v6 body_kind discriminant values
 const BODY_KIND_INLINE: u8 = 0x00;
 const BODY_KIND_EXTERNAL: u8 = 0x01;
+const BODY_KIND_EXTERNAL_CRC: u8 = 0x02; // v9
 const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
 const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
 const RECORD_TYPE_TOMBSTONE: u8 = 0x03; // v8
 const RECORD_TYPE_ID_MARK: u8 = 0x04; // v8
+const RECORD_TYPE_TOAST_MARK: u8 = 0x05; // v9
 /// First version with tombstone and id-mark records.
 const WAL_VERSION_TOMBSTONES: u32 = 8;
+/// First version with TOAST marks and body CRCs.
+const WAL_VERSION_TOAST_MARKS: u32 = 9;
 /// Size of an id-mark record: type(1) + high_water(8) + payload_len(4) + crc(4).
 const ID_MARK_RECORD_SIZE: usize = 1 + 8 + 4 + 4;
+/// Size of a TOAST mark record: type(1) + seq(8) + payload_len(4) +
+/// offset(8) + crc(4).
+const TOAST_MARK_RECORD_SIZE: usize = 1 + 8 + 4 + 8 + 4;
 const STATE_CHANGE_PAYLOAD_LEN_V3: u32 = 21;
 const STATE_CHANGE_PAYLOAD_LEN_V4: u32 = 22; // v4: added reason byte
 const STATE_CHANGE_PAYLOAD_LEN_V7: u32 = 30; // v7: added change_epoch_secs (u64)
@@ -185,6 +199,15 @@ impl std::fmt::Display for WalError {
 
 // --- WAL record types ---
 
+/// The format versions of a WAL directory's segments (`Wal::format_versions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatVersions {
+    /// The lowest version of any segment.
+    pub min: u32,
+    /// The newest segment's version: what the last server to start wrote.
+    pub newest: u32,
+}
+
 /// A record that holds a reference on its segment until it is released:
 /// the segment's seq and the record's size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +267,9 @@ pub enum WalRecord {
     IdMark {
         high_water: u64,
     },
+    /// How far the body store was durable when this record was written
+    /// (v9+): the TOAST recovery point.
+    ToastMark(DurablePoint),
 }
 
 // --- Serialization ---
@@ -294,18 +320,28 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
     );
 
     // body — v6: `body_kind` discriminant + variant payload.
-    //   inline   → kind=0x00, then `body_len (u32 LE)` then `len` bytes.
-    //   external → kind=0x01, then `body_id (u64 LE)`.
+    //   inline       → kind=0x00, then `body_len (u32 LE)` then `len` bytes.
+    //   external     → kind=0x01, then `body_id (u64 LE)`.
+    //   external+crc → kind=0x02, then `body_id (u64 LE)`, `crc32 (u32 LE)` (v9).
     if let Some(bytes) = job.body.as_inline_bytes() {
         payload.push(BODY_KIND_INLINE);
         payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         payload.extend_from_slice(bytes);
     } else {
-        let BodyRef::External(id) = &job.body else {
+        let BodyRef::External(id, crc) = &job.body else {
             unreachable!("as_inline_bytes returned None ⇒ External");
         };
-        payload.push(BODY_KIND_EXTERNAL);
-        payload.extend_from_slice(&id.0.to_le_bytes());
+        match crc {
+            Some(crc) => {
+                payload.push(BODY_KIND_EXTERNAL_CRC);
+                payload.extend_from_slice(&id.0.to_le_bytes());
+                payload.extend_from_slice(&crc.to_le_bytes());
+            }
+            None => {
+                payload.push(BODY_KIND_EXTERNAL);
+                payload.extend_from_slice(&id.0.to_le_bytes());
+            }
+        }
     }
 
     // Build full record: type + job_id + payload_len + payload + crc
@@ -383,19 +419,29 @@ pub fn serialize_id_mark(high_water: u64) -> Vec<u8> {
     frame_record(RECORD_TYPE_ID_MARK, high_water, &[])
 }
 
+/// A v9 TOAST mark, carrying the segment seq in the job-id field and the
+/// offset as its payload.
+pub fn serialize_toast_mark(point: DurablePoint) -> Vec<u8> {
+    frame_record(
+        RECORD_TYPE_TOAST_MARK,
+        point.seq,
+        &point.offset.to_le_bytes(),
+    )
+}
+
 /// On-wire size of the v6 body section for a FullJob record.
 /// `body_external == true` selects the BodyId encoding; otherwise the
 /// body rides inline as `len + bytes`.
 fn body_section_bytes(body_len: usize, body_external: bool) -> usize {
     if body_external {
-        1 + 8 // body_kind + BodyId
+        1 + 8 + 4 // body_kind + BodyId + crc32
     } else {
         1 + 4 + body_len // body_kind + body_len + bytes
     }
 }
 
 pub fn estimate_full_job_size(job: &Job) -> usize {
-    let body_external = matches!(job.body, BodyRef::External(_));
+    let body_external = matches!(job.body, BodyRef::External(..));
     estimate_full_job_size_raw(
         &job.tube_name,
         job.idempotency_key().map(|(k, _)| k.as_str()),
@@ -449,6 +495,9 @@ pub fn deserialize_record(data: &[u8], version: u32) -> Result<(WalRecord, usize
         RECORD_TYPE_STATE_CHANGE => deserialize_state_change(data),
         RECORD_TYPE_TOMBSTONE if version >= WAL_VERSION_TOMBSTONES => deserialize_tombstone(data),
         RECORD_TYPE_ID_MARK if version >= WAL_VERSION_TOMBSTONES => deserialize_id_mark(data),
+        RECORD_TYPE_TOAST_MARK if version >= WAL_VERSION_TOAST_MARKS => {
+            deserialize_toast_mark(data)
+        }
         _ => Err(WalError::UnknownRecordType(record_type)),
     }
 }
@@ -507,6 +556,15 @@ fn deserialize_tombstone(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
 fn deserialize_id_mark(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
     let (high_water, _, total_len) = unframe_record(data)?;
     Ok((WalRecord::IdMark { high_water }, total_len))
+}
+
+fn deserialize_toast_mark(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+    let (seq, payload, total_len) = unframe_record(data)?;
+    let offset = u64::from_le_bytes(payload.try_into().map_err(|_| WalError::InvalidData)?);
+    Ok((
+        WalRecord::ToastMark(DurablePoint { seq, offset }),
+        total_len,
+    ))
 }
 
 fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize), WalError> {
@@ -645,13 +703,18 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
             }
             BODY_KIND_EXTERNAL => {
                 let body_id = read_u64!();
-                BodyRef::External(crate::job::BodyId(body_id))
+                BodyRef::External(crate::job::BodyId(body_id), None)
+            }
+            BODY_KIND_EXTERNAL_CRC if version >= WAL_VERSION_TOAST_MARKS => {
+                let body_id = read_u64!();
+                let crc = read_u32!();
+                BodyRef::External(crate::job::BodyId(body_id), Some(crc))
             }
             _ => return Err(WalError::InvalidData),
         }
     } else if version == 5 {
         let body_id = read_u64!();
-        BodyRef::External(crate::job::BodyId(body_id))
+        BodyRef::External(crate::job::BodyId(body_id), None)
     } else {
         let body_len = read_u32!() as usize;
         if off + body_len > payload.len() {
@@ -950,6 +1013,11 @@ pub struct Wal {
     /// body-store fsync so that any `BodyId` referenced by an acked WAL
     /// record is already durable on disk.
     body_store: Option<Arc<BodyStore>>,
+    /// The TOAST recovery point last written (or, at startup, set): how
+    /// far the body store is known durable. `sync` records a newer one
+    /// after each TOAST fsync, and every new segment repeats it after its
+    /// id mark, so GC never takes the last one.
+    toast_mark: Option<DurablePoint>,
     #[allow(dead_code)] // held for flock side effect
     lock_fd: Option<File>,
     #[cfg(test)]
@@ -985,13 +1053,13 @@ impl Wal {
         self.total_disk_bytes
     }
 
-    /// Lowest format version found across all WAL files on disk. `Ok(None)`
-    /// means the WAL directory is empty (no files yet). Reads only the first
-    /// 12 bytes of each file — used at startup to decide whether legacy
-    /// migration is required, before any expensive replay work.
-    pub fn min_format_version(&self) -> io::Result<Option<u32>> {
+    /// Format versions of the WAL files on disk: the lowest, and the newest
+    /// segment's. `Ok(None)` means the WAL directory is empty (no files yet).
+    /// Reads only the first 12 bytes of each file — used at startup to decide
+    /// whether legacy migration is required, before any expensive replay work.
+    pub fn format_versions(&self) -> io::Result<Option<FormatVersions>> {
         use std::io::Read;
-        let mut min: Option<u32> = None;
+        let mut versions: Option<FormatVersions> = None;
         for f in self.files.iter() {
             let mut buf = [0u8; HEADER_SIZE];
             let mut file = match File::open(&f.path) {
@@ -1003,10 +1071,13 @@ impl Wal {
                 continue; // empty/truncated file — replay path will warn
             }
             if let Ok((v, _)) = read_header(&buf) {
-                min = Some(min.map_or(v, |m| m.min(v)));
+                versions = Some(FormatVersions {
+                    min: versions.map_or(v, |vs| vs.min.min(v)),
+                    newest: v,
+                });
             }
         }
-        Ok(min)
+        Ok(versions)
     }
 
     /// Number of job records migrated during compaction.
@@ -1068,6 +1139,7 @@ impl Wal {
             ops_written: 0,
             synced_ops: 0,
             body_store: None,
+            toast_mark: None,
             lock_fd: Some(lock_fd),
             #[cfg(test)]
             sync_count: 0,
@@ -1108,10 +1180,22 @@ impl Wal {
         }
         #[cfg(test)]
         self.injected_failure()?;
-        self.pre_sync_body_store()?;
+        let point = self.pre_sync_body_store()?;
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
+            // Record how far TOAST is now durable, in the batch this fsync
+            // makes durable. Written after the TOAST fsync returned, so a
+            // mark on disk never names bytes a crash could still tear.
+            if let Some(p) = point
+                && point != self.toast_mark
+            {
+                let mark = serialize_toast_mark(p);
+                fd.write_all(&mark)?;
+                f.bytes_written += mark.len();
+                self.total_disk_bytes += mark.len() as u64;
+                self.toast_mark = point;
+            }
             Self::flush_and_fsync(fd)?;
         }
         self.record_sync();
@@ -1126,15 +1210,70 @@ impl Wal {
         self.body_store = Some(bs);
     }
 
+    /// Set the TOAST recovery point that the next segment opens with. At
+    /// startup, the body store's end once it is open
+    /// ([`BodyStore::synced_point`]): it supersedes the mark it was opened
+    /// with, which `--wal-skip-corrupt` may have cut the store short of.
+    pub fn set_toast_mark(&mut self, point: Option<DurablePoint>) {
+        self.toast_mark = point;
+    }
+
+    /// Mark the WAL dirty if the body store's fsyncs have gone past the last
+    /// recorded mark, so the next sync records a new one. Compaction moves
+    /// bodies and fsyncs them with no WAL write of its own; without this an
+    /// idle WAL would leave them past the recovery point indefinitely.
+    pub fn note_toast_progress(&mut self) {
+        if let Some(bs) = &self.body_store
+            && bs.synced_point() > self.toast_mark
+        {
+            self.dirty = true;
+        }
+    }
+
     /// fsync the body store (if attached) so referenced bodies are durable
     /// before we promise the same of any WAL record. The TOAST-then-WAL
     /// order means a crash mid-sync produces orphan bodies (recoverable as
-    /// wasted space) rather than dangling references.
-    fn pre_sync_body_store(&self) -> io::Result<()> {
-        if let Some(bs) = &self.body_store {
-            bs.fsync()?;
+    /// wasted space) rather than dangling references. Returns how far the
+    /// body store is now durable.
+    fn pre_sync_body_store(&self) -> io::Result<Option<DurablePoint>> {
+        match &self.body_store {
+            Some(bs) => Ok(bs.fsync()?),
+            None => Ok(None),
         }
-        Ok(())
+    }
+
+    /// The latest TOAST recovery point the WAL recorded, read before the
+    /// body store is opened so its startup scan can be judged by it. Every
+    /// segment a v9 server creates repeats the latest mark after its id
+    /// mark, so the newest segment whose opening reads has the answer, and
+    /// none in it means there is none: older segments aren't read. One that
+    /// can't be read or parsed is left to [`Wal::replay`] to report, and
+    /// only its records before the damage count. `None` before v9, or with
+    /// no TOAST writes yet.
+    pub fn read_toast_mark(&self) -> Option<DurablePoint> {
+        for f in self.files.iter().rev() {
+            let Ok(data) = fs::read(&f.path) else {
+                continue;
+            };
+            let Ok((version, _)) = read_header(&data) else {
+                continue;
+            };
+            if version < WAL_VERSION_TOAST_MARKS {
+                return None;
+            }
+            let mut latest = None;
+            let mut offset = HEADER_SIZE;
+            while let Ok((record, consumed)) = deserialize_record(&data[offset..], version) {
+                if let WalRecord::ToastMark(point) = record {
+                    latest = Some(point);
+                }
+                offset += consumed;
+            }
+            if latest.is_some() || offset > HEADER_SIZE {
+                return latest;
+            }
+        }
+        None
     }
 
     fn acquire_lock(dir: &Path) -> io::Result<File> {
@@ -1223,8 +1362,14 @@ impl Wal {
         write_header(&mut fd)?;
         // Open with the id high-water mark. GC never removes the newest
         // segment, so the mark survives every older segment being collected,
-        // and replay can't hand out an id twice.
+        // and replay can't hand out an id twice. The TOAST recovery point
+        // follows for the same reason.
         fd.write_all(&serialize_id_mark(self.max_job_id))?;
+        let mut opening_bytes = HEADER_SIZE + ID_MARK_RECORD_SIZE;
+        if let Some(point) = self.toast_mark {
+            fd.write_all(&serialize_toast_mark(point))?;
+            opening_bytes += TOAST_MARK_RECORD_SIZE;
+        }
         // Make the header durable immediately. Without this, a crash any
         // time before the first sync leaves a 0-byte or partial file that
         // the next replay flags as corrupt ("bad header ... quarantined")
@@ -1232,7 +1377,6 @@ impl Wal {
         // then mints one spurious .corrupt sidecar per restart.
         Self::flush_and_fsync(&mut fd)?;
 
-        let opening_bytes = HEADER_SIZE + ID_MARK_RECORD_SIZE;
         self.files.push_back(WalFile {
             seq,
             path,
@@ -1282,8 +1426,11 @@ impl Wal {
     fn rotate_if_needed(&mut self) -> io::Result<()> {
         if self.should_rotate() {
             // Close current file. Sync TOAST first so any BodyId references
-            // about to land in the WAL are already durable.
-            self.pre_sync_body_store()?;
+            // about to land in the WAL are already durable. The next segment
+            // opens with the point that reached.
+            if let Some(point) = self.pre_sync_body_store()? {
+                self.toast_mark = Some(point);
+            }
             if let Some(f) = self.files.back_mut()
                 && let Some(mut fd) = f.fd.take()
             {
@@ -1735,7 +1882,7 @@ impl Wal {
                                             if let Some(old_seq) = old_job.wal_seq() {
                                                 self.decref_file(old_seq, old_job.wal_used as usize);
                                             }
-                                            if let BodyRef::External(body_id) = old_job.body {
+                                            if let BodyRef::External(body_id, _) = old_job.body {
                                                 orphan_bodies.push(body_id);
                                             }
                                         }
@@ -1842,6 +1989,8 @@ impl Wal {
                             WalRecord::IdMark { high_water } => {
                                 max_id = max_id.max(high_water);
                             }
+                            // Read before replay, by `read_toast_mark`.
+                            WalRecord::ToastMark(_) => {}
                         }
                         offset += consumed;
                     }
@@ -2045,9 +2194,9 @@ mod tests {
     /// Switch a test-built job to a synthetic external `BodyRef`. The WAL's
     /// v5 serializer requires `BodyRef::External`; unit tests don't run a
     /// body store, so we fabricate a deterministic id (the job's own id)
-    /// and assert on it where roundtripping matters.
+    /// and CRC, and assert on them where roundtripping matters.
     fn external_body(job: &mut Job) {
-        job.body = BodyRef::External(BodyId(job.id));
+        job.body = BodyRef::External(BodyId(job.id), Some(0xC0FF_EE00));
     }
 
     fn make_test_job(id: u64, _body: &[u8]) -> Job {
@@ -2083,7 +2232,7 @@ mod tests {
             assert_eq!(j.priority, 100);
             assert_eq!(j.delay, Duration::from_secs(5));
             assert_eq!(j.ttr, Duration::from_secs(30));
-            assert!(matches!(&j.body, BodyRef::External(_)));
+            assert!(matches!(&j.body, BodyRef::External(..)));
             assert_eq!(j.tube_name.as_ref(), "test-tube");
             assert_eq!(j.reserve_ct, 3);
             assert_eq!(j.timeout_ct, 1);
@@ -2099,8 +2248,12 @@ mod tests {
             assert_eq!(j.concurrency_key().cloned(), Some(("conc".to_string(), 3)));
             // Reserved replays as Ready
             assert_eq!(j.state, JobState::Delayed); // original was delayed (delay > 0)
-            // v5 round-trip preserves the BodyId reference, not the bytes.
-            assert!(matches!(j.body, BodyRef::External(BodyId(42))));
+            // The round-trip preserves the BodyId reference and the body's
+            // CRC (v9), not the bytes.
+            assert!(matches!(
+                j.body,
+                BodyRef::External(BodyId(42), Some(0xC0FF_EE00))
+            ));
         } else {
             panic!("expected FullJob");
         }
@@ -2757,6 +2910,171 @@ mod tests {
     }
 
     #[test]
+    fn test_v9_records_round_trip_and_v8_segments_refuse_them() {
+        let point = DurablePoint {
+            seq: 3,
+            offset: 4096,
+        };
+        let mark = serialize_toast_mark(point);
+        assert_eq!(mark.len(), TOAST_MARK_RECORD_SIZE);
+        assert!(matches!(
+            deserialize_record(&mark, WAL_VERSION).unwrap(),
+            (WalRecord::ToastMark(p), TOAST_MARK_RECORD_SIZE) if p == point
+        ));
+        assert!(matches!(
+            deserialize_record(&mark, 8),
+            Err(WalError::UnknownRecordType(RECORD_TYPE_TOAST_MARK))
+        ));
+        // A body CRC (kind 2) is v9 only; a v8 record has none (kind 1).
+        assert!(matches!(
+            deserialize_record(&serialize_full_job(&make_test_job(5, b"")), 8),
+            Err(WalError::InvalidData)
+        ));
+        let mut legacy = make_test_job(6, b"");
+        legacy.body = BodyRef::External(BodyId(6), None);
+        match deserialize_record(&serialize_full_job(&legacy), 8).unwrap() {
+            (WalRecord::FullJob(j), _) => {
+                assert!(matches!(j.body, BodyRef::External(BodyId(6), None)))
+            }
+            other => panic!("expected a FullJob, got {other:?}"),
+        }
+    }
+
+    /// A WAL with a body store attached, as the server runs it.
+    fn wal_with_body_store(dir: &Path) -> (Wal, Arc<BodyStore>) {
+        let bs = Arc::new(BodyStore::open(&dir.join("toast"), 4096).unwrap());
+        let mut wal = Wal::open(dir, WalConfig::default()).unwrap();
+        wal.set_body_store(Arc::clone(&bs));
+        (wal, bs)
+    }
+
+    /// Put job `id` with a 300-byte TOAST body.
+    fn put_with_toast_body(wal: &mut Wal, bs: &BodyStore, id: u64) -> Job {
+        let (body_id, crc) = bs.write_body_with_crc(&[id as u8; 300]).unwrap();
+        let mut job = make_test_job(id, b"");
+        job.body = BodyRef::External(body_id, Some(crc));
+        wal.write_put(&mut job).unwrap();
+        job
+    }
+
+    #[test]
+    fn test_sync_records_how_far_toast_was_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut wal, bs) = wal_with_body_store(dir.path());
+        put_with_toast_body(&mut wal, &bs, 1);
+        wal.sync().unwrap();
+        let first = bs.synced_point();
+        assert!(first.is_some());
+        assert_eq!(wal.read_toast_mark(), first);
+
+        put_with_toast_body(&mut wal, &bs, 2);
+        wal.sync().unwrap();
+        assert!(bs.synced_point() > first);
+        assert_eq!(
+            wal.read_toast_mark(),
+            bs.synced_point(),
+            "the latest mark wins"
+        );
+    }
+
+    #[test]
+    fn test_toast_fsyncs_without_a_wal_write_still_get_a_mark() {
+        // Compaction appends the bodies it moves and fsyncs them, but writes
+        // nothing to the WAL, so an idle WAL never synced again and left
+        // them past the recovery point.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut wal, bs) = wal_with_body_store(dir.path());
+        put_with_toast_body(&mut wal, &bs, 1);
+        wal.sync().unwrap();
+        bs.write_body(&[7; 300]).unwrap();
+        bs.fsync().unwrap();
+        assert!(!wal.is_dirty());
+
+        wal.note_toast_progress();
+        assert!(wal.is_dirty());
+        wal.sync().unwrap();
+        assert_eq!(wal.read_toast_mark(), bs.synced_point());
+    }
+
+    #[test]
+    fn test_toast_mark_survives_older_segments_being_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let point = {
+            let (mut wal, bs) = wal_with_body_store(dir.path());
+            let mut job = put_with_toast_body(&mut wal, &bs, 1);
+            wal.write_state_change(
+                &mut job,
+                None,
+                0,
+                Duration::ZERO,
+                0,
+                StateChangeReason::None,
+            )
+            .unwrap();
+            wal.sync().unwrap();
+            bs.synced_point()
+        };
+        {
+            // As startup does: the new segment replay opens repeats the mark.
+            let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+            wal.set_toast_mark(wal.read_toast_mark());
+            wal.replay().unwrap();
+            wal.gc();
+            assert_eq!(wal.file_count(), 1, "only the new segment is left");
+        }
+        let wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        assert_eq!(wal.read_toast_mark(), point);
+    }
+
+    /// Job 1 with a TOAST body, synced so its segment holds a mark; then a
+    /// restart whose new segment opens with `opening_mark`. The point the
+    /// first sync reached, and the new segment's path.
+    fn restart_with_toast_mark(
+        dir: &Path,
+        opening_mark: impl FnOnce(&Wal) -> Option<DurablePoint>,
+    ) -> (Option<DurablePoint>, PathBuf) {
+        let point = {
+            let (mut wal, bs) = wal_with_body_store(dir);
+            put_with_toast_body(&mut wal, &bs, 1);
+            wal.sync().unwrap();
+            bs.synced_point()
+        };
+        assert!(point.is_some());
+        let mut wal = Wal::open(dir, WalConfig::default()).unwrap();
+        wal.set_toast_mark(opening_mark(&wal));
+        wal.replay().unwrap();
+        wal.sync().unwrap();
+        assert_eq!(wal.file_count(), 2, "job 1 keeps the first segment");
+        (point, wal.files.back().unwrap().path.clone())
+    }
+
+    #[test]
+    fn test_read_toast_mark_stops_at_the_newest_segment() {
+        // Every segment opens with the mark current when it was made, so a
+        // newest segment without one means there is none: as at a start
+        // that found the body store empty. Looking further read the whole
+        // WAL, and a store whose bodies all stay inline never has a mark.
+        let dir = tempfile::tempdir().unwrap();
+        restart_with_toast_mark(dir.path(), |_| None);
+
+        let wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        assert_eq!(wal.read_toast_mark(), None);
+    }
+
+    #[test]
+    fn test_read_toast_mark_looks_past_a_newest_segment_damaged_at_its_start() {
+        // Its opening records don't read, so they can't say there's no mark.
+        let dir = tempfile::tempdir().unwrap();
+        let (point, newest) = restart_with_toast_mark(dir.path(), |wal| wal.read_toast_mark());
+        let mut data = fs::read(&newest).unwrap();
+        data[HEADER_SIZE + ID_MARK_RECORD_SIZE - 1] ^= 0xFF;
+        fs::write(&newest, &data).unwrap();
+
+        let wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        assert_eq!(wal.read_toast_mark(), point);
+    }
+
+    #[test]
     fn test_replay_refuses_truncated_older_segment() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
@@ -3377,7 +3695,7 @@ mod tests {
             assert!(jobs.contains_key(&2));
             let j2 = &jobs[&2];
             assert_eq!(j2.priority, 20);
-            assert!(matches!(&j2.body, BodyRef::External(_)));
+            assert!(matches!(&j2.body, BodyRef::External(..)));
             assert_eq!(j2.tube_name.as_ref(), "other");
             assert_eq!(j2.state, JobState::Delayed);
             assert!(next_id >= 3);
@@ -3732,7 +4050,7 @@ mod tests {
             assert!(jobs.contains_key(&1), "job 1 must survive replay after GC");
             let job = jobs.get(&1).unwrap();
             assert_eq!(job.state, JobState::Buried);
-            assert!(matches!(&job.body, BodyRef::External(_)));
+            assert!(matches!(&job.body, BodyRef::External(..)));
         }
     }
 
@@ -4127,7 +4445,7 @@ mod tests {
         .unwrap();
         let (jobs, _, _, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1), "job should survive buffered replay");
-        assert!(matches!(&jobs[&1].body, BodyRef::External(_)));
+        assert!(matches!(&jobs[&1].body, BodyRef::External(..)));
     }
 
     #[test]
