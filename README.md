@@ -291,6 +291,8 @@ Up to 3 `con:api` jobs can be reserved simultaneously. `con:key` (no `:N`) defau
 
 If jobs sharing a key declare different limits, the strictest wins: the key's limit is the smallest declared by any of its ready or reserved jobs. So a job that asked for one at a time never runs beside another, and after a deploy raises a key's limit, it takes effect once the jobs declaring the old one are done. A delayed job tightens the limit once it's due, an `aft:` job once its group completes, and a buried one once it's kicked.
 
+**A key is shared across tubes, so give it one limit everywhere.** A single plain `con:k` job, put from any tube or app, holds every `con:k` job to one at a time for as long as it's ready or reserved, including while its tube is paused.
+
 Burying or releasing-with-delay a job frees its concurrency slot immediately — the slot is only held while the job is reserved. Delayed jobs don't occupy a slot until they become ready and are reserved. Use `stats-job <id>` to check a job's current state if reserves are unexpectedly blocked.
 
 ### Recurring Schedules
@@ -341,6 +343,8 @@ reserve-batch 5
 ```
 
 The response starts with `RESERVED_BATCH <count>`, followed by standard `RESERVED <id> <bytes>\r\n<body>\r\n` entries for each job. If no jobs are available, `RESERVED_BATCH 0` is returned.
+
+To wait rather than poll, add a timeout in seconds: `reserve-batch 5 30` waits while nothing is ready, replies as soon as a job arrives with whatever is ready by then, and replies `RESERVED_BATCH 0` after 30 seconds. While it waits it can be answered `DEADLINE_SOON`, as `reserve-with-timeout` can. Every job's TTR starts when the batch is reserved, so send `touch-all` while working through one.
 
 #### delete-batch
 
@@ -728,13 +732,14 @@ All commands are `\r\n`-terminated. `<id>` is a 64-bit job ID, `<pri>` is a 32-b
 | `reserve\r\n` | Block until a job is available. Returns `RESERVED <id> <bytes>\r\n<body>`. |
 | `reserve-with-timeout <seconds>\r\n` | Like `reserve` but times out. Returns `RESERVED …` or `TIMED_OUT`. |
 | `reserve-job <id>\r\n` | Reserve a specific job by ID. Returns `RESERVED …` or `NOT_FOUND`. |
-| **+** `reserve-batch <count>\r\n` | Reserve up to `<count>` jobs at once (1–1000). Non-blocking — returns whatever is available. See [Batch Operations](#batch-operations). |
+| **+** `reserve-batch <count> [timeout]\r\n` | Reserve up to `<count>` jobs at once (1–1000). Without a timeout, returns whatever is available at once; with one, waits for the first job. See [Batch Operations](#batch-operations). |
 | **+** `reserve-mode <mode>\r\n` | Set reserve strategy: `fifo` (priority-first, the default), `weighted` (random by tube weight), or `weighted-fair` (adjusted for processing time). See [Weighted Reserve](#weighted-reserve). |
 | `delete <id>\r\n` | Delete a job. Returns `DELETED` or `NOT_FOUND`. |
 | **+** `delete-batch <id> …\r\n` | Delete multiple jobs by ID (1–1000, space-separated). Returns `DELETED_BATCH <deleted> <not_found>`. See [Batch Operations](#batch-operations). |
 | `release <id> <pri> <delay>\r\n` | Release a reserved job back to ready (or delayed). Returns `RELEASED`. |
 | `bury <id> <pri>\r\n` | Bury a reserved job. Returns `BURIED`. |
 | `touch <id>\r\n` | Reset the TTR timer on a reserved job. Returns `TOUCHED`. |
+| **+** `touch-all\r\n` | Reset the TTR timer on every job the connection has reserved. Returns `TOUCHED_ALL <n>`, the number still held. |
 | `watch <tube> [weight]\r\n` | Add a tube to the watch list. Optional **+** weight for weighted mode. Returns `WATCHING <count>`. |
 | `ignore <tube>\r\n` | Remove a tube from the watch list. Returns `WATCHING <count>` or `NOT_IGNORED`. |
 
@@ -759,6 +764,7 @@ See [Recurring Schedules](#recurring-schedules) and [docs/protocol.md](docs/prot
 | `peek-ready\r\n` | Peek at the next ready job in the used tube. |
 | `peek-delayed\r\n` | Peek at the next delayed job in the used tube. |
 | `peek-buried\r\n` | Peek at the next buried job in the used tube. |
+| **+** `peek-reserved\r\n` | Peek at the oldest reserved job in the used tube. |
 
 ### Admin commands
 

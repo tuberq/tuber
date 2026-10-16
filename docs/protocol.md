@@ -21,7 +21,9 @@ Optional extension tags (space-separated, after `<bytes>`):
 Responses:
 - `INSERTED <id>\r\n` — new job created
 - `INSERTED <id> <STATE>\r\n` — idempotency dedup hit (STATE is `READY`, `RESERVED`, `DELAYED`, `BURIED`, or `DELETED`)
-- `BURIED <id>\r\n` (out of memory)
+- `INSERTED <id> <STATE> <pri>\r\n` — a dedup hit that raised the existing job's priority to `<pri>` (a put can raise it, never lower it)
+- `OUT_OF_MEMORY\r\n` — the in-memory job budget (`--max-jobs-size`) is full. Nothing is stored.
+- `OUT_OF_STORAGE\r\n` — the disk budget (`--max-storage-bytes`, with `-b`) is full. Nothing is stored.
 - `EXPECTED_CRLF\r\n` (body not terminated correctly — **closes the connection**, see below)
 - `JOB_TOO_BIG\r\n`
 - `DRAINING\r\n`
@@ -78,6 +80,14 @@ Responses:
 - `RESERVED <id> <bytes>\r\n<body>\r\n`
 - `TIMED_OUT\r\n`
 - `DEADLINE_SOON\r\n` — the connection has a reserved job whose TTR is about to expire (see below).
+- `INTERNAL_ERROR\r\n` (`-b`), for one of two reasons:
+  - The job's body couldn't be read from the body store, or isn't the body
+    the WAL wrote. The job is buried, so the next reserve moves on to
+    another; `peek-buried` and `kick` reach it.
+  - In strict mode (`--sync-interval 0`), the WAL fsync failed. The job stays
+    reserved to this connection, though its id wasn't sent, and goes back to
+    ready when its TTR runs out or the connection closes. Puts are refused
+    from then until restart.
 
 ### reserve-job \<id\>\r\n
 
@@ -86,12 +96,44 @@ Reserve a specific job by ID (regardless of tube).
 Responses:
 - `RESERVED <id> <bytes>\r\n<body>\r\n`
 - `NOT_FOUND\r\n`
+- `INTERNAL_ERROR\r\n` — as for `reserve`, except that a job whose body
+  can't be read stays where it was.
+
+### reserve-batch \<count\> [timeout]\r\n
+
+Reserve up to `<count>` ready jobs (1–1000) from watched tubes at once.
+Without `timeout`, or with `0`, it replies at once with whatever is ready,
+possibly nothing. With a positive `timeout` (seconds) it waits while nothing
+is ready, then replies with whatever is ready, up to `<count>`, as soon as a
+job arrives, or with nothing once the timeout runs out. Use the timeout form
+rather than polling in a loop.
+
+Responses:
+- `RESERVED_BATCH <n>\r\n`, then `<n>` blocks of
+  `RESERVED <id> <bytes>\r\n<body>\r\n`. `<n>` can be 0.
+- `DEADLINE_SOON\r\n` — only while waiting with a positive timeout, as for
+  `reserve-with-timeout` (see below). It interrupts the wait to service a job
+  already reserved; it isn't an answer to this command.
+- `INTERNAL_ERROR\r\n` — as for `reserve`, when no job was reserved. A job
+  whose body can't be read is buried; if jobs were already collected, the
+  batch stops there and returns them.
+- `BAD_FORMAT\r\n` — `<count>` outside 1–1000.
+
+Each job's TTR starts when the batch is reserved, so a worker that handles
+them one after another should send `touch-all` as it goes.
 
 ### delete \<id\>\r\n
 
 Delete a job.
 
 Response: `DELETED\r\n` or `NOT_FOUND\r\n`
+
+### delete-batch \<id\> ...\r\n
+
+Delete up to 1000 jobs by ID, space-separated.
+
+Response: `DELETED_BATCH <deleted> <not_found>\r\n`, or `BAD_FORMAT\r\n`
+for no IDs, more than 1000, or one that isn't a number.
 
 ### release \<id\> \<pri\> \<delay\>\r\n
 
@@ -110,6 +152,14 @@ Response: `BURIED\r\n` or `NOT_FOUND\r\n`
 Reset the TTR timer on a reserved job.
 
 Response: `TOUCHED\r\n` or `NOT_FOUND\r\n`
+
+### touch-all\r\n
+
+Reset the TTR timer on every job this connection has reserved, each by its
+own TTR. The heartbeat for `reserve-batch` workers.
+
+Response: `TOUCHED_ALL <n>\r\n`, the number of jobs still reserved. Fewer
+than expected means some ran out their TTR and went back to the queue.
 
 ### watch \<tube\> [weight]\r\n
 
@@ -233,9 +283,13 @@ Response: `OK <bytes>\r\n<yaml>\r\n` or `NOT_FOUND\r\n`. Fields are in
 
 ## Other Commands
 
-### peek \<id\>\r\n / peek-ready\r\n / peek-delayed\r\n / peek-buried\r\n
+### peek \<id\>\r\n / peek-ready\r\n / peek-delayed\r\n / peek-buried\r\n / peek-reserved\r\n
 
-Response: `FOUND <id> <bytes>\r\n<body>\r\n` or `NOT_FOUND\r\n`
+The `peek-*` forms look in the `use` tube. `peek-reserved` finds its oldest
+reserved job.
+
+Response: `FOUND <id> <bytes>\r\n<body>\r\n` or `NOT_FOUND\r\n`, or
+`INTERNAL_ERROR\r\n` (`-b`) when the job's body can't be read.
 
 ### kick \<bound\>\r\n
 

@@ -121,8 +121,9 @@ a client actually sent one, which in practice means development.
 
 ## Deployment invariants
 
-Both are properties of the deployment, not of the code. Tuber cannot enforce
-either, which is why they are stated here rather than left implied.
+All three are properties of the deployment, not of the code. Tuber cannot
+enforce any of them, which is why they are stated here rather than left
+implied.
 
 ### 1. Tuber's upgrade listener must be unreachable except through the proxy
 
@@ -138,7 +139,8 @@ $ (direct to the upgrade listener, no proxy)
   WHOAMI root groups=admin
 ```
 
-Bind to `127.0.0.1` or a unix socket. Never to `0.0.0.0`.
+Bind to `127.0.0.1` or a unix socket. Never to `0.0.0.0`. Loopback still
+admits every process on the host; see [Open questions *(tuber)*](#open-questions-tuber).
 
 ### 2. The proxy's site block must be host-matched
 
@@ -154,6 +156,17 @@ Under a catch-all, the identity provider resolves its application — and
 therefore its access rules — from a string the client chose, while the proxy
 still routes to tuber. Authorization gets evaluated against one application and
 access granted to another. Always name the host.
+
+### 3. The proxy must strip client-sent `Remote-*` headers
+
+Tuber can't tell a `Remote-User` the auth service set from one the client
+sent. Caddy's `copy_headers` handles both cases (rows 6 and 7 under
+[Verified behaviour](#verified-behaviour)): it overwrites a forged header with
+the authenticated identity, and deletes it when the auth service sets none.
+That is Caddy's behaviour, not something forward auth guarantees, and another
+proxy may pass a client's `Remote-User` through when the auth service sets
+none. With any other proxy, strip every `Remote-*` request header before the
+auth check, and rerun the row 7 test against it.
 
 ## Caddyfile
 
@@ -312,6 +325,43 @@ must redact `Authorization`.
 *even with `auto_https off`*, answering plain HTTP with `400 Client sent an
 HTTP request to an HTTPS server`. The site address needs an explicit `http://`
 prefix.
+
+## Open questions *(tuber)*
+
+1. **Loopback trusts every local process.** Invariant 1 keeps the network
+   out, but anything on the host can connect to `127.0.0.1` and send its own
+   `Remote-User`: another user's process, or an SSRF in a web app on the same
+   host that can be made to send headers. Two ways to close it:
+   - **A unix socket** whose file mode admits only the proxy's user. Local
+     processes are kept out by the kernel, and an HTTP SSRF can't reach a
+     socket path. It needs the proxy on the same host.
+   - **A shared secret** the proxy adds to every upstream request
+     (`header_up`), which tuber checks before trusting any `Remote-*` header.
+     It works across hosts, but the secret is one more thing to rotate, and it
+     sits in the proxy's config.
+
+   The plain listener (`-l/-p`) has no auth at all, so on a host where it is
+   on loopback this changes nothing until identities gate something the plain
+   listener can't do. Leaning: a unix socket by default, the secret for a
+   proxy on another host.
+
+2. **Revocation doesn't reach open connections.** Identity is checked once,
+   at the upgrade. A worker connected before its key was revoked keeps that
+   identity until it reconnects, which for a long-lived worker can be weeks.
+   Options:
+   - A maximum age for an upgraded connection, after which tuber closes it
+     and the client reconnects through the proxy. It bounds how long a
+     revoked identity lasts, and tuber needs to know nothing about clinch.
+     A worker holding a reservation loses it at the close, as on any
+     disconnect, so the age wants to be long (hours) and jittered.
+   - Re-verifying each connection with the auth service now and then. Tuber
+     would have to call clinch, which this design avoids.
+   - An admin command that closes every connection with a given identity, run
+     as part of revoking. Immediate, but it relies on someone remembering it.
+
+   Leaning: the maximum age, plus the admin command for when hours is too
+   long. Without either, the operator docs must say that revoking a key
+   takes effect only once the workers using it reconnect.
 
 ## Open questions *(clinch)*
 

@@ -3825,10 +3825,10 @@ impl ServerState {
     /// fewer than `count`, possibly empty), plus a terminal `INTERNAL_ERROR`
     /// when draining stopped because a body-store read failed rather than
     /// because the queue ran dry. The error is only meaningful when no jobs
-    /// were collected: with a non-empty batch the failed job simply stays
-    /// ready (do_reserve materialises the body before dequeuing) and resurfaces
-    /// on a later reserve, just as for single `reserve`. Shared by the
-    /// non-blocking `reserve-batch` path and blocking batch-waiter fulfilment.
+    /// were collected: with a non-empty batch the failed job is buried
+    /// (do_reserve does that, as for single `reserve`) and the batch returns
+    /// what it has. Shared by the non-blocking `reserve-batch` path and
+    /// blocking batch-waiter fulfilment.
     fn collect_batch(&mut self, conn_id: u64, count: u32) -> (Vec<(u64, Vec<u8>)>, Option<Response>) {
         let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
         for _ in 0..count {
