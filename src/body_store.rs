@@ -247,9 +247,10 @@ impl BodyStore {
     /// scan truncates that quietly. Any other damage, such as a body header
     /// failing its CRC or a length running past the end of an older segment,
     /// is an error unless `skip_corrupt` (`--wal-skip-corrupt`) is set. Then
-    /// the bodies before the damage are used and a copy of the segment is
-    /// kept as `.corrupt`, or a segment with no usable file header is moved
-    /// there.
+    /// the bodies before the damage are used, a copy of the segment is kept
+    /// as `.corrupt` and the segment is cut at the damage, or a segment with
+    /// no usable file header is moved there. Either way a later start
+    /// doesn't need the flag again.
     pub fn open_with_skip_corrupt(
         dir: &Path,
         segment_size: u64,
@@ -313,10 +314,16 @@ impl BodyStore {
             // Where a crash could have cut this segment short: nowhere in an
             // older one, and in the newest from the recovery point on — all
             // of it when there is none, or the point is in an older segment.
-            let torn_from = newest.then_some(match recovery_point {
-                Some(p) if p.seq == *seq => p.offset,
-                _ => 0,
-            });
+            // Nowhere either when the point is in a later segment, since
+            // deleted: an old-format newest segment takes no new bodies, so
+            // the compactor deletes it once its own are dead, and the one
+            // left newest was sealed before it.
+            let torn_from = match recovery_point {
+                _ if !newest => None,
+                Some(p) if p.seq > *seq => None,
+                Some(p) if p.seq == *seq => Some(p.offset),
+                _ => Some(0),
+            };
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let scan = scan_segment(&mut file, torn_from)?;
             if let Some(damage) = &scan.damage {
@@ -324,7 +331,7 @@ impl BodyStore {
                     let why = if !newest {
                         "It is not the newest segment, so this is not a write cut short by a \
                          crash: its bodies were fsynced. "
-                    } else if torn_from.is_some_and(|t| t > 0) {
+                    } else if torn_from.is_none_or(|t| t > 0) {
                         "It is before the TOAST recovery point the WAL recorded, so this is \
                          not a write cut short by a crash: those bodies were fsynced. "
                     } else {
@@ -351,26 +358,35 @@ impl BodyStore {
                     }
                     continue;
                 }
-                match fs::copy(&path, &aside) {
-                    Ok(_) => tracing::error!(
-                        "TOAST: segment {:?} {}; using the bodies before it, copy kept as {:?} \
-                         (--wal-skip-corrupt)",
-                        path,
-                        damage.what,
-                        aside,
-                    ),
-                    Err(e) => tracing::error!(
-                        "TOAST: segment {:?} {}; using the bodies before it, failed to keep a \
-                         copy: {}",
-                        path,
-                        damage.what,
-                        e,
-                    ),
-                }
-                // Appends continue in the newest segment, so cut it at the
-                // damage: stray bytes left past a new record could later
-                // scan as a phantom body. An older segment is never cut.
-                if newest {
+                let kept = match fs::copy(&path, &aside) {
+                    Ok(_) => {
+                        tracing::error!(
+                            "TOAST: segment {:?} {}; using the bodies before it, copy kept as \
+                             {:?} (--wal-skip-corrupt)",
+                            path,
+                            damage.what,
+                            aside,
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "TOAST: segment {:?} {}; using the bodies before it, failed to keep \
+                             a copy: {}",
+                            path,
+                            damage.what,
+                            e,
+                        );
+                        false
+                    }
+                };
+                // Cut the segment at the damage, so a later start finds it
+                // whole and doesn't need the flag again. An older one only
+                // once the copy is kept, since the bodies past the damage
+                // may still be recoverable from it. The newest regardless:
+                // appends continue there, and stray bytes left past a new
+                // record could later scan as a phantom body.
+                if newest || kept {
                     file.set_len(scan.consumed)?;
                     file.sync_data()?;
                 }
@@ -1953,13 +1969,36 @@ mod tests {
             Err(BodyStoreError::NotFound(_))
         ));
         assert_eq!(bs.read_body(ids[3]).unwrap(), vec![3; 40]);
+        drop(bs);
+
+        // A later start doesn't need the flag.
+        let bs = BodyStore::open(tmp.path(), 200).unwrap();
+        assert_eq!(bs.read_body(ids[0]).unwrap(), vec![0; 40]);
+        assert_eq!(bs.read_body(ids[3]).unwrap(), vec![3; 40]);
         let seg0 = segment_path(tmp.path(), 0);
-        assert_eq!(
-            fs::read(&seg0).unwrap(),
-            damaged,
-            "an older segment is never truncated"
+        assert!(
+            fs::read(&seg0).unwrap() == damaged[..header_offset(1) as usize],
+            "cut at the damage"
         );
-        assert_eq!(fs::read(corrupt_copy_path(&seg0)).unwrap(), damaged);
+        assert!(
+            fs::read(corrupt_copy_path(&seg0)).unwrap() == damaged,
+            "the copy is whole"
+        );
+    }
+
+    #[test]
+    fn test_open_skip_corrupt_leaves_an_older_segment_whole_without_a_copy() {
+        // The bodies past the damage may still be recoverable, and with no
+        // copy kept the segment is the only place they are.
+        let tmp = TempDir::new().unwrap();
+        let ids = store_with_older_segment(tmp.path());
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+        let seg0 = segment_path(tmp.path(), 0);
+        fs::create_dir(corrupt_copy_path(&seg0)).unwrap();
+
+        let bs = BodyStore::open_with_skip_corrupt(tmp.path(), 200, true).unwrap();
+        assert_eq!(bs.read_body(ids[0]).unwrap(), vec![0; 40]);
+        assert!(fs::read(&seg0).unwrap() == damaged, "left whole");
     }
 
     #[test]
@@ -2011,6 +2050,31 @@ mod tests {
         assert!(msg.contains("recovery point"), "{msg}");
         assert!(msg.contains("--wal-skip-corrupt"), "{msg}");
         assert_eq!(fs::read(segment_path(tmp.path(), 0)).unwrap(), damaged);
+    }
+
+    #[test]
+    fn test_open_refuses_damage_in_a_newest_segment_sealed_before_the_recovery_point() {
+        // The segment holding the recovery point is gone: an old-format
+        // newest segment takes no new bodies, so the compactor deletes it
+        // once its own are dead. The one left newest was sealed before it.
+        let tmp = TempDir::new().unwrap();
+        store_with_older_segment(tmp.path());
+        fs::remove_file(segment_path(tmp.path(), 1)).unwrap();
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+        let point = DurablePoint {
+            seq: 1,
+            offset: header_offset(1),
+        };
+
+        let msg = match open_at(tmp.path(), Some(point)) {
+            Ok(_) => panic!("open took damage in a sealed segment for a torn write"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("recovery point"), "{msg}");
+        assert!(
+            fs::read(segment_path(tmp.path(), 0)).unwrap() == damaged,
+            "left as found"
+        );
     }
 
     #[test]

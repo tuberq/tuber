@@ -392,7 +392,8 @@ names the segment and the damage, and nothing on disk is changed. Restore the WA
 directory from a backup, or start with `--wal-skip-corrupt` (env
 `TUBER_WAL_SKIP_CORRUPT`) to replay what remains. A segment with a bad
 header or a read error is then renamed to `<segment>.corrupt`, and one
-with a corrupt record is copied there and truncated at the bad offset.
+with a corrupt record is copied there and truncated at the bad offset, so
+a later start doesn't need the flag again.
 
 ## Durability
 
@@ -604,7 +605,8 @@ synchronisation point.
   creating the next, and fsyncs the new segment's file header, so that
   is in the newest segment, and from the WAL's TOAST recovery point on
   (its latest ToastMark; all of the newest segment without one, as
-  before WAL v9). There, `BodyStore::open` stops at the first partial
+  before WAL v9, and none of it when the mark names a later segment,
+  since deleted). There, `BodyStore::open` stops at the first partial
   record, failed header CRC or length running past the end of the file,
   and truncates the segment at it. The next write resumes at that point.
 
@@ -618,9 +620,11 @@ synchronisation point.
   refuses to start, leaving the files alone. With `--wal-skip-corrupt`
   it starts with the bodies before the damage and keeps a copy of the
   segment as `<segment>.corrupt` (or moves it there when its file header
-  is bad). The newest segment is then truncated at the damage, since
-  appends continue there; an older one never is. Jobs whose bodies are
-  lost are reaped as missing-body jobs (below).
+  is bad). The segment is then truncated at the damage, so a later
+  start doesn't need the flag again: the newest regardless, since appends
+  continue there, and an older one only once the copy is kept, since the
+  bodies past the damage may still be recoverable from it. Jobs whose
+  bodies are lost are reaped as missing-body jobs (below).
 - **Version 1 segments** — read without the header check. A version 1
   newest segment is not appended to; the first write starts a version 2
   segment.

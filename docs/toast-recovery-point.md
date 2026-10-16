@@ -43,15 +43,21 @@ is opened. Then:
 
 - Damage in the newest TOAST segment **before** the mark is corruption. It
   is handled like damage in an older segment: refuse to start, or with
-  `--wal-skip-corrupt` keep a `.corrupt` copy and carry on with the bodies
-  before it.
+  `--wal-skip-corrupt` keep a `.corrupt` copy, cut the segment at the
+  damage and carry on with the bodies before it.
 - Damage **after** the mark is a torn tail and is truncated quietly, as
   before.
-- A newest segment shorter than the mark, or older than the mark's segment,
-  lost bodies the WAL vouched for, but what is left isn't damaged. Startup
-  carries on, and replay reaps each job whose body is missing, logged as
-  lost data and counted in `recovered-missing-bodies`, as for a body lost
-  any other way. Refusing instead is left open.
+- A newest segment shorter than the mark lost bodies the WAL vouched for,
+  but what is left isn't damaged. Startup carries on, and replay reaps
+  each job whose body is missing, logged as lost data and counted in
+  `recovered-missing-bodies`, as for a body lost any other way. Refusing
+  instead is left open.
+- A newest segment older than the mark's segment: the mark's segment is
+  gone. Usually the compactor deleted it, since an old-format newest
+  segment takes no new bodies and is emptied once its own are dead;
+  otherwise it was lost. Either way the segment now newest was sealed
+  before the mark's segment was created, so none of it can be torn, and
+  damage anywhere in it is handled like damage in an older segment.
 - No mark (a WAL from before v9, or an empty one): the old rule, truncate.
 
 A mark can lag safely. A stale one only widens the stretch treated as

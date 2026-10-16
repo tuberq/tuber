@@ -2058,57 +2058,21 @@ async fn test_server_refuses_to_start_on_a_damaged_older_wal_segment() {
 async fn test_wal_skip_corrupt_starts_on_a_damaged_older_segment() {
     // The override replays what remains and keeps the damaged segment. Its
     // cost shows: job 1's delete was in the damaged record, so job 1 is back.
+    // The damage is cut away, so a later start doesn't need the flag.
     let dir = tempfile::tempdir().unwrap();
     write_wal_one_record_per_segment(dir.path());
     let seg = corrupt_wal_segment(dir.path(), 3);
 
-    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = tmp_listener.local_addr().unwrap().port();
-    drop(tmp_listener);
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tuber"))
-        .args(["server", "-l", "127.0.0.1", "-p", &port.to_string()])
-        .args([
-            "-b",
-            dir.path().to_str().unwrap(),
-            "--max-storage-bytes",
-            "1g",
-        ])
-        .arg("--wal-skip-corrupt")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("failed to start tuber subprocess");
-
-    let mut stream = None;
-    for _ in 0..40 {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let mut c = BufReader::new(stream.expect("the server never started listening"));
-    let mut found = Vec::new();
-    for id in 1..=3 {
-        c.get_mut()
-            .write_all(format!("peek {id}\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut line = String::new();
-        c.read_line(&mut line).await.unwrap();
-        if line.starts_with("FOUND") {
-            let mut body = String::new();
-            c.read_line(&mut body).await.unwrap();
-            found.push(id);
-        }
-    }
-    child.kill().await.unwrap();
-
-    assert_eq!(found, vec![1, 2, 3]);
+    let found = peek_ten(dir.path(), &["--wal-skip-corrupt"]).await;
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
     let mut sidecar = seg.into_os_string();
     sidecar.push(".corrupt");
     assert!(Path::new(&sidecar).exists(), "the damaged segment is kept");
+
+    let found = peek_ten(dir.path(), &[]).await;
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
 }
 
 /// Put ten jobs with 300-byte bodies (so they go to TOAST) and shut down
@@ -2135,14 +2099,20 @@ async fn ten_toast_jobs(dir: &Path) -> PathBuf {
 }
 
 /// [`ten_toast_jobs`], then make TOAST segment 0 an older segment by adding
-/// an empty newer one. Returns the path of segment 0.
-async fn ten_toast_jobs_in_an_older_segment(dir: &Path) -> PathBuf {
+/// an empty newer one in format `version`. Returns the path of segment 0.
+async fn ten_toast_jobs_then_an_empty_segment(dir: &Path, version: u32) -> PathBuf {
     let seg = ten_toast_jobs(dir).await;
     let mut header = Vec::from(*b"TBOD");
-    header.extend_from_slice(&1u32.to_le_bytes());
+    header.extend_from_slice(&version.to_le_bytes());
     header.extend_from_slice(&0u64.to_le_bytes());
     std::fs::write(dir.join("toast").join("body.000001"), header).unwrap();
     seg
+}
+
+/// [`ten_toast_jobs_then_an_empty_segment`] in the current format, so new
+/// bodies go to the newer segment and it stays.
+async fn ten_toast_jobs_in_an_older_segment(dir: &Path) -> PathBuf {
+    ten_toast_jobs_then_an_empty_segment(dir, 2).await
 }
 
 /// Offset of body `n`'s (0-based) record header in a segment of 300-byte
@@ -2367,8 +2337,8 @@ async fn test_server_refuses_to_start_on_a_damaged_older_toast_segment() {
 #[tokio::test]
 async fn test_wal_skip_corrupt_starts_on_a_damaged_older_toast_segment() {
     // The override starts without the bodies from the damage on, keeping a
-    // copy of the segment and leaving it untruncated. Its cost shows: the
-    // jobs whose bodies are gone are dropped at startup.
+    // copy of the segment. Its cost shows: the jobs whose bodies are gone
+    // are dropped at startup.
     let dir = tempfile::tempdir().unwrap();
     let seg = ten_toast_jobs_in_an_older_segment(dir.path()).await;
     let len_field = 16 + 2 * (20 + 300) + 8;
@@ -2376,58 +2346,77 @@ async fn test_wal_skip_corrupt_starts_on_a_damaged_older_toast_segment() {
     data[len_field..len_field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     std::fs::write(&seg, &data).unwrap();
 
-    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = tmp_listener.local_addr().unwrap().port();
-    drop(tmp_listener);
+    let found = peek_ten(dir.path(), &["--wal-skip-corrupt"]).await;
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2]);
+
+    // The segment is cut at the damage, so a later start doesn't need the
+    // flag.
+    let found = peek_ten(dir.path(), &[]).await;
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert!(
+        std::fs::read(&seg).unwrap() == data[..len_field - 8],
+        "cut at the damage"
+    );
+    let mut copy = seg.into_os_string();
+    copy.push(".corrupt");
+    assert!(std::fs::read(copy).unwrap() == data, "the copy is whole");
+}
+
+#[tokio::test]
+async fn test_server_refuses_damage_in_a_newest_toast_segment_sealed_before_the_recovery_point() {
+    // An old-format newest segment never takes new bodies, so once its own
+    // are dead the compactor deletes it, and the WAL's recovery point names a
+    // segment that's gone. The one left newest was sealed before it: none of
+    // it can be a write cut short by a crash, and damage there must stop
+    // startup, not be truncated as a torn tail.
+    let dir = tempfile::tempdir().unwrap();
+    let seg = ten_toast_jobs_then_an_empty_segment(dir.path(), 1).await;
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tuber"))
-        .args(["server", "-l", "127.0.0.1", "-p", &port.to_string()])
+        .args(["server", "-l", "127.0.0.1", "-p", "0"])
         .args([
             "-b",
             dir.path().to_str().unwrap(),
             "--max-storage-bytes",
             "1g",
         ])
-        .arg("--wal-skip-corrupt")
+        .env_remove("TUBER_WAL_SKIP_CORRUPT")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("failed to start tuber subprocess");
-
-    let mut stream = None;
-    for _ in 0..40 {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
-            stream = Some(s);
+    let newer = dir.path().join("toast").join("body.000001");
+    for _ in 0..200 {
+        if !newer.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let mut c = BufReader::new(stream.expect("the server never started listening"));
-    let mut found = Vec::new();
-    for id in 1..=10 {
-        c.get_mut()
-            .write_all(format!("peek {id}\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut line = String::new();
-        c.read_line(&mut line).await.unwrap();
-        if line.starts_with("FOUND") {
-            let mut body = String::new();
-            c.read_line(&mut body).await.unwrap();
-            found.push(id);
-        }
-    }
-    child.kill().await.unwrap();
-
-    assert_eq!(found, vec![1, 2]);
-    assert_eq!(
-        std::fs::read(&seg).unwrap(),
-        data,
-        "an older segment is never truncated"
+    assert!(
+        !newer.exists(),
+        "the compactor never deleted the empty segment"
     );
-    let mut copy = seg.into_os_string();
-    copy.push(".corrupt");
-    assert_eq!(std::fs::read(copy).unwrap(), data);
+    // Past a WAL sync, so the recovery point it opened with is on disk.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+
+    let len_field = 16 + 2 * (20 + 300) + 8;
+    let mut data = std::fs::read(&seg).unwrap();
+    data[len_field..len_field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&seg, &data).unwrap();
+
+    let (status, log) = server_exit(dir.path(), &[])
+        .await
+        .expect("the server started on a damaged TOAST segment instead of refusing");
+    assert!(!status.success(), "{status:?}\n{log}");
+    assert!(log.contains("recovery point"), "{log}");
+    assert!(
+        std::fs::read(&seg).unwrap() == data,
+        "segment left as found"
+    );
 }
 
 /// Wait up to 5 s for WAL segment `seq` to be garbage-collected.
