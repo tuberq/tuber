@@ -373,39 +373,45 @@ offer an opt-in to fire anyway when the match is buried is left for later.
 
 ### 6. Persistence and crashes
 
-**Storage: two small files in the binlog directory**, not WAL records. WAL
-segments are collected by tracking the live jobs each one holds, with
-compaction copying them forward (`Wal::compaction_target`, `Wal::gc`);
-schedule entries would have to join that, for state that changes a few times
-per deploy.
+**Storage: WAL records** (v9). Two record types:
 
-- `schedules` holds every entry's definition, stored as its `schedule-put`
-  line plus body and parsed back through the protocol parser on load, so a
-  restored entry passes exactly the checks a synced one did. Rewritten on
-  every commit, before `SYNCED` is sent.
-- `schedules.fired` holds each entry's last fire. Rewritten whenever entries
-  fire — one rewrite per tick that fires anything, however many entries
-  fired in it — and kept apart so that rewrite is a few bytes per entry
-  rather than every entry's body.
+- A **schedule set** holds one owner's entries, each stored as its
+  `schedule-put` line plus body and parsed back through the protocol parser
+  on restore, so a restored entry passes exactly the checks a synced one
+  did. A sync carries the owner's whole set and replaces it in one step, so
+  one record per commit matches it, and is atomic under the record's CRC: a
+  crash can't leave half a sync on disk. Written on a commit that changes
+  something (an entry added, changed or removed, or a spec respelled), and
+  synced before `SYNCED` is sent.
+- A **schedule fired** record holds one entry's last fire. Kept apart from
+  the set so a fire writes a few bytes per entry rather than every entry's
+  body.
 
-Both are versioned and checksummed, and replaced atomically (write
-`<name>.tmp`, fsync, rename, fsync the directory). They count toward
-`--max-storage-bytes`. This is the same shape as systemd's per-timer stamp
-files. Nothing references across the two stores: a fired job is an ordinary
-job in the WAL. On restart each entry resumes from the later of its last fire
-and its sync time.
+Each live record pins its segment, as a live job's FullJob does: an owner's
+set until its next one, an entry's last fire until its next one or its
+owner's next set, which carries every entry's last fire. Compaction rewrites
+an owner's set to move it, and its last fires, out of the oldest segment, as
+it rewrites live jobs and cooldowns. A fired job is an ordinary job in the
+WAL. On restart each entry resumes from the later of its last fire and its
+sync time.
 
-A damaged `schedules` file is moved to `schedules.corrupt`, as the WAL names
-a corrupt segment (or `schedules.corrupt.N`, never over an earlier one), and
-the server starts without schedules — the queue staying up matters more, and
-each app's next sync restores its own. A checksummed file of another format version is not
-damage but a newer tuber's schedules, after a downgrade say: that stops
-startup with an explanation rather than being thrown away. Every format
-version keeps the magic, version field and trailing CRC-32, so the two can be
-told apart. A damaged `schedules.fired` only loses last
-fires, so missed ticks are judged from each entry's sync time. A stored entry
-that no longer parses (most likely a zone gone from both the host's tzdata
-and tuber's own copy) is logged and skipped.
+*Superseded:* the schedules began as two small files beside the WAL,
+`schedules` (definitions) and `schedules.fired` (last fires), each replaced
+whole with a write, fsync, rename and directory fsync, on the reasoning
+that schedule entries shouldn't join the WAL's segment tracking for state
+that changes a few times per deploy. Two things changed that. Replication
+reads the WAL, and schedules outside it wouldn't reach a replica: a promoted
+one would fire ticks the old primary already had. And joining the tracking
+turned out small, the tombstone pattern again. A start on a WAL with no
+schedule records moves the files' entries into it and removes them. A
+damaged `schedules` file found then is moved to `schedules.corrupt` (or
+`schedules.corrupt.N`, never over an earlier one) and the server starts
+without schedules, each app's next sync restoring its own; a checksummed
+file of another format version stops startup rather than being thrown away.
+A damaged `schedules.fired` only loses last fires.
+
+A stored entry that no longer parses (most likely a zone gone from both the
+host's tzdata and tuber's own copy) is logged and skipped.
 
 Without `-b`, schedules live in memory like everything else, and the next app
 process to boot syncs them back.
@@ -420,8 +426,10 @@ ways:
   first job is still live.
 
 **Decided: stamp first.** Splat said missed ticks are fine and duplicates
-are the complaint. The stamp is durable before the put is attempted, so a
-crash in between loses that tick and nothing fires it later: on restart the
+are the complaint. The stamp is durable before the put is attempted — the
+tick's schedule fired records are synced on their own, not left in the
+WAL's buffer for the put's fsync — so a crash in between loses that tick and
+nothing fires it later: on restart the
 entry's last fire already covers it, so missed-tick catch-up (decision 3)
 does not see it as missed either. If the stamps can't be written, nothing
 fires that tick — recorded as `INTERNAL_ERROR` — for the same reason.
@@ -447,7 +455,7 @@ due in between.
 A fire refused by the put itself (`OUT_OF_MEMORY`, `OUT_OF_STORAGE`,
 `JOB_TOO_BIG`, `INTERNAL_ERROR`) is counted and not retried — the next tick
 tries again. One that queued nothing has the entry's last fire put back (in
-memory and in `schedules.fired`): the staleness alert on
+memory and in the WAL): the staleness alert on
 `tuber_schedule_last_fire_timestamp_seconds` still sees the gap, and after a
 restart the tick counts as missed. So it is treated like downtime: a daily
 09:00 entry refused at 09:00 and restarted at 18:00 fires then, 9 hours
@@ -455,7 +463,10 @@ late, unless `catchup:` says that's too stale. That is all of them except the
 `INTERNAL_ERROR` of the put that failed the WAL, which keeps its stamp: its
 record may still have reached disk, and a restart can bring the job back.
 An `INTERNAL_ERROR` from a failed TOAST write, or from a put refused because
-an earlier fire in the tick failed the WAL, wrote nothing. A fire that
+an earlier fire in the tick failed the WAL, wrote nothing. Putting the last
+fire back needs the WAL, though, so in the second case it is put back in
+memory only: after the restart the WAL failure needs, that tick counts as
+fired, lost rather than caught up. A fire that
 dedups against a buried job is logged as a warning each time, with the
 streak.
 

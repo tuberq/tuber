@@ -331,7 +331,7 @@ SYNCED 2 0 0 0
 - **Downtime costs at most one run.** A run of ticks missed while tuber was down fires once on restart, not as a burst; `catchup:<seconds>` bounds how stale that can be, and `catchup:0` skips it. A crash just as an entry fires loses that tick rather than firing it twice. A tick whose put was refused (`OUT_OF_MEMORY`, say) counts as missed too, so a restart before the next tick can fire it late.
 - **It's visible.** `stats-schedule <owner> <name>` shows the next three fires in the entry's own zone and the last fire's reply. `buried-streak` and `tuber_schedule_fires_total{result="deduped_buried"}` catch an entry whose `idp:` key has been matching a buried job — the put "succeeds" and queues nothing.
 
-With `-b`, schedules persist beside the WAL. To move an app's cron jobs into tuber, start with [docs/scheduling.md](docs/scheduling.md); the commands are in [docs/protocol.md](docs/protocol.md#schedule-commands), and the design and its reasoning in [docs/scheduler.md](docs/scheduler.md).
+With `-b`, schedules persist in the WAL. To move an app's cron jobs into tuber, start with [docs/scheduling.md](docs/scheduling.md); the commands are in [docs/protocol.md](docs/protocol.md#schedule-commands), and the design and its reasoning in [docs/scheduler.md](docs/scheduler.md).
 
 ### Batch Operations
 

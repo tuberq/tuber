@@ -55,7 +55,7 @@ space, never dangling references. Orphans are reclaimed on the next replay.
 | Offset | Size | Field     | Value                                      |
 |--------|------|-----------|--------------------------------------------|
 | 0      | 4    | magic     | `TWAL` (`0x5457414C`)                      |
-| 4      | 4    | version   | `8` (u32 LE) — current; v3–v7 still readable |
+| 4      | 4    | version   | `9` (u32 LE) — current; v3–v8 still readable |
 | 8      | 4    | flags     | `0` — reserved for future use              |
 
 **Total: 12 bytes**
@@ -65,9 +65,9 @@ zero and ignored on read.
 
 ## Record Types
 
-Five record types follow the header: FullJob and StateChange, plus
-Tombstone and IdMark from v8 and ToastMark from v9. All share a common
-envelope:
+Seven record types follow the header: FullJob and StateChange, plus
+Tombstone and IdMark from v8, and ToastMark, ScheduleSet and ScheduleFired
+from v9. All share a common envelope:
 
 ```
 +-----------+------------------+------------------+---------+----------+
@@ -256,6 +256,47 @@ widens the stretch treated as possibly torn. Once TOAST is open, its end
 is the point the replay's new segment opens with, superseding the old one.
 Design and alternatives: `docs/toast-recovery-point.md`.
 
+### 0x06 — ScheduleSet (v9+)
+
+One owner's recurring schedule entries, written by a `schedule-commit`
+that changes them and synced before `SYNCED`. `job_id` is 0. The payload,
+little-endian, with `bytes` = `len u32` + bytes, `time` = `seconds i64` +
+`nanos i32`, and `opt_time` = a flag byte, then a `time` if it is 1:
+
+| Field        | Type      | Notes                                         |
+|--------------|-----------|-----------------------------------------------|
+| owner        | bytes     | UTF-8                                         |
+| count        | u32       | entries that follow; `0` when the owner has none left |
+| *per entry:* |           |                                               |
+| line         | bytes     | the `schedule-put` arguments, e.g. `rollup maint 1024 0 120 40 idp:rollup 5 * * * *` |
+| body         | bytes     | the job body each fire puts                   |
+| synced_at    | time      | when the definition took effect               |
+| last_fire    | opt_time  | absent if it hasn't fired                     |
+
+A set replaces the owner's earlier set and every ScheduleFired written for
+the owner since: it carries each entry's last fire. Restore parses each
+line back through the protocol parser, so a restored entry passes the
+checks a synced one did; one that no longer parses (a zone gone from both
+the host's tzdata and tuber's copy) is logged and dropped. A set with
+entries holds a reference on its segment until the owner's next set, and
+compaction rewrites it into the current segment. An empty one holds none,
+for the same reason as a clearing Tombstone.
+
+### 0x07 — ScheduleFired (v9+)
+
+One schedule entry's last fire. `job_id` is 0; the payload is `owner`
+(bytes), `name` (bytes) and `last_fire` (opt_time), encoded as in
+ScheduleSet. Written for each entry a tick fires, and synced, before any of
+its jobs are put: a crash can lose the tick, never fire it twice. A fire the
+put refused before queueing anything writes another with the entry's
+previous last fire, unsynced, so a restart sees the tick as missed. It
+holds a reference on its segment until the entry's next ScheduleFired or
+its owner's next ScheduleSet.
+
+Before v9, schedules were two files beside the WAL, `schedules` and
+`schedules.fired`. A start on a WAL with no schedule records moves their
+entries into it as ScheduleSet records, syncs, and removes the files.
+
 ## Encoding Details
 
 ### State Encoding
@@ -329,6 +370,11 @@ On startup, files are read in sequence order. For each record:
   free.
 - **IdMark (v8)**: Raises the next job id to at least `job_id + 1`.
 - **ToastMark (v9)**: Ignored; read before replay by `read_toast_mark`.
+- **ScheduleSet (v9)**: Replaces the owner's entries, dropping any
+  ScheduleFired since its last set. With entries, the record's segment
+  gains a reference; empty, the owner is gone.
+- **ScheduleFired (v9)**: Replaces the entry's last fire, if its owner has
+  a set; the record's segment gains a reference.
 - **StateChange (other)**: Update the job's state, priority, and delay.
   Increment the counter named by `reason` (v4+).
 
@@ -442,7 +488,9 @@ avoids per-file balancing complexity while keeping segments roughly bounded.
 
 Each WAL file tracks a reference count (`refs`): the live jobs whose most
 recent FullJob record is in that file, plus the live cooldowns whose
-Tombstone record is. On each server tick, head files with `refs == 0`
+Tombstone record is, and the schedule records still current (each
+owner's latest ScheduleSet, and each ScheduleFired written since it). On
+each server tick, head files with `refs == 0`
 are deleted, oldest first. The current writable file is never removed;
 each opens with an IdMark, which keeps the job-id high-water mark, and
 then the latest ToastMark.
@@ -452,8 +500,9 @@ then the latest ToastMark.
 When the dead-to-live ratio across all WAL files reaches 2:1, the engine
 migrates jobs out of the oldest file into the current one (re-writing
 their FullJob records) at a rate of `ratio` jobs per tick, and the same
-number of live cooldowns (re-writing their Tombstone records). This frees
-the oldest file for GC. Self-regulating: more waste = more migration.
+number of live cooldowns (re-writing their Tombstone records) and of
+schedule owners with a record there (re-writing each owner's ScheduleSet,
+which carries its entries' last fires). This frees the oldest file for GC. Self-regulating: more waste = more migration.
 
 ### Storage budget
 
@@ -484,7 +533,7 @@ This prevents multiple tuber instances from writing to the same WAL.
 | 6       | 12 bytes    | FullJob body field becomes a 1-byte `body_kind` discriminant followed by inline (`body_len u32` + bytes) or external (`body_id u64`). Small bodies stay inline; only larger bodies go to TOAST. Per-record kind decouples the on-disk format from the runtime threshold. v3–v5 reads still supported (v3/v4 via `--migrate-wal`). |
 | 7       | 12 bytes    | StateChange payload gains `change_epoch_secs` (u64), so a delayed job replays with its remaining delay. |
 | 8       | 12 bytes    | Tombstone (0x03) and IdMark (0x04) records. A cooldown no longer depends on its job's FullJob record surviving GC, and job ids never go backwards. Deletes write `expiry_epoch_secs = 0`. Startup on an older WAL needs `--migrate-wal`; an older tuber can't read v8 segments. |
-| 9       | 12 bytes    | ToastMark (0x05) records the TOAST recovery point, so startup tells a torn TOAST tail from corruption. FullJob body kind 0x02 carries the TOAST body's CRC32. Startup on an older WAL needs `--migrate-wal`. An older tuber sets a v9 newest segment aside as `.corrupt` and starts without it, and refuses an older one. The header's `flags` word is still written as 0 and ignored on read. |
+| 9       | 12 bytes    | ToastMark (0x05) records the TOAST recovery point, so startup tells a torn TOAST tail from corruption. FullJob body kind 0x02 carries the TOAST body's CRC32. ScheduleSet (0x06) and ScheduleFired (0x07) hold the recurring schedules, which were two files beside the WAL. Startup on an older WAL needs `--migrate-wal`. An older tuber sets a v9 newest segment aside as `.corrupt` and starts without it, and refuses an older one. The header's `flags` word is still written as 0 and ignored on read. |
 
 ---
 

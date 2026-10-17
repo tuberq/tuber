@@ -225,7 +225,7 @@ Alert on it (see [Monitoring](#monitoring)).
 - **A crash at the moment a job fires** loses that tick rather than running it
   twice. Tuber records the fire before it puts the job.
 - **Persistence:**
-  - With `-b`, schedules are saved beside the WAL and survive restarts.
+  - With `-b`, schedules are saved in the WAL and survive restarts.
   - Without `-b`, they're held in memory and lost on restart, until your app
     syncs again.
 - **Your jobs should still be safe to run twice.** Missed-tick catch-up, a
@@ -311,5 +311,6 @@ A deploy that switches over:
 - Entries count toward `--max-jobs-size`: their bodies and names, plus about
   500 bytes each, shown as `current-schedules-size` in `stats`. A sync in
   progress counts too.
-- With `-b`, the schedule files count toward `--max-storage-bytes`. A commit
+- With `-b`, schedules are stored in the WAL and count toward
+  `--max-storage-bytes`. A commit
   that only keeps or shrinks a set always goes through, even on a full disk.
