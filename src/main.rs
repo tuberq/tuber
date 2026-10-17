@@ -405,24 +405,25 @@ async fn run() {
             // that `stats` has always reported for an unset budget.
             let max_jobs_size = (max_jobs_size != 0).then_some(max_jobs_size);
 
-            if let Err(e) = tuber::server::run(
-                &listen,
+            if let Err(e) = tuber::server::run(tuber::server::ServerConfig {
+                addr: listen,
                 port,
                 max_job_size,
-                max_jobs_size,
+                max_job_bytes: max_jobs_size,
                 max_storage_bytes,
-                binlog_dir.as_deref(),
+                wal_dir: binlog_dir.map(std::path::PathBuf::from),
                 sync_interval,
                 migrate_wal,
                 wal_skip_corrupt,
                 metrics_port,
-                metrics_listen.as_deref(),
+                metrics_listen,
                 name,
                 max_connections,
                 // 0 means disabled, matching the other 0-is-no-limit knobs.
-                (conn_idle_timeout != 0).then(|| Duration::from_secs(conn_idle_timeout)),
-                (tcp_keepalive != 0).then(|| Duration::from_secs(tcp_keepalive)),
-            )
+                conn_idle_timeout: (conn_idle_timeout != 0)
+                    .then(|| Duration::from_secs(conn_idle_timeout)),
+                tcp_keepalive: (tcp_keepalive != 0).then(|| Duration::from_secs(tcp_keepalive)),
+            })
             .await
             {
                 tracing::error!("server error: {e}");

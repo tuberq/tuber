@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -4556,6 +4556,67 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
     Ok(state)
 }
 
+/// Everything [`run`] needs, one field per server knob. Mirrors the
+/// `server` flags (`cli::server_config` builds one from them), but exists as
+/// an owned value so an embedding binary can start the server
+/// programmatically: build one with [`Default::default`], override what you
+/// need, and hand it to [`run`].
+pub struct ServerConfig {
+    /// Listen address (default `0.0.0.0`).
+    pub addr: String,
+    /// Listen port (default `11300`).
+    pub port: u16,
+    /// Largest single job body accepted, in bytes.
+    pub max_job_size: u32,
+    /// In-memory budget for the live job set; `None` = unlimited.
+    pub max_job_bytes: Option<u64>,
+    /// On-disk budget for WAL + TOAST; required when `wal_dir` is set.
+    pub max_storage_bytes: Option<u64>,
+    /// WAL directory; `None` runs in-memory.
+    pub wal_dir: Option<PathBuf>,
+    /// Group-commit fsync interval; `Duration::ZERO` = fsync every write.
+    pub sync_interval: Duration,
+    /// Permit upgrading a WAL written by an older tuber (`--migrate-wal`).
+    pub migrate_wal: bool,
+    /// Start past a damaged WAL or TOAST segment, keeping it as
+    /// `<segment>.corrupt`, instead of refusing (`--wal-skip-corrupt`).
+    pub wal_skip_corrupt: bool,
+    /// Serve Prometheus metrics on this port; `None` = disabled.
+    pub metrics_port: Option<u16>,
+    /// Address the metrics endpoint listens on; `None` = the `addr` one.
+    pub metrics_listen: Option<String>,
+    /// Instance name, echoed in logs and `stats`.
+    pub name: Option<String>,
+    /// Connection ceiling; `None` derives one from the fd rlimit.
+    pub max_connections: Option<usize>,
+    /// Idle-connection pruning; `None` = disabled.
+    pub conn_idle_timeout: Option<Duration>,
+    /// TCP keepalive idle time on accepted sockets; `None` = off.
+    pub tcp_keepalive: Option<Duration>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            addr: "0.0.0.0".to_string(),
+            port: 11300,
+            max_job_size: crate::job::JOB_DATA_SIZE_LIMIT_DEFAULT,
+            max_job_bytes: Some(crate::job::JOBS_SIZE_LIMIT_DEFAULT),
+            max_storage_bytes: None,
+            wal_dir: None,
+            sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
+            migrate_wal: false,
+            wal_skip_corrupt: false,
+            metrics_port: None,
+            metrics_listen: None,
+            name: None,
+            max_connections: None,
+            conn_idle_timeout: None,
+            tcp_keepalive: Some(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS)),
+        }
+    }
+}
+
 /// Start the beanstalkd server.
 ///
 /// WAL replay runs *before* the TCP listener is bound, so the accept port
@@ -4563,27 +4624,24 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
 /// makes TCP-level health checks (e.g. `nc -z host 11300`) an honest signal of
 /// readiness — during replay there is nothing to connect to, rather than a
 /// listening socket that silently never calls `accept()`.
-// One parameter per server CLI flag; clap already owns the grouping, and the
-// wide list stops here — everything past the listener travels as [`StateConfig`].
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    addr: &str,
-    port: u16,
-    max_job_size: u32,
-    max_job_bytes: Option<u64>,
-    max_storage_bytes: Option<u64>,
-    wal_dir: Option<&str>,
-    sync_interval: Duration,
-    migrate_wal: bool,
-    wal_skip_corrupt: bool,
-    metrics_port: Option<u16>,
-    metrics_listen: Option<&str>,
-    name: Option<String>,
-    max_connections: Option<usize>,
-    conn_idle_timeout: Option<Duration>,
-    tcp_keepalive: Option<Duration>,
-) -> io::Result<()> {
-    let wal_path = wal_dir.map(Path::new);
+pub async fn run(config: ServerConfig) -> io::Result<()> {
+    let ServerConfig {
+        addr,
+        port,
+        max_job_size,
+        max_job_bytes,
+        max_storage_bytes,
+        wal_dir,
+        sync_interval,
+        migrate_wal,
+        wal_skip_corrupt,
+        metrics_port,
+        metrics_listen,
+        name,
+        max_connections,
+        conn_idle_timeout,
+        tcp_keepalive,
+    } = config;
     let fd_budget = Arc::new(
         FdBudget::new(max_connections)
             .with_idle_timeout(conn_idle_timeout)
@@ -4593,7 +4651,7 @@ pub async fn run(
         max_job_size,
         max_job_bytes,
         max_storage_bytes,
-        wal_dir: wal_path,
+        wal_dir: wal_dir.as_deref(),
         sync_interval,
         migrate_wal,
         wal_skip_corrupt,
@@ -4601,7 +4659,7 @@ pub async fn run(
         fd_budget: Arc::clone(&fd_budget),
     })?;
 
-    let listener = TcpListener::bind((addr, port)).await?;
+    let listener = TcpListener::bind((addr.as_str(), port)).await?;
     let mut opts = format!(" max-job-size={max_job_size}");
     match max_job_bytes {
         Some(b) => opts.push_str(&format!(" max-jobs-size={b}")),
@@ -4627,7 +4685,7 @@ pub async fn run(
         None => opts.push_str(" tcp-keepalive=off"),
     }
     if let Some(ref dir) = wal_dir {
-        opts.push_str(&format!(" binlog={dir}"));
+        opts.push_str(&format!(" binlog={}", dir.display()));
         if sync_interval.is_zero() {
             opts.push_str(" sync=every-write");
         } else {
@@ -4636,7 +4694,7 @@ pub async fn run(
     }
     let listen_addr = listener.local_addr()?.ip();
     // Metrics listen where the protocol does unless given their own address.
-    let metrics_addr = metrics_listen.map_or_else(|| listen_addr.to_string(), str::to_owned);
+    let metrics_addr = metrics_listen.unwrap_or_else(|| listen_addr.to_string());
     if let Some(mp) = metrics_port {
         opts.push_str(&format!(" metrics={metrics_addr}:{mp}"));
     }
