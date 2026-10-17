@@ -1,4 +1,5 @@
 pub mod body_store;
+pub mod cli;
 pub mod cli_output;
 pub mod client;
 pub mod cmd_put;
