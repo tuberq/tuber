@@ -68,11 +68,21 @@ struct Cli {
 #[derive(Args, Debug)]
 pub struct ServerArgs {
     /// Listen address
-    #[arg(short = 'l', long, default_value = "0.0.0.0", env = "TUBER_LISTEN")]
+    #[arg(
+        short = 'l',
+        long,
+        default_value = crate::server::DEFAULT_LISTEN_ADDR,
+        env = "TUBER_LISTEN"
+    )]
     pub listen: String,
 
     /// Listen port
-    #[arg(short = 'p', long, default_value_t = 11300, env = "TUBER_PORT")]
+    #[arg(
+        short = 'p',
+        long,
+        default_value_t = crate::server::DEFAULT_PORT,
+        env = "TUBER_PORT"
+    )]
     pub port: u16,
 
     /// WAL directory (enables persistence)

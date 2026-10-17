@@ -322,6 +322,64 @@ pub enum WalRecord {
     },
 }
 
+impl WalRecord {
+    /// Borrow this record as the [`WalEvent`] the live tee would have
+    /// reported for it. Lets a consumer that both scans history with a
+    /// [`WalReader`] and follows the tee run *one* match over both, which
+    /// is what makes "one record shape" (see [`WalEvent`]) true in practice
+    /// rather than only on paper.
+    pub fn as_event(&self) -> WalEvent<'_> {
+        match self {
+            WalRecord::FullJob(job) => WalEvent::Put { job },
+            WalRecord::StateChange {
+                job_id,
+                new_state,
+                new_priority,
+                new_delay_nanos,
+                expiry_epoch_secs,
+                reason,
+                change_epoch_secs,
+            } => WalEvent::StateChange {
+                job_id: *job_id,
+                new_state: *new_state,
+                new_priority: *new_priority,
+                new_delay_nanos: *new_delay_nanos,
+                expiry_epoch_secs: *expiry_epoch_secs,
+                reason: *reason,
+                change_epoch_secs: *change_epoch_secs,
+            },
+            WalRecord::Tombstone {
+                job_id,
+                tube,
+                key,
+                expires_epoch_secs,
+            } => WalEvent::Tombstone {
+                job_id: *job_id,
+                tube,
+                key,
+                expires_epoch_secs: *expires_epoch_secs,
+            },
+            WalRecord::IdMark { high_water } => WalEvent::IdMark {
+                high_water: *high_water,
+            },
+            WalRecord::ToastMark(point) => WalEvent::ToastMark(*point),
+            WalRecord::ScheduleSet { owner, entries } => WalEvent::ScheduleSet {
+                owner,
+                entries: ScheduleEntries(entries),
+            },
+            WalRecord::ScheduleFired {
+                owner,
+                name,
+                last_fire,
+            } => WalEvent::ScheduleFired {
+                owner,
+                name,
+                last_fire: *last_fire,
+            },
+        }
+    }
+}
+
 // --- Observation ---
 
 /// Byte-exact location of a record in the WAL: the segment's sequence
@@ -1348,6 +1406,19 @@ struct WalFile {
     zero_refs_at_op: u64,
 }
 
+impl WalFile {
+    /// Where this file's next record will land — the single definition of
+    /// "a position is a segment's seq plus its written length". Both write
+    /// paths take a record's position from here before appending, and
+    /// [`Wal::end_position`] reads it off the tail file.
+    fn position(&self) -> Position {
+        Position {
+            seg: self.seq,
+            offset: self.bytes_written as u64,
+        }
+    }
+}
+
 /// Configuration for [`Wal::open`].
 #[derive(Debug, Clone)]
 pub struct WalConfig {
@@ -1598,6 +1669,7 @@ impl Wal {
             if let Some(p) = point
                 && point != self.toast_mark
             {
+                // Not `f.position()`: `fd` holds `f` mutably here.
                 let pos = Position {
                     seg: f.seq,
                     offset: f.bytes_written as u64,
@@ -1615,10 +1687,6 @@ impl Wal {
         }
         self.record_sync();
         self.dirty = false;
-        let end = self.end_position();
-        if let Some(obs) = self.observer.as_mut() {
-            obs.on_sync(end);
-        }
         Ok(())
     }
 
@@ -1660,16 +1728,10 @@ impl Wal {
     /// appended. Every existing record sits at a position strictly below
     /// this. An empty WAL reports the start of the first future segment.
     pub fn end_position(&self) -> Position {
-        match self.files.back() {
-            Some(f) => Position {
-                seg: f.seq,
-                offset: f.bytes_written as u64,
-            },
-            None => Position {
-                seg: self.next_seq,
-                offset: HEADER_SIZE as u64,
-            },
-        }
+        self.files.back().map(WalFile::position).unwrap_or(Position {
+            seg: self.next_seq,
+            offset: HEADER_SIZE as u64,
+        })
     }
 
     /// fsync the body store (if attached) so referenced bodies are durable
@@ -1857,6 +1919,11 @@ impl Wal {
     /// after everything buffered so far is durable (`sync()` fsyncs the
     /// current file; rotation fsyncs the outgoing file, and all older
     /// files were fsynced at their own rotation).
+    ///
+    /// Being the one place that fact is known is also why the observer's
+    /// durable-frontier callback fires from here rather than from `sync()`:
+    /// rotation's fsync advances the frontier too, and any future fsync
+    /// site inherits the notification instead of silently skipping it.
     fn record_sync(&mut self) {
         #[cfg(test)]
         {
@@ -1864,6 +1931,14 @@ impl Wal {
         }
         self.last_sync_at = Instant::now();
         self.synced_ops = self.ops_written;
+        if self.observer.is_some() {
+            // `end_position` needs `&self`, so it can't run while the
+            // observer is mutably borrowed — hence the two-step lookup.
+            let end = self.end_position();
+            if let Some(obs) = self.observer.as_mut() {
+                obs.on_sync(end);
+            }
+        }
     }
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
@@ -2072,10 +2147,7 @@ impl Wal {
         let file = self.current_file_mut()?;
         // The record's position: assigned here, at layout time, so the
         // observer tee and any later file scan name this record identically.
-        let pos = Position {
-            seg: file.seq,
-            offset: file.bytes_written as u64,
-        };
+        let pos = file.position();
         let fd = file
             .fd
             .as_mut()
@@ -2792,14 +2864,11 @@ pub struct WalReader {
     pos: Position,
 }
 
-/// One loaded segment mid-iteration.
+/// One loaded segment mid-iteration. Where we *are* in it is `WalReader::pos`
+/// — the public resume cursor — so there is only ever one cursor to advance.
 struct SegmentCursor {
-    seq: u64,
     version: u32,
     data: Vec<u8>,
-    offset: usize,
-    /// Snapshot-newest: truncation here means "caught up", not corruption.
-    newest: bool,
 }
 
 impl WalReader {
@@ -2830,6 +2899,14 @@ impl WalReader {
         self.pos
     }
 
+    /// Is the segment being read the newest in the snapshot? Only there is
+    /// a truncated tail benign (the writer's buffer, not corruption) —
+    /// `seqs` holds only the segments still *unvisited*, so an empty one
+    /// means nothing follows what we're on.
+    fn is_on_newest(&self) -> bool {
+        self.seqs.is_empty()
+    }
+
     /// Yield the next record and the position it was read from, or
     /// `Ok(None)` when the snapshot is exhausted (including a buffered
     /// tail not yet flushed by the writer — see the type docs).
@@ -2839,7 +2916,6 @@ impl WalReader {
                 let Some(seq) = self.seqs.pop_front() else {
                     return Ok(None);
                 };
-                let newest = self.seqs.is_empty();
                 let data = match fs::read(segment_path(&self.dir, seq)) {
                     Ok(d) => d,
                     // Compacted away between listing and read: its live
@@ -2852,41 +2928,38 @@ impl WalReader {
                     // A sub-header newest segment is the benign artifact of
                     // a crash between creation and the header fsync (replay
                     // removes it quietly for the same reason).
-                    Err(WalError::Truncated) if newest => return Ok(None),
+                    Err(WalError::Truncated) if self.is_on_newest() => return Ok(None),
                     Err(e) => return Err(e),
                 };
                 // First segment resumes at the cursor; later ones start at
                 // the top. ZERO's offset clamps up to the header.
                 let start = if seq == self.pos.seg {
-                    (self.pos.offset as usize).max(HEADER_SIZE)
+                    self.pos.offset.max(HEADER_SIZE as u64)
                 } else {
-                    HEADER_SIZE
+                    HEADER_SIZE as u64
                 };
-                self.pos = Position { seg: seq, offset: start as u64 };
-                self.current = Some(SegmentCursor { seq, version, data, offset: start, newest });
+                self.pos = Position { seg: seq, offset: start };
+                self.current = Some(SegmentCursor { version, data });
                 continue;
             };
 
             // `offset > len` happens when resuming at a boundary the writer
             // has not flushed yet — same answer as an exact-end segment:
-            // nothing more to read here.
-            if cur.offset >= cur.data.len() {
-                let last = self.seqs.is_empty();
+            // nothing more to read here. Dropping the cursor and looping
+            // re-enters the load branch, which returns `Ok(None)` once
+            // `seqs` is empty; no separate last-segment check needed.
+            if self.pos.offset as usize >= cur.data.len() {
                 self.current = None;
-                if last {
-                    return Ok(None);
-                }
                 continue;
             }
 
-            match deserialize_record(&cur.data[cur.offset..], cur.version) {
+            match deserialize_record(&cur.data[self.pos.offset as usize..], cur.version) {
                 Ok((record, consumed)) => {
-                    let pos = Position { seg: cur.seq, offset: cur.offset as u64 };
-                    cur.offset += consumed;
-                    self.pos = Position { seg: cur.seq, offset: cur.offset as u64 };
+                    let pos = self.pos;
+                    self.pos.offset += consumed as u64;
                     return Ok(Some((pos, record)));
                 }
-                Err(WalError::Truncated) if cur.newest => return Ok(None),
+                Err(WalError::Truncated) if self.is_on_newest() => return Ok(None),
                 Err(e) => return Err(e),
             }
         }
@@ -5515,51 +5588,6 @@ mod tests {
         },
     }
 
-    /// What a segment file holds for a record, in the same terms as the tee.
-    fn seen_in_file(rec: &WalRecord) -> SeenRecord {
-        match rec {
-            WalRecord::FullJob(job) => SeenRecord::Put { job_id: job.id },
-            WalRecord::StateChange {
-                job_id,
-                new_state,
-                reason,
-                ..
-            } => SeenRecord::StateChange {
-                job_id: *job_id,
-                new_state: *new_state,
-                reason: *reason,
-            },
-            WalRecord::Tombstone {
-                job_id,
-                tube,
-                key,
-                expires_epoch_secs,
-            } => SeenRecord::Tombstone {
-                job_id: *job_id,
-                tube: tube.clone(),
-                key: key.clone(),
-                expires_epoch_secs: *expires_epoch_secs,
-            },
-            WalRecord::IdMark { high_water } => SeenRecord::IdMark {
-                high_water: *high_water,
-            },
-            WalRecord::ToastMark(point) => SeenRecord::ToastMark(*point),
-            WalRecord::ScheduleSet { owner, entries } => SeenRecord::ScheduleSet {
-                owner: owner.clone(),
-                entries: entries.clone(),
-            },
-            WalRecord::ScheduleFired {
-                owner,
-                name,
-                last_fire,
-            } => SeenRecord::ScheduleFired {
-                owner: owner.clone(),
-                name: name.clone(),
-                last_fire: *last_fire,
-            },
-        }
-    }
-
     /// Observer that records everything it sees behind shared handles the
     /// test keeps, since the Box itself is owned by the Wal.
     struct RecordingObserver {
@@ -5567,9 +5595,12 @@ mod tests {
         syncs: std::sync::Arc<std::sync::Mutex<Vec<Position>>>,
     }
 
-    impl WalObserver for RecordingObserver {
-        fn on_record(&mut self, pos: Position, event: WalEvent<'_>) {
-            let seen = match event {
+    impl SeenRecord {
+        /// The one adapter both the tee and the reader go through — the
+        /// reader reaches it via [`WalRecord::as_event`], which is the point
+        /// of that method.
+        fn of(event: WalEvent<'_>) -> SeenRecord {
+            match event {
                 WalEvent::Put { job } => SeenRecord::Put { job_id: job.id },
                 WalEvent::StateChange {
                     job_id,
@@ -5615,7 +5646,13 @@ mod tests {
                     name: name.to_string(),
                     last_fire,
                 },
-            };
+            }
+        }
+    }
+
+    impl WalObserver for RecordingObserver {
+        fn on_record(&mut self, pos: Position, event: WalEvent<'_>) {
+            let seen = SeenRecord::of(event);
             self.events.lock().unwrap().push((pos, seen));
         }
 
@@ -5705,7 +5742,7 @@ mod tests {
                 deserialize_record(&data[pos.offset as usize..], version).unwrap_or_else(|e| {
                     panic!("offset {} is not a record boundary: {:?}", pos.offset, e)
                 });
-            assert_eq!(&seen_in_file(&rec), seen, "tee/file record mismatch at {pos:?}");
+            assert_eq!(&SeenRecord::of(rec.as_event()), seen, "tee/file record mismatch at {pos:?}");
         }
     }
 
@@ -5716,7 +5753,7 @@ mod tests {
         // header exceeds this max on the next write's rotate check.
         let mut wal =
             Wal::open(dir.path(), WalConfig::with_max_file_size(HEADER_SIZE + 1)).unwrap();
-        let (events, _syncs) = attach_recording_observer(&mut wal);
+        let (events, syncs) = attach_recording_observer(&mut wal);
 
         let mut job1 = make_test_job(1, b"one");
         let mut job2 = make_test_job(2, b"two");
@@ -5737,6 +5774,15 @@ mod tests {
             puts[1],
             Position { seg: 2, offset: first_record },
             "second put must land at the top of the rotated segment"
+        );
+
+        // Rotation fsyncs the outgoing segment, so the durable frontier
+        // advances past the first record without any sync() call — the
+        // reason on_sync hangs off record_sync rather than off sync().
+        let syncs = syncs.lock().unwrap();
+        assert!(
+            syncs.iter().any(|end| *end > puts[0]),
+            "rotation's fsync must report a frontier covering seg 1: {syncs:?}"
         );
     }
 
@@ -5800,7 +5846,7 @@ mod tests {
             while offset < data.len() {
                 let (rec, consumed) = deserialize_record(&data[offset..], version).unwrap();
                 let pos = Position { seg: seq, offset: offset as u64 };
-                in_files.push((pos, seen_in_file(&rec)));
+                in_files.push((pos, SeenRecord::of(rec.as_event())));
                 offset += consumed;
             }
         }
@@ -5821,7 +5867,7 @@ mod tests {
     fn drain_reader(reader: &mut WalReader) -> Vec<(Position, SeenRecord)> {
         let mut out = Vec::new();
         while let Some((pos, record)) = reader.next_record().unwrap() {
-            out.push((pos, seen_in_file(&record)));
+            out.push((pos, SeenRecord::of(record.as_event())));
         }
         out
     }

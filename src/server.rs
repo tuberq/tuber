@@ -4255,6 +4255,29 @@ struct StateConfig<'a> {
     wal_observer: Option<Box<dyn WalObserver>>,
 }
 
+impl Default for StateConfig<'_> {
+    /// In-memory, unbudgeted, no observer — what the `run_with_listener*`
+    /// variants all start from, so each one spells out only the knob it
+    /// exists to exercise and a new field costs one edit here instead of
+    /// one per call site.
+    fn default() -> Self {
+        StateConfig {
+            max_job_size: crate::job::JOB_DATA_SIZE_LIMIT_DEFAULT,
+            max_job_bytes: None,
+            max_storage_bytes: None,
+            wal_dir: None,
+            sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
+            migrate_wal: false,
+            wal_skip_corrupt: false,
+            name: None,
+            // `Some(0)` is the unlimited sentinel: tests must not inherit
+            // the host's `ulimit -n` as a connection ceiling.
+            fd_budget: Arc::new(FdBudget::new(Some(0))),
+            wal_observer: None,
+        }
+    }
+}
+
 /// Build ServerState, replaying the WAL if `wal_dir` is set.
 ///
 /// On a large binlog this can take seconds to minutes and allocate
@@ -4560,10 +4583,23 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             tombstone_count,
             dir
         );
+    } else if wal_observer.is_some() {
+        // Same reflex as the other knobs that can't take effect (see the
+        // --max-storage-bytes check above and main.rs's warnings): an
+        // embedder who wires a replication observer and forgets the WAL
+        // directory gets a quietly non-replicating server otherwise.
+        tracing::warn!("wal_observer ignored: no WAL directory configured");
     }
 
     Ok(state)
 }
+
+/// Default listen address. Shared with clap's `--listen` default so the
+/// CLI and [`ServerConfig::default`] cannot drift apart.
+pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0";
+
+/// Default listen port; shared with clap's `--port` default.
+pub const DEFAULT_PORT: u16 = 11300;
 
 /// Everything [`run`] needs, one field per server knob. Mirrors the
 /// `server` flags (`cli::server_config` builds one from them), but exists as
@@ -4574,9 +4610,9 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
 /// The one field with no flag is `wal_observer`: a hook, not a knob. Only
 /// an embedder can build an observer, so a command line has nothing to say.
 pub struct ServerConfig {
-    /// Listen address (default `0.0.0.0`).
+    /// Listen address; see [`DEFAULT_LISTEN_ADDR`].
     pub addr: String,
-    /// Listen port (default `11300`).
+    /// Listen port; see [`DEFAULT_PORT`].
     pub port: u16,
     /// Largest single job body accepted, in bytes.
     pub max_job_size: u32,
@@ -4614,8 +4650,8 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            addr: "0.0.0.0".to_string(),
-            port: 11300,
+            addr: DEFAULT_LISTEN_ADDR.to_string(),
+            port: DEFAULT_PORT,
             max_job_size: crate::job::JOB_DATA_SIZE_LIMIT_DEFAULT,
             max_job_bytes: Some(crate::job::JOBS_SIZE_LIMIT_DEFAULT),
             max_storage_bytes: None,
@@ -4791,12 +4827,9 @@ pub async fn run_with_listener_limited(
         max_job_bytes,
         max_storage_bytes,
         wal_dir,
-        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
         migrate_wal,
-        wal_skip_corrupt: false,
         name,
-        fd_budget: Arc::new(FdBudget::new(Some(0))),
-        wal_observer: None,
+        ..Default::default()
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4813,15 +4846,11 @@ pub async fn run_with_listener_sync_zero(
 ) -> io::Result<()> {
     let state = build_state(StateConfig {
         max_job_size,
-        max_job_bytes: None,
         max_storage_bytes: Some(1024 * 1024 * 1024),
         wal_dir: Some(wal_dir),
         sync_interval: Duration::ZERO,
         migrate_wal: true,
-        wal_skip_corrupt: false,
-        name: None,
-        fd_budget: Arc::new(FdBudget::new(Some(0))),
-        wal_observer: None,
+        ..Default::default()
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4836,15 +4865,8 @@ pub async fn run_with_listener_max_connections(
 ) -> io::Result<()> {
     let state = build_state(StateConfig {
         max_job_size,
-        max_job_bytes: None,
-        max_storage_bytes: None,
-        wal_dir: None,
-        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
-        migrate_wal: false,
-        wal_skip_corrupt: false,
-        name: None,
         fd_budget: Arc::new(FdBudget::new(Some(max_connections))),
-        wal_observer: None,
+        ..Default::default()
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4859,15 +4881,8 @@ pub async fn run_with_listener_idle_timeout(
 ) -> io::Result<()> {
     let state = build_state(StateConfig {
         max_job_size,
-        max_job_bytes: None,
-        max_storage_bytes: None,
-        wal_dir: None,
-        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
-        migrate_wal: false,
-        wal_skip_corrupt: false,
-        name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_idle_timeout(Some(idle_timeout))),
-        wal_observer: None,
+        ..Default::default()
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4881,15 +4896,8 @@ pub async fn run_with_listener_tcp_keepalive(
 ) -> io::Result<()> {
     let state = build_state(StateConfig {
         max_job_size,
-        max_job_bytes: None,
-        max_storage_bytes: None,
-        wal_dir: None,
-        sync_interval: crate::wal::DEFAULT_SYNC_INTERVAL,
-        migrate_wal: false,
-        wal_skip_corrupt: false,
-        name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_tcp_keepalive(idle)),
-        wal_observer: None,
+        ..Default::default()
     })?;
     serve(listener, state, max_job_size).await
 }
