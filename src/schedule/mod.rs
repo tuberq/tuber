@@ -20,7 +20,7 @@ use crate::protocol::Response;
 use crate::tube::IdpDedups;
 use spec::Spec;
 
-/// Most entries held across all owners. Keeps the schedule files and the
+/// Most entries held across all owners. Keeps the schedule records and the
 /// per-tick scan bounded.
 pub const MAX_ENTRIES: usize = 10_000;
 
@@ -202,8 +202,7 @@ pub struct Schedules {
     owners: BTreeMap<String, BTreeMap<String, Entry>>,
     /// Sum of `memory_cost` over every entry.
     bytes: u64,
-    /// Something the definitions file holds has changed since it was last
-    /// written, so the next commit rewrites it even if it changes nothing.
+    /// The last commit changed something its owner's stored set holds.
     unsaved: bool,
 }
 
@@ -220,18 +219,14 @@ impl Schedules {
         self.bytes
     }
 
-    /// Whether the definitions file is behind: a commit or a clock
-    /// correction changed what it holds, and it hasn't been written since.
-    pub fn unsaved(&self) -> bool {
-        self.unsaved
+    /// Whether the last commit changed what its owner's stored set holds
+    /// (a respelled spec included), so it must be written. Reads once.
+    pub fn take_unsaved(&mut self) -> bool {
+        std::mem::take(&mut self.unsaved)
     }
 
-    pub fn mark_unsaved(&mut self) {
-        self.unsaved = true;
-    }
-
-    pub fn mark_saved(&mut self) {
-        self.unsaved = false;
+    pub fn owners(&self) -> impl Iterator<Item = &str> {
+        self.owners.keys().map(String::as_str)
     }
 
     pub fn get(&self, owner: &str, name: &str) -> Option<&Entry> {

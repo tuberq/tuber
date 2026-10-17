@@ -3934,58 +3934,142 @@ fn schedule_fire_records_dedups_and_buried_streak() {
     assert_eq!(s.tubes["jobs"].stat.idp_dedups.buried, 2, "counted on the tube too");
 }
 
-/// The definitions file's inode: each rewrite renames a new file over it.
-fn schedules_inode(dir: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(dir.join("schedules")).unwrap().ino()
+// --- Recurring schedules: persistence ---
+
+/// A server started on `dir`'s binlog, as at a restart.
+fn reopen(dir: &std::path::Path) -> ServerState {
+    build_state(StateConfig {
+        max_job_size: 65535,
+        max_job_bytes: None,
+        max_storage_bytes: Some(1 << 30),
+        wal_dir: Some(dir),
+        sync_interval: Duration::from_millis(100),
+        migrate_wal: false,
+        wal_skip_corrupt: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0))),
+    })
+    .unwrap()
+}
+
+/// Copy what's on disk in `from` to `to`, as a crash would leave it: what
+/// the WAL still holds in its buffer is lost.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let dest = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_dir(&path, &dest);
+        } else {
+            std::fs::copy(&path, &dest).unwrap();
+        }
+    }
 }
 
 #[test]
-fn a_schedule_sync_that_changes_nothing_does_not_rewrite_the_file() {
-    // Every commit rewrote and fsynced the whole file on the engine task,
-    // stalling every client for as long as that took.
+fn schedules_survive_a_restart_in_the_wal_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let mut s = make_state();
+    let mut s = reopen(dir.path());
     let c = register(&mut s);
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    s.schedule_files = Some(files);
     sync_schedules(&mut s, c, &[("ping", "every 60s")]);
-    let written = schedules_inode(dir.path());
+    let t = next_fire(&s, "ping");
+    s.fire_due_schedules(t);
+    drop(s);
+    for name in ["schedules", "schedules.fired"] {
+        assert!(!dir.path().join(name).exists(), "{name} beside the WAL");
+    }
 
-    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
-    assert_eq!(schedules_inode(dir.path()), written);
+    let s = reopen(dir.path());
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!(e.last_fire, Some(t));
+    assert_eq!(e.next_fire, Some(t + mins(1)));
 }
 
 #[test]
-fn a_schedule_sync_that_only_respells_a_spec_is_saved() {
+fn a_fire_is_on_disk_before_its_job_is_put() {
+    // At most once: a crash after the put mustn't fire the tick again, so
+    // the stamp is synced first, not left in the WAL's buffer.
     let dir = tempfile::tempdir().unwrap();
-    let mut s = make_state();
+    let mut s = reopen(dir.path());
     let c = register(&mut s);
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    s.schedule_files = Some(files);
     sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let t = next_fire(&s, "ping");
+    s.fire_due_schedules(t);
+    assert_eq!(ready_in(&s, "jobs"), 1);
+    let crashed = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), crashed.path());
+    drop(s);
 
-    sync_schedules(&mut s, c, &[("ping", "every 1m")]);
-    assert_eq!(fired(&s, "ping"), 0);
-    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    assert_eq!(
-        restored.get("app", "ping").unwrap().line.spec_text,
-        "every 1m"
-    );
+    let mut s = reopen(crashed.path());
+    assert_eq!(s.schedules.get("app", "ping").unwrap().last_fire, Some(t));
+    s.fire_due_schedules(t + secs(1));
+    assert_eq!(fired(&s, "ping"), 0, "the tick isn't fired again");
 }
 
 #[test]
-fn a_schedule_sync_that_changes_nothing_saves_one_that_failed_to() {
-    // The failed commit's set stands in memory, so the retry finds nothing
-    // changed. It still has to reach the disk.
+fn a_schedule_set_in_the_oldest_segment_is_carried_forward() {
     let dir = tempfile::tempdir().unwrap();
-    let defs = dir.path().join("defs");
     let mut s = make_state();
+    let config = crate::wal::WalConfig {
+        max_file_size: Some(1024),
+        ..Default::default()
+    };
+    s.wal = Some(crate::wal::Wal::open(dir.path(), config).unwrap());
     let c = register(&mut s);
-    // Not there yet, so the first commit's write fails.
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(&defs).unwrap();
-    s.schedule_files = Some(files);
+    sync_schedules(&mut s, c, &[("report", "@yearly")]);
+    let first = dir.path().join("binlog.000001");
+    assert!(first.exists());
 
+    // Churn until compaction has moved the set on and GC taken the segment.
+    for _ in 0..200 {
+        let id = match s.handle_command(c, put_cmd(0, 0, 60, 1), Some(b"x".to_vec())) {
+            Response::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        assert_eq!(s.handle_command(c, Command::Delete { id }, None), Response::Deleted);
+        s.tick();
+        assert!(s.sync_wal());
+    }
+    assert!(!first.exists(), "the oldest segment was collected");
+    drop(s);
+
+    let s = reopen(dir.path());
+    assert!(s.schedules.get("app", "report").is_some());
+}
+
+#[test]
+fn schedule_files_from_an_earlier_tuber_move_into_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = {
+        let mut s = make_state();
+        let c = register(&mut s);
+        sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+        let t = next_fire(&s, "ping");
+        s.fire_due_schedules(t);
+        crate::schedule::store::write_files(dir.path(), &s.schedules).unwrap();
+        t
+    };
+
+    let s = reopen(dir.path());
+    assert_eq!(s.schedules.get("app", "ping").unwrap().last_fire, Some(t));
+    for name in ["schedules", "schedules.fired"] {
+        assert!(!dir.path().join(name).exists(), "{name} left behind");
+    }
+    drop(s);
+
+    let s = reopen(dir.path());
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!(e.last_fire, Some(t), "restored from the WAL");
+}
+
+#[test]
+fn a_schedule_commit_the_wal_cannot_take_is_an_internal_error() {
+    // The set stands in memory, as a put whose WAL write fails does.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+    s.wal.as_mut().unwrap().inject_io_failure();
     s.handle_command(
         c,
         Command::ScheduleBegin {
@@ -3993,16 +4077,39 @@ fn a_schedule_sync_that_changes_nothing_saves_one_that_failed_to() {
         },
         None,
     );
-    let line = "schedule-put ping jobs 0 0 60 2 every 60s";
-    let cmd = protocol::parse_line(line.as_bytes()).unwrap();
+    let cmd = protocol::parse_line(b"schedule-put ping jobs 0 0 60 2 every 60s").unwrap();
     s.handle_command(c, cmd, Some(b"{}".to_vec()));
     let resp = s.handle_command(c, Command::ScheduleCommit, None);
     assert_eq!(resp, Response::InternalError);
+    assert!(s.wal_failed);
+    assert!(s.schedules.get("app", "ping").is_some());
+}
 
-    std::fs::create_dir(&defs).unwrap();
+#[test]
+fn a_schedule_sync_that_only_respells_a_spec_reaches_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
     sync_schedules(&mut s, c, &[("ping", "every 60s")]);
-    let (_, restored) = crate::schedule::store::ScheduleFiles::open(&defs).unwrap();
-    assert!(restored.get("app", "ping").is_some());
+    sync_schedules(&mut s, c, &[("ping", "every 1m")]);
+    assert_eq!(fired(&s, "ping"), 0);
+    drop(s);
+    let s = reopen(dir.path());
+    assert_eq!(
+        s.schedules.get("app", "ping").unwrap().line.spec_text,
+        "every 1m"
+    );
+}
+
+#[test]
+fn a_schedule_sync_that_changes_nothing_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let written = s.wal.as_ref().unwrap().total_disk_bytes();
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    assert_eq!(s.wal.as_ref().unwrap().total_disk_bytes(), written);
 }
 
 #[test]
@@ -4042,10 +4149,8 @@ fn a_tick_due_after_the_wal_failed_waits_for_the_restart() {
 #[test]
 fn a_fire_refused_for_memory_is_lost_but_not_recorded_as_a_fire() {
     let dir = tempfile::tempdir().unwrap();
-    let mut s = make_state();
+    let mut s = reopen(dir.path());
     let c = register(&mut s);
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    s.schedule_files = Some(files);
     sync_schedules(&mut s, c, &[("ping", "every 60s")]);
     let t = next_fire(&s, "ping");
 
@@ -4059,7 +4164,8 @@ fn a_fire_refused_for_memory_is_lost_but_not_recorded_as_a_fire() {
     // But no job was queued, so last-fire doesn't move — in memory or on
     // disk — and an alert on its staleness still sees the gap.
     assert_eq!(e.last_fire, None);
-    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    drop(s);
+    let restored = reopen(dir.path()).schedules;
     assert_eq!(restored.get("app", "ping").unwrap().last_fire, None);
 }
 
@@ -4070,10 +4176,8 @@ fn a_fire_whose_body_store_write_fails_is_not_recorded_as_a_fire() {
     // back at a restart.
     let dir = tempfile::tempdir().unwrap();
     let toast = tempfile::tempdir().unwrap();
-    let mut s = make_state();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
     let c = register(&mut s);
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    s.schedule_files = Some(files);
     s.body_store = Some(Arc::new(
         crate::body_store::BodyStore::open(toast.path(), 4096).unwrap(),
     ));
@@ -4102,7 +4206,8 @@ fn a_fire_whose_body_store_write_fails_is_not_recorded_as_a_fire() {
     assert_eq!(e.stats.last_result.as_deref(), Some("INTERNAL_ERROR"));
     assert_eq!(ready_in(&s, "jobs"), 0);
     assert_eq!(e.last_fire, None);
-    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    drop(s);
+    let restored = reopen(dir.path()).schedules;
     assert_eq!(restored.get("app", "ping").unwrap().last_fire, None);
 }
 
@@ -4112,37 +4217,37 @@ fn of_a_tick_s_fires_only_the_one_that_failed_the_wal_is_recorded() {
     // as fired. The fires after it are refused before anything is
     // written, like a tick due once the WAL has failed.
     let dir = tempfile::tempdir().unwrap();
-    let wal_dir = tempfile::tempdir().unwrap();
-    let mut s = make_wal_state(wal_dir.path(), Duration::from_millis(100));
+    let mut s = reopen(dir.path());
     let c = register(&mut s);
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    s.schedule_files = Some(files);
     sync_schedules(&mut s, c, &[("ping", "every 60s"), ("pong", "every 60s")]);
     let t = next_fire(&s, "ping").max(next_fire(&s, "pong"));
 
-    s.wal.as_mut().unwrap().inject_io_failure();
+    // Both stamps and their sync go through; ping's put fails the WAL.
+    s.wal.as_mut().unwrap().inject_io_failure_after(3);
     s.fire_due_schedules(t);
     assert!(s.wal_failed);
+    assert_eq!(ready_in(&s, "jobs"), 0);
     let last_fire = |s: &crate::schedule::Schedules, name| s.get("app", name).unwrap().last_fire;
     assert_eq!(last_fire(&s.schedules, "ping"), Some(t));
     assert_eq!(last_fire(&s.schedules, "pong"), None);
-    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
-    assert!(last_fire(&restored, "ping").is_some());
-    assert_eq!(last_fire(&restored, "pong"), None);
+    drop(s);
+
+    // Putting pong's stamp back needed the WAL, so after a restart its tick
+    // counts as fired too: lost, not caught up. Still at most once.
+    let restored = reopen(dir.path()).schedules;
+    assert_eq!(last_fire(&restored, "ping"), Some(t));
+    assert_eq!(last_fire(&restored, "pong"), Some(t));
 }
 
 #[test]
 fn a_fire_that_cannot_be_stamped_is_not_put() {
-    let mut s = make_state();
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
     let c = register(&mut s);
     sync_schedules(&mut s, c, &[("ping", "every 60s")]);
     let t = next_fire(&s, "ping");
 
-    // A directory that isn't there: every write fails.
-    let gone = std::env::temp_dir().join("tuber-test-no-such-dir/nested");
-    let (files, _) = crate::schedule::store::ScheduleFiles::open(&gone).unwrap();
-    s.schedule_files = Some(files);
-
+    s.wal.as_mut().unwrap().inject_io_failure();
     s.fire_due_schedules(t);
     assert_eq!(ready_in(&s, "jobs"), 0, "at most once: unstamped means unfired");
     let e = s.schedules.get("app", "ping").unwrap();

@@ -492,10 +492,10 @@ struct ServerState {
     /// Memory held by schedule syncs not yet committed, across every
     /// connection. Counted against `--max-jobs-size` like committed entries.
     staged_schedule_bytes: u64,
-    /// Where `schedules` is persisted. Present iff a binlog directory is
-    /// configured; without one, schedules live in memory and the next app to
-    /// boot syncs them back.
-    schedule_files: Option<crate::schedule::store::ScheduleFiles>,
+    /// The WAL records persisting `schedules`. Empty without a binlog
+    /// directory: schedules live in memory, and the next app to boot syncs
+    /// them back.
+    schedule_refs: crate::schedule::store::ScheduleRefs,
 }
 
 impl ServerState {
@@ -610,7 +610,7 @@ impl ServerState {
             fd_budget,
             schedules: crate::schedule::Schedules::default(),
             staged_schedule_bytes: 0,
-            schedule_files: None,
+            schedule_refs: Default::default(),
         }
     }
 
@@ -731,10 +731,8 @@ impl ServerState {
             ),
             None => (0, 0),
         };
-        let schedule_bytes = self.schedule_files.as_ref().map_or(0, |f| f.disk_bytes());
         let projected = wal_bytes
             .saturating_add(toast_bytes)
-            .saturating_add(schedule_bytes)
             .saturating_add(body_len)
             .saturating_add(BODY_OVERHEAD)
             .saturating_add(wal_reserve);
@@ -4431,6 +4429,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             dir,
         );
         let (mut jobs, next_id, tombstones, orphan_bodies, buried_order) = wal.replay()?;
+        let replayed_schedules = wal.take_replayed_schedules();
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
 
@@ -4573,24 +4572,14 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
 
         state.restore_jobs(jobs, next_id, tombstones, buried_order);
 
-        // Schedule entries live beside the WAL; see `crate::schedule::store`.
-        let (files, schedules) = match crate::schedule::store::ScheduleFiles::open(dir) {
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                // A damaged schedule file mustn't keep the queue down. Set
-                // it aside and start without schedules: each app's next sync
-                // restores its own. (One from a different tuber version is
-                // `Unsupported`, not damage, and stops startup below.)
-                let aside = crate::schedule::store::set_aside_corrupt(dir)?;
-                tracing::error!("{e}; moved to {aside:?}, no schedules until apps re-sync");
-                crate::schedule::store::ScheduleFiles::open(dir)?
-            }
-            other => other?,
-        };
-        if !schedules.is_empty() {
-            tracing::info!("schedules: restored {} entries from {:?}", schedules.len(), dir);
-        }
-        state.schedules = schedules;
-        state.schedule_files = Some(files);
+        // Hand the body store to the WAL so every WAL fsync is preceded
+        // by a TOAST fsync — the durability invariant for v5 records.
+        wal.set_body_store(Arc::clone(&body_store));
+        state.wal = Some(wal);
+        state.body_store = Some(body_store);
+        state.persist_legacy_cooldowns();
+        // Schedule entries are in the WAL too; see `crate::schedule::store`.
+        state.restore_schedules(dir, replayed_schedules)?;
 
         // Enforce the in-memory budget after replay. The WAL on-disk size
         // is not a reliable proxy (tombstones, superseded records, and format
@@ -4612,12 +4601,6 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
             ));
         }
 
-        // Hand the body store to the WAL so every WAL fsync is preceded
-        // by a TOAST fsync — the durability invariant for v5 records.
-        wal.set_body_store(Arc::clone(&body_store));
-        state.wal = Some(wal);
-        state.body_store = Some(body_store);
-        state.persist_legacy_cooldowns();
         tracing::info!(
             "WAL: replayed {} jobs and {} idempotency tombstones from {:?}",
             job_count,

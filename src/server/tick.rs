@@ -325,6 +325,18 @@ impl ServerState {
                     }
                 }
             }
+
+            // So do schedule records. Rewriting an owner's set moves it out,
+            // and its last fires with it: the set carries them.
+            let owners = self.schedule_refs.owners_in(target_seq);
+            for owner in owners.into_iter().take(count) {
+                if !self.journal_schedule_set(&owner) {
+                    break;
+                }
+                if let Some(wal) = self.wal.as_mut() {
+                    wal.record_migration();
+                }
+            }
         }
 
         // After-group-held jobs (state Delayed, no deadline) live only in

@@ -1,17 +1,26 @@
-//! The schedule files in the binlog directory.
+//! Recurring schedules on disk: in the WAL, when persistence is on.
 //!
-//! `schedules` holds every entry's definition and is rewritten on each
-//! commit. `schedules.fired` holds each entry's last fire and is rewritten
-//! before a tick's fires are put, so a crash between the two loses that tick
-//! rather than firing it twice. Kept apart so a fire rewrites a few bytes per
-//! entry rather than every entry's body.
+//! An owner's schedule set record holds all its entries, and is written on
+//! each commit that changes them, synced before `SYNCED`. A schedule fired
+//! record holds one entry's last fire, and is written and synced before a
+//! tick's fires are put, so a crash between the two loses that tick rather
+//! than firing it twice. Kept apart so a fire writes a few bytes per entry
+//! rather than every entry's body.
 //!
-//! Neither is a WAL record: WAL segments are reclaimed by tracking the live
-//! jobs each holds, and entries would have to join that for state that
-//! changes a few times per deploy. A fired job is an ordinary job in the WAL.
+//! Each live record pins its segment, as a live job's record does: an
+//! owner's set until its next one, and an entry's last fire until its next
+//! one or its owner's next set, which carries every entry's last fire.
+//! Compaction rewrites an owner's set to move it, and its last fires, out of
+//! the oldest segment.
 //!
-//! Both files are replaced whole: written to `<name>.tmp`, fsynced, renamed
-//! over the old file, and the directory fsynced. Layout, little-endian:
+//! An entry is stored as its `schedule-put` line and parsed back through the
+//! protocol parser on restore, so a restored entry passes exactly the checks
+//! a synced one did.
+//!
+//! Before WAL v9 the schedules were two files beside the WAL, each replaced
+//! whole: `schedules` (definitions) and `schedules.fired` (last fires). A
+//! start that finds them moves their entries into the WAL and removes them.
+//! Layout, little-endian:
 //!
 //! ```text
 //! magic[4] version:u32 count:u32 record* crc32:u32     (crc over all before it)
@@ -20,23 +29,19 @@
 //! str/bytes = len:u32 + bytes;  time = seconds:i64 nanos:i32
 //! ```
 //!
-//! Every format version must keep the magic, the version field and the
-//! trailing crc32 over the rest: a file whose checksum fails is damage and is
-//! set aside, while a checksummed file of another version is a newer tuber's
-//! schedules and stops startup rather than being thrown away.
-//!
-//! A definition is stored as its `schedule-put` line and parsed back through
-//! the protocol parser on load, so a stored entry passes exactly the checks a
-//! synced one did.
+//! A file whose checksum fails is damage and is set aside, while a
+//! checksummed file of another version stops startup rather than being
+//! thrown away.
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 
 use super::{Catchup, Entry, EntryStats, Line, Schedules};
+use crate::wal::{RecordRef, ReplayedSchedules, ScheduleRecord, Wal};
 
 const DEFS_FILE: &str = "schedules";
 const STAMPS_FILE: &str = "schedules.fired";
@@ -44,115 +49,224 @@ const DEFS_MAGIC: &[u8; 4] = b"TSCH";
 const STAMPS_MAGIC: &[u8; 4] = b"TSTP";
 const VERSION: u32 = 1;
 
-/// The two files and their sizes, which count toward `--max-storage-bytes`.
-#[derive(Debug)]
-pub struct ScheduleFiles {
-    dir: PathBuf,
-    defs_bytes: u64,
-    stamps_bytes: u64,
+/// The WAL records holding the schedules, and so pinning their segments.
+#[derive(Debug, Default)]
+pub struct ScheduleRefs {
+    /// Each owner's latest set.
+    sets: HashMap<String, RecordRef>,
+    /// Last fires written since their owner's set, by owner then name.
+    stamps: HashMap<String, HashMap<String, RecordRef>>,
 }
 
-impl ScheduleFiles {
-    /// Read the entries stored in `dir`. A missing file is an empty set. A
-    /// damaged definitions file is an error; a damaged stamps file is logged
-    /// and ignored, so missed ticks are judged from each entry's sync time.
-    pub fn open(dir: &Path) -> io::Result<(ScheduleFiles, Schedules)> {
-        let mut files = ScheduleFiles {
-            dir: dir.to_path_buf(),
-            defs_bytes: 0,
-            stamps_bytes: 0,
-        };
+impl ScheduleRefs {
+    /// Rebuild the entries a replay found, and the references their
+    /// records hold.
+    pub fn restore(wal: &mut Wal, replayed: ReplayedSchedules) -> (ScheduleRefs, Schedules) {
+        let mut refs = ScheduleRefs::default();
         let mut schedules = Schedules::default();
-        let Some(defs) = read(dir, DEFS_FILE, DEFS_MAGIC)? else {
-            return Ok((files, schedules));
-        };
-        files.defs_bytes = defs.len() as u64;
-
-        let stamps = read(dir, STAMPS_FILE, STAMPS_MAGIC).and_then(|bytes| {
-            let Some(bytes) = bytes else {
-                return Ok(HashMap::new());
-            };
-            files.stamps_bytes = bytes.len() as u64;
-            parse_stamps(&bytes)
-        });
-        let stamps = match stamps {
-            Ok(stamps) => stamps,
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(e),
-            Err(e) => {
-                tracing::error!("{STAMPS_FILE}: {e}; last fires lost");
-                HashMap::new()
-            }
-        };
-
-        let mut r = Reader::records(&defs);
-        for _ in 0..r.count {
-            let owner = r.string()?;
-            let line_text = r.string()?;
-            let synced_at = r.time()?;
-            let body = r.bytes()?.to_vec();
-            let line = match crate::protocol::parse_schedule_put_line(&line_text) {
-                Ok(line) => line,
-                Err(resp) => {
-                    // Most likely a zone gone from both the host's tzdata
-                    // and the copy built into tuber.
-                    // The app's next sync puts it back, or is told why not.
-                    tracing::error!(
-                        owner,
-                        line = line_text,
-                        reply = ?resp,
-                        "{DEFS_FILE}: stored entry no longer parses; dropped",
-                    );
+        let ReplayedSchedules {
+            sets, mut stamps, ..
+        } = replayed;
+        for (owner, (records, set)) in sets {
+            refs.sets.insert(owner.clone(), set);
+            for r in records {
+                let Some(mut entry) = stored_entry(&owner, &r.line, r.body, r.synced_at, r.last_fire)
+                else {
                     continue;
+                };
+                if let Some((last_fire, stamp)) =
+                    stamps.remove(&(owner.clone(), entry.line.name.clone()))
+                {
+                    entry.last_fire = last_fire;
+                    refs.stamps
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(entry.line.name.clone(), stamp);
                 }
-            };
-            let last_fire = stamps.get(&(owner.clone(), line.name.clone())).copied();
-            let mut entry = Entry {
-                owner,
-                next_fire: None,
-                line,
-                body,
-                synced_at,
-                last_fire,
-                stats: EntryStats::default(),
-            };
-            entry.next_fire = entry.line.spec.next_after(entry.recorded());
-            schedules.restore(entry);
+                entry.next_fire = entry.line.spec.next_after(entry.recorded());
+                schedules.restore(entry);
+            }
         }
-        Ok((files, schedules))
-    }
-
-    pub fn disk_bytes(&self) -> u64 {
-        self.defs_bytes + self.stamps_bytes
-    }
-
-    /// Rewrite both files after a commit.
-    pub fn write_all(&mut self, schedules: &Schedules) -> io::Result<()> {
-        let mut w = Writer::new(DEFS_MAGIC, schedules.len(), self.defs_bytes);
-        for e in schedules.iter() {
-            w.string(&e.owner);
-            w.string(&wire_line(&e.line, e.body.len()));
-            w.time(e.synced_at);
-            w.bytes(&e.body);
+        // Last fires of entries that didn't come back.
+        for (_, stamp) in stamps.into_values() {
+            wal.release_record(stamp);
         }
-        self.defs_bytes = replace(&self.dir, DEFS_FILE, &w.finish())?;
-        self.write_stamps(schedules)
+        (refs, schedules)
     }
 
-    /// Rewrite the last fires, before the fires they record are put.
-    pub fn write_stamps(&mut self, schedules: &Schedules) -> io::Result<()> {
-        let fired: Vec<(&Entry, Timestamp)> = schedules
-            .iter()
-            .filter_map(|e| Some((e, e.last_fire?)))
+    /// Journal `owner`'s entries as `schedules` holds them now, releasing
+    /// the records that supersedes.
+    pub fn write_set(&mut self, wal: &mut Wal, schedules: &Schedules, owner: &str) -> io::Result<()> {
+        let records: Vec<ScheduleRecord> = schedules
+            .owner_entries(owner)
+            .map(|e| ScheduleRecord {
+                line: wire_line(&e.line, e.body.len()),
+                body: e.body.clone(),
+                synced_at: e.synced_at,
+                last_fire: e.last_fire,
+            })
             .collect();
-        let mut w = Writer::new(STAMPS_MAGIC, fired.len(), self.stamps_bytes);
-        for (e, last_fire) in fired {
-            w.string(&e.owner);
-            w.string(&e.line.name);
-            w.time(last_fire);
+        let set = wal.write_schedule_set(owner, &records)?;
+        if let Some(old) = self.sets.remove(owner) {
+            wal.release_record(old);
         }
-        self.stamps_bytes = replace(&self.dir, STAMPS_FILE, &w.finish())?;
+        for stamp in self.stamps.remove(owner).into_iter().flat_map(HashMap::into_values) {
+            wal.release_record(stamp);
+        }
+        if let Some(set) = set {
+            self.sets.insert(owner.to_string(), set);
+        }
         Ok(())
     }
+
+    /// Journal the last fire of `owner`'s entry `name`.
+    pub fn write_fired(
+        &mut self,
+        wal: &mut Wal,
+        owner: &str,
+        name: &str,
+        last_fire: Option<Timestamp>,
+    ) -> io::Result<()> {
+        let stamp = wal.write_schedule_fired(owner, name, last_fire)?;
+        if let Some(old) = self
+            .stamps
+            .entry(owner.to_string())
+            .or_default()
+            .insert(name.to_string(), stamp)
+        {
+            wal.release_record(old);
+        }
+        Ok(())
+    }
+
+    /// Owners with a record in segment `seq`, whose sets compaction must
+    /// rewrite for it to be collected.
+    pub fn owners_in(&self, seq: u64) -> BTreeSet<String> {
+        let sets = self.sets.iter().filter(|(_, r)| r.seq == seq);
+        let stamps = self
+            .stamps
+            .iter()
+            .filter(|(_, names)| names.values().any(|r| r.seq == seq));
+        sets.map(|(owner, _)| owner.clone())
+            .chain(stamps.map(|(owner, _)| owner.clone()))
+            .collect()
+    }
+}
+
+/// An entry as stored, or `None`, logged, if its line no longer parses.
+/// Its next fire is left for the caller.
+fn stored_entry(
+    owner: &str,
+    line_text: &str,
+    body: Vec<u8>,
+    synced_at: Timestamp,
+    last_fire: Option<Timestamp>,
+) -> Option<Entry> {
+    let line = match crate::protocol::parse_schedule_put_line(line_text) {
+        Ok(line) => line,
+        Err(resp) => {
+            // Most likely a zone gone from both the host's tzdata and the
+            // copy built into tuber. The app's next sync puts it back, or is
+            // told why not.
+            tracing::error!(
+                owner,
+                line = line_text,
+                reply = ?resp,
+                "stored schedule entry no longer parses; dropped",
+            );
+            return None;
+        }
+    };
+    Some(Entry {
+        owner: owner.to_string(),
+        next_fire: None,
+        line,
+        body,
+        synced_at,
+        last_fire,
+        stats: EntryStats::default(),
+    })
+}
+
+/// Read the schedule files an earlier tuber kept in `dir`: `None` if there
+/// are none. A damaged definitions file is an error; a damaged stamps file
+/// is logged and ignored, so missed ticks are judged from each entry's sync
+/// time.
+pub fn read_files(dir: &Path) -> io::Result<Option<Schedules>> {
+    let Some(defs) = read(dir, DEFS_FILE, DEFS_MAGIC)? else {
+        return Ok(None);
+    };
+    let stamps = read(dir, STAMPS_FILE, STAMPS_MAGIC).and_then(|bytes| match bytes {
+        Some(bytes) => parse_stamps(&bytes),
+        None => Ok(HashMap::new()),
+    });
+    let stamps = match stamps {
+        Ok(stamps) => stamps,
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(e),
+        Err(e) => {
+            tracing::error!("{STAMPS_FILE}: {e}; last fires lost");
+            HashMap::new()
+        }
+    };
+
+    let mut schedules = Schedules::default();
+    let mut r = Reader::records(&defs);
+    for _ in 0..r.count {
+        let owner = r.string()?;
+        let line_text = r.string()?;
+        let synced_at = r.time()?;
+        let body = r.bytes()?.to_vec();
+        let Some(mut entry) = stored_entry(&owner, &line_text, body, synced_at, None) else {
+            continue;
+        };
+        entry.last_fire = stamps.get(&(owner, entry.line.name.clone())).copied();
+        entry.next_fire = entry.line.spec.next_after(entry.recorded());
+        schedules.restore(entry);
+    }
+    Ok(Some(schedules))
+}
+
+/// Remove the schedule files from `dir`, once the WAL holds their entries.
+pub fn remove_files(dir: &Path) -> io::Result<()> {
+    let mut removed = false;
+    for name in [DEFS_FILE, STAMPS_FILE] {
+        // A replace cut short by a crash leaves its temporary file behind.
+        for path in [dir.join(name), dir.join(format!("{name}.tmp"))] {
+            match fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    if removed {
+        crate::body_store::fsync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Write `schedules` as an earlier tuber would have.
+#[cfg(test)]
+pub fn write_files(dir: &Path, schedules: &Schedules) -> io::Result<()> {
+    let mut w = Writer::new(DEFS_MAGIC, schedules.len());
+    for e in schedules.iter() {
+        w.string(&e.owner);
+        w.string(&wire_line(&e.line, e.body.len()));
+        w.time(e.synced_at);
+        w.bytes(&e.body);
+    }
+    fs::write(dir.join(DEFS_FILE), w.finish())?;
+    let fired: Vec<(&Entry, Timestamp)> = schedules
+        .iter()
+        .filter_map(|e| Some((e, e.last_fire?)))
+        .collect();
+    let mut w = Writer::new(STAMPS_MAGIC, fired.len());
+    for (e, last_fire) in fired {
+        w.string(&e.owner);
+        w.string(&e.line.name);
+        w.time(last_fire);
+    }
+    fs::write(dir.join(STAMPS_FILE), w.finish())
 }
 
 /// Move a damaged definitions file out of the way, to `schedules.corrupt`
@@ -237,27 +351,15 @@ fn read(dir: &Path, name: &str, magic: &[u8; 4]) -> io::Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-/// Replace `dir/name` with `bytes` atomically; returns the size written.
-fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<u64> {
-    let tmp = dir.join(format!("{name}.tmp"));
-    let mut f = File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, dir.join(name))?;
-    // The rename is only durable once the directory entry is.
-    crate::body_store::fsync_dir(dir)?;
-    Ok(bytes.len() as u64)
-}
-
+#[cfg(test)]
 struct Writer {
     buf: Vec<u8>,
 }
 
+#[cfg(test)]
 impl Writer {
-    /// `size_hint`: the file's last size, so the buffer rarely regrows.
-    fn new(magic: &[u8; 4], count: usize, size_hint: u64) -> Writer {
-        let mut buf = Vec::with_capacity(size_hint.max(256) as usize);
+    fn new(magic: &[u8; 4], count: usize) -> Writer {
+        let mut buf = Vec::new();
         buf.extend_from_slice(magic);
         buf.extend_from_slice(&VERSION.to_le_bytes());
         buf.extend_from_slice(&(count as u32).to_le_bytes());
@@ -352,24 +454,16 @@ mod tests {
         s
     }
 
-    #[test]
-    fn round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = schedules_with(&[
-            "rollup splat.maint 1024 0 120 15 idp:rollup con:1 5 * * * *",
-            "retention splat.maint 10 5 60 15 con:jobs:2 catchup:600 0 2 * * * Australia/Melbourne",
-            "checkpoint splat.checkins 1024 0 120 15 catchup:0 every 10m",
-        ]);
-        s.get_mut("splat", "rollup").unwrap().last_fire = Some(ts("2026-10-11T03:05:00.25Z"));
+    /// Replay `dir`'s WAL and restore the schedules it holds.
+    fn restored(dir: &Path) -> Schedules {
+        let mut wal = Wal::open(dir, crate::wal::WalConfig::default()).unwrap();
+        wal.replay().unwrap();
+        let replayed = wal.take_replayed_schedules();
+        ScheduleRefs::restore(&mut wal, replayed).1
+    }
 
-        let (mut files, empty) = ScheduleFiles::open(dir.path()).unwrap();
-        assert!(empty.is_empty());
-        files.write_all(&s).unwrap();
-        assert!(files.disk_bytes() > 0);
-
-        let (files2, loaded) = ScheduleFiles::open(dir.path()).unwrap();
-        assert_eq!(files2.disk_bytes(), files.disk_bytes());
-        assert_eq!(loaded.len(), 3);
+    fn assert_same(loaded: &Schedules, s: &Schedules) {
+        assert_eq!(loaded.len(), s.len());
         for e in s.iter() {
             let l = loaded.get(&e.owner, &e.line.name).unwrap();
             assert_eq!(l.line, e.line);
@@ -378,41 +472,79 @@ mod tests {
             assert_eq!(l.last_fire, e.last_fire);
         }
         assert_eq!(loaded.bytes(), s.bytes());
+    }
+
+    fn three_entries() -> Schedules {
+        let mut s = schedules_with(&[
+            "rollup splat.maint 1024 0 120 15 idp:rollup con:1 5 * * * *",
+            "retention splat.maint 10 5 60 15 con:jobs:2 catchup:600 0 2 * * * Australia/Melbourne",
+            "checkpoint splat.checkins 1024 0 120 15 catchup:0 every 10m",
+        ]);
+        s.get_mut("splat", "rollup").unwrap().last_fire = Some(ts("2026-10-11T03:05:00.25Z"));
+        s
+    }
+
+    #[test]
+    fn round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = three_entries();
+        {
+            let mut wal = Wal::open(dir.path(), crate::wal::WalConfig::default()).unwrap();
+            let mut refs = ScheduleRefs::default();
+            refs.write_set(&mut wal, &s, "splat").unwrap();
+            wal.sync().unwrap();
+        }
+        let loaded = restored(dir.path());
+        assert_same(&loaded, &s);
         // Next fire resumes from the last fire.
         let rollup = loaded.get("splat", "rollup").unwrap();
         assert_eq!(rollup.next_fire, Some(ts("2026-10-11T04:05:00Z")));
     }
 
     #[test]
-    fn stamps_are_rewritten_alone() {
+    fn a_last_fire_written_after_the_set_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = schedules_with(&["rollup t 0 0 1 15 5 * * * *"]);
-        let (mut files, _) = ScheduleFiles::open(dir.path()).unwrap();
-        files.write_all(&s).unwrap();
-        let defs_before = fs::read(dir.path().join(DEFS_FILE)).unwrap();
+        let s = schedules_with(&["rollup t 0 0 1 15 5 * * * *"]);
+        {
+            let mut wal = Wal::open(dir.path(), crate::wal::WalConfig::default()).unwrap();
+            let mut refs = ScheduleRefs::default();
+            refs.write_set(&mut wal, &s, "splat").unwrap();
+            let t = Some(ts("2026-10-11T03:05:00Z"));
+            refs.write_fired(&mut wal, "splat", "rollup", t).unwrap();
+            assert_eq!(refs.owners_in(1), BTreeSet::from(["splat".to_string()]));
+            wal.sync().unwrap();
+        }
+        let loaded = restored(dir.path());
+        let e = loaded.get("splat", "rollup").unwrap();
+        assert_eq!(e.last_fire, Some(ts("2026-10-11T03:05:00Z")));
+        assert_eq!(e.next_fire, Some(ts("2026-10-11T04:05:00Z")));
+    }
 
-        s.get_mut("splat", "rollup").unwrap().last_fire = Some(ts("2026-10-11T03:05:00Z"));
-        files.write_stamps(&s).unwrap();
-        assert_eq!(fs::read(dir.path().join(DEFS_FILE)).unwrap(), defs_before);
-        let (_, loaded) = ScheduleFiles::open(dir.path()).unwrap();
-        assert_eq!(
-            loaded.get("splat", "rollup").unwrap().last_fire,
-            Some(ts("2026-10-11T03:05:00Z"))
-        );
+    #[test]
+    fn files_an_earlier_tuber_wrote_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_files(dir.path()).unwrap().is_none());
+        let s = three_entries();
+        write_files(dir.path(), &s).unwrap();
+        let loaded = read_files(dir.path()).unwrap().unwrap();
+        assert_same(&loaded, &s);
+
+        remove_files(dir.path()).unwrap();
+        assert!(read_files(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join(STAMPS_FILE).exists());
     }
 
     #[test]
     fn a_damaged_definitions_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let s = schedules_with(&["rollup t 0 0 1 15 5 * * * *"]);
-        let (mut files, _) = ScheduleFiles::open(dir.path()).unwrap();
-        files.write_all(&s).unwrap();
+        write_files(dir.path(), &s).unwrap();
         let path = dir.path().join(DEFS_FILE);
         let mut bytes = fs::read(&path).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
         fs::write(&path, &bytes).unwrap();
-        let err = ScheduleFiles::open(dir.path()).unwrap_err();
+        let err = read_files(dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -421,10 +553,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = schedules_with(&["rollup t 0 0 1 15 5 * * * *"]);
         s.get_mut("splat", "rollup").unwrap().last_fire = Some(ts("2026-10-11T03:05:00Z"));
-        let (mut files, _) = ScheduleFiles::open(dir.path()).unwrap();
-        files.write_all(&s).unwrap();
+        write_files(dir.path(), &s).unwrap();
         fs::write(dir.path().join(STAMPS_FILE), b"garbage").unwrap();
-        let (_, loaded) = ScheduleFiles::open(dir.path()).unwrap();
+        let loaded = read_files(dir.path()).unwrap().unwrap();
         let e = loaded.get("splat", "rollup").unwrap();
         assert_eq!(e.last_fire, None);
         assert_eq!(

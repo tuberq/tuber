@@ -84,12 +84,13 @@ impl ServerState {
         let counts = self.schedules.commit(sync, Timestamp::now());
         // Durable before the reply. On failure the new set stands in memory
         // and the client hears INTERNAL_ERROR, as a put whose WAL write
-        // fails does. Only a later commit rewrites the definitions (a fire
-        // writes just the stamps), so a restart before then restores the
-        // previous set. A commit that changes nothing writes nothing,
-        // unless one before it failed to.
-        if let Err(e) = self.save_schedules() {
-            tracing::error!(owner, "schedule sync not persisted: {e}");
+        // fails does; the WAL is dropped, so a restart restores the set last
+        // written. A commit that changes nothing writes nothing, but once
+        // the WAL has failed none can be kept.
+        let unsaved = self.schedules.take_unsaved();
+        if (unsaved || self.wal_failed) && !(self.journal_schedule_set(&owner) && self.sync_wal())
+        {
+            tracing::error!(owner, "schedule sync not persisted");
             return Response::InternalError;
         }
         tracing::info!(
@@ -103,15 +104,85 @@ impl ServerState {
         Response::Synced(counts)
     }
 
-    /// Rewrite the definitions file if anything it holds has changed since
-    /// it was last written. It is the whole set, fsynced, on the engine
-    /// task, so a resync that changes nothing mustn't pay for it.
-    fn save_schedules(&mut self) -> std::io::Result<()> {
-        if let Some(files) = self.schedule_files.as_mut()
-            && self.schedules.unsaved()
-        {
-            files.write_all(&self.schedules)?;
-            self.schedules.mark_saved();
+    /// Journal `owner`'s set as it stands, unsynced. False once the WAL
+    /// has failed; true without one (no `-b`), as there's nothing to write.
+    pub(super) fn journal_schedule_set(&mut self, owner: &str) -> bool {
+        let written = match self.wal.as_mut() {
+            Some(wal) => self.schedule_refs.write_set(wal, &self.schedules, owner),
+            None => Ok(()),
+        };
+        if let Err(e) = written {
+            self.fail_wal("schedule set write", e);
+        }
+        !self.wal_failed
+    }
+
+    /// Journal each entry's last fire, unsynced. False once the WAL has
+    /// failed.
+    fn journal_last_fires(&mut self, fires: &[(String, String, Option<Timestamp>)]) -> bool {
+        let written = match self.wal.as_mut() {
+            Some(wal) => fires.iter().try_for_each(|(owner, name, last_fire)| {
+                self.schedule_refs.write_fired(wal, owner, name, *last_fire)
+            }),
+            None => Ok(()),
+        };
+        if let Err(e) = written {
+            self.fail_wal("schedule fire write", e);
+        }
+        !self.wal_failed
+    }
+
+    /// Restore the schedules a WAL replay found. A WAL holding none may be
+    /// one an earlier tuber kept beside two files: their entries move into
+    /// it, and the files are removed.
+    pub(super) fn restore_schedules(
+        &mut self,
+        dir: &std::path::Path,
+        replayed: crate::wal::ReplayedSchedules,
+    ) -> io::Result<()> {
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+        if replayed.seen {
+            let (refs, schedules) = schedule::store::ScheduleRefs::restore(wal, replayed);
+            self.schedule_refs = refs;
+            self.schedules = schedules;
+            // Left by a crash before a move into the WAL removed them.
+            schedule::store::remove_files(dir)?;
+        } else {
+            let files = match schedule::store::read_files(dir) {
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    // A damaged schedule file mustn't keep the queue down.
+                    // Set it aside and start without schedules: each app's
+                    // next sync restores its own. (One from a different
+                    // tuber version is `Unsupported`, not damage, and stops
+                    // startup.)
+                    let aside = schedule::store::set_aside_corrupt(dir)?;
+                    tracing::error!("{e}; moved to {aside:?}, no schedules until apps re-sync");
+                    None
+                }
+                other => other?,
+            };
+            if let Some(schedules) = files {
+                self.schedules = schedules;
+                let owners: Vec<String> = self.schedules.owners().map(str::to_string).collect();
+                for owner in &owners {
+                    self.journal_schedule_set(owner);
+                }
+                if !self.sync_wal() {
+                    return Err(io::Error::other(
+                        "schedules: could not move the schedule files into the WAL",
+                    ));
+                }
+                tracing::info!(
+                    "schedules: moved {} entries from the schedule files into the WAL",
+                    self.schedules.len()
+                );
+            }
+            schedule::store::remove_files(dir)?;
+        }
+        if !self.schedules.is_empty() {
+            tracing::info!("schedules: restored {} entries from {:?}", self.schedules.len(), dir);
         }
         Ok(())
     }
@@ -274,11 +345,23 @@ impl ServerState {
         if self.drain_mode || self.wal_failed {
             return;
         }
-        let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
-        let mut corrected = false;
+        // Persist corrected times, so a restart doesn't find them in the
+        // future again. Unsynced: lost to a crash, they're corrected again.
         let horizon = now + CLOCK_STEP_TOLERANCE;
+        let corrected: std::collections::BTreeSet<String> = self
+            .schedules
+            .iter_mut()
+            .filter_map(|e| correct_future_clock(e, now, horizon).then(|| e.owner.clone()))
+            .collect();
+        for owner in &corrected {
+            if !self.journal_schedule_set(owner) {
+                tracing::error!(owner, "schedule clock correction not persisted");
+                return;
+            }
+        }
+
+        let mut due: Vec<(String, String, Option<Timestamp>)> = Vec::new();
         for e in self.schedules.iter_mut() {
-            corrected |= correct_future_clock(e, now, horizon);
             let Some(tick) = e.next_fire.filter(|&t| t <= now) else {
                 continue;
             };
@@ -289,25 +372,21 @@ impl ServerState {
                 e.last_fire = Some(now);
             }
         }
-        // Persist corrected sync times, so a restart doesn't find them in
-        // the future again. Corrected last fires go out with the stamps.
-        if corrected {
-            self.schedules.mark_unsaved();
-            if let Err(e) = self.save_schedules() {
-                tracing::error!("schedule clock correction not persisted: {e}");
-            }
-        }
         if due.is_empty() {
             return;
         }
 
         // Stamp first: once the stamps are on disk a crash can lose these
-        // fires but never repeat them. If they can't be written, don't fire —
-        // the same at-most-once promise, kept by losing the tick now.
-        if let Some(files) = self.schedule_files.as_mut()
-            && let Err(e) = files.write_stamps(&self.schedules)
-        {
-            tracing::error!("schedule fires not stamped, so not fired: {e}");
+        // fires but never repeat them, so they're synced before anything is
+        // put, not left in the WAL's buffer with the puts. If they can't be
+        // written, don't fire — the same at-most-once promise, kept by
+        // losing the tick now.
+        let stamps: Vec<_> = due
+            .iter()
+            .map(|(owner, name, _)| (owner.clone(), name.clone(), Some(now)))
+            .collect();
+        if !(self.journal_last_fires(&stamps) && self.sync_wal()) {
+            tracing::error!("schedule fires not stamped, so not fired");
             for (owner, name, previous) in due {
                 if let Some(entry) = self.schedules.get_mut(&owner, &name) {
                     entry.last_fire = previous;
@@ -317,7 +396,7 @@ impl ServerState {
             return;
         }
 
-        let mut unstamped = false;
+        let mut unstamped = Vec::new();
         for (owner, name, previous) in due {
             let Some(e) = self.schedules.get(&owner, &name) else {
                 continue;
@@ -340,16 +419,15 @@ impl ServerState {
             };
             if queued_nothing && let Some(e) = self.schedules.get_mut(&owner, &name) {
                 e.last_fire = previous;
-                unstamped = true;
+                unstamped.push((owner, name, previous));
             }
         }
         // After a restart the refused tick counts as missed and `catchup:`
-        // may fire it: still at most once, since nothing was queued.
-        if unstamped
-            && let Some(files) = self.schedule_files.as_mut()
-            && let Err(e) = files.write_stamps(&self.schedules)
-        {
-            tracing::error!("refused schedule fires not unstamped: {e}");
+        // may fire it: still at most once, since nothing was queued. Not
+        // once the WAL has failed, though: the stamp stays, and the tick is
+        // lost rather than caught up.
+        if !unstamped.is_empty() && !self.journal_last_fires(&unstamped) {
+            tracing::error!("refused schedule fires not unstamped: the WAL has failed");
         }
     }
 

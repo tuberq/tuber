@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use jiff::Timestamp;
+
 use crate::body_store::BodyStore;
 use crate::body_store::DurablePoint;
 use crate::job::{BodyId, BodyRef, Job, JobState};
@@ -44,7 +46,9 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 ///   body also carries the body's CRC32 (body kind 2). Startup uses the
 ///   first to tell a torn TOAST tail from corruption, and the second to
 ///   check TOAST holds the body the WAL wrote. See
-///   `docs/toast-recovery-point.md`.
+///   `docs/toast-recovery-point.md`. Recurring schedules moved into the
+///   WAL too, from two files beside it: a schedule set record holds one
+///   owner's entries, and a schedule fired record one entry's last fire.
 pub const WAL_VERSION: u32 = 9;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 
@@ -58,10 +62,14 @@ const RECORD_TYPE_STATE_CHANGE: u8 = 0x02;
 const RECORD_TYPE_TOMBSTONE: u8 = 0x03; // v8
 const RECORD_TYPE_ID_MARK: u8 = 0x04; // v8
 const RECORD_TYPE_TOAST_MARK: u8 = 0x05; // v9
+const RECORD_TYPE_SCHEDULE_SET: u8 = 0x06; // v9
+const RECORD_TYPE_SCHEDULE_FIRED: u8 = 0x07; // v9
 /// First version with tombstone and id-mark records.
 const WAL_VERSION_TOMBSTONES: u32 = 8;
 /// First version with TOAST marks and body CRCs.
 const WAL_VERSION_TOAST_MARKS: u32 = 9;
+/// First version with schedule records.
+const WAL_VERSION_SCHEDULES: u32 = 9;
 /// Size of an id-mark record: type(1) + high_water(8) + payload_len(4) + crc(4).
 const ID_MARK_RECORD_SIZE: usize = 1 + 8 + 4 + 4;
 /// Size of a TOAST mark record: type(1) + seq(8) + payload_len(4) +
@@ -228,6 +236,31 @@ pub struct IdpTombstone {
     pub record: Option<RecordRef>,
 }
 
+/// A recurring schedule entry as the WAL holds it. `line` is its
+/// `schedule-put` arguments, parsed back through the protocol parser on
+/// restore, so a restored entry passes exactly the checks a synced one did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleRecord {
+    pub line: String,
+    pub body: Vec<u8>,
+    /// When its definition took effect.
+    pub synced_at: Timestamp,
+    pub last_fire: Option<Timestamp>,
+}
+
+/// The schedules [`Wal::replay`] found ([`Wal::take_replayed_schedules`]).
+#[derive(Debug, Default)]
+pub struct ReplayedSchedules {
+    /// Each owner's latest set, and the record holding it.
+    pub sets: HashMap<String, (Vec<ScheduleRecord>, RecordRef)>,
+    /// Last fires written since their owner's set, by (owner, name), and
+    /// the records holding them.
+    pub stamps: HashMap<(String, String), (Option<Timestamp>, RecordRef)>,
+    /// Whether any schedule record was read, an owner's removal included:
+    /// the WAL holds the schedules, not files an earlier tuber kept.
+    pub seen: bool,
+}
+
 /// What [`Wal::replay`] returns: `(jobs, next_job_id, idempotency
 /// tombstones, orphaned body ids, buried order)`.
 pub type ReplayOutcome = (
@@ -270,6 +303,20 @@ pub enum WalRecord {
     /// How far the body store was durable when this record was written
     /// (v9+): the TOAST recovery point.
     ToastMark(DurablePoint),
+    /// One owner's recurring schedules (v9+), replacing its earlier set
+    /// and every last fire written since. Empty once the owner has none.
+    ScheduleSet {
+        owner: String,
+        entries: Vec<ScheduleRecord>,
+    },
+    /// An entry's last fire (v9+), superseding the one in its owner's set
+    /// and any earlier record. `None` when a refused fire is put back on
+    /// an entry that hadn't fired.
+    ScheduleFired {
+        owner: String,
+        name: String,
+        last_fire: Option<Timestamp>,
+    },
 }
 
 // --- Serialization ---
@@ -429,6 +476,110 @@ pub fn serialize_toast_mark(point: DurablePoint) -> Vec<u8> {
     )
 }
 
+/// A v9 schedule set record: `owner`'s entries, replacing its earlier set.
+pub fn serialize_schedule_set(owner: &str, entries: &[ScheduleRecord]) -> Vec<u8> {
+    let size = entries
+        .iter()
+        .map(|e| 4 + e.line.len() + 4 + e.body.len() + 12 + 13)
+        .sum::<usize>();
+    let mut p = Payload(Vec::with_capacity(4 + owner.len() + 4 + size));
+    p.bytes(owner.as_bytes());
+    p.0.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        p.bytes(e.line.as_bytes());
+        p.bytes(&e.body);
+        p.time(e.synced_at);
+        p.opt_time(e.last_fire);
+    }
+    frame_record(RECORD_TYPE_SCHEDULE_SET, 0, &p.0)
+}
+
+/// A v9 schedule fired record: the last fire of `owner`'s entry `name`.
+pub fn serialize_schedule_fired(owner: &str, name: &str, last_fire: Option<Timestamp>) -> Vec<u8> {
+    let mut p = Payload(Vec::with_capacity(4 + owner.len() + 4 + name.len() + 13));
+    p.bytes(owner.as_bytes());
+    p.bytes(name.as_bytes());
+    p.opt_time(last_fire);
+    frame_record(RECORD_TYPE_SCHEDULE_FIRED, 0, &p.0)
+}
+
+/// Builds a schedule record's payload. Little-endian; bytes are
+/// `len:u32 + bytes`, a time `seconds:i64 nanos:i32`, an optional time a
+/// flag byte and then the time if the flag is 1.
+struct Payload(Vec<u8>);
+
+impl Payload {
+    fn bytes(&mut self, b: &[u8]) {
+        self.0.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        self.0.extend_from_slice(b);
+    }
+
+    fn time(&mut self, t: Timestamp) {
+        self.0.extend_from_slice(&t.as_second().to_le_bytes());
+        self.0.extend_from_slice(&t.subsec_nanosecond().to_le_bytes());
+    }
+
+    fn opt_time(&mut self, t: Option<Timestamp>) {
+        match t {
+            None => self.0.push(0),
+            Some(t) => {
+                self.0.push(1);
+                self.time(t);
+            }
+        }
+    }
+}
+
+/// Reads a payload [`Payload`] built.
+struct PayloadReader<'a>(&'a [u8]);
+
+impl<'a> PayloadReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], WalError> {
+        if self.0.len() < n {
+            return Err(WalError::InvalidData);
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u32(&mut self) -> Result<u32, WalError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], WalError> {
+        let len = self.u32()? as usize;
+        self.take(len)
+    }
+
+    fn string(&mut self) -> Result<String, WalError> {
+        String::from_utf8(self.bytes()?.to_vec()).map_err(|_| WalError::InvalidData)
+    }
+
+    fn time(&mut self) -> Result<Timestamp, WalError> {
+        let secs = i64::from_le_bytes(self.take(8)?.try_into().unwrap());
+        let nanos = i32::from_le_bytes(self.take(4)?.try_into().unwrap());
+        Timestamp::new(secs, nanos).map_err(|_| WalError::InvalidData)
+    }
+
+    fn opt_time(&mut self) -> Result<Option<Timestamp>, WalError> {
+        match self.take(1)?[0] {
+            0 => Ok(None),
+            1 => self.time().map(Some),
+            _ => Err(WalError::InvalidData),
+        }
+    }
+
+    /// The payload must be used up: anything left over is damage.
+    fn finish(self) -> Result<(), WalError> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(WalError::InvalidData)
+        }
+    }
+}
+
 /// On-wire size of the v6 body section for a FullJob record.
 /// `body_external == true` selects the BodyId encoding; otherwise the
 /// body rides inline as `len + bytes`.
@@ -498,6 +649,12 @@ pub fn deserialize_record(data: &[u8], version: u32) -> Result<(WalRecord, usize
         RECORD_TYPE_TOAST_MARK if version >= WAL_VERSION_TOAST_MARKS => {
             deserialize_toast_mark(data)
         }
+        RECORD_TYPE_SCHEDULE_SET if version >= WAL_VERSION_SCHEDULES => {
+            deserialize_schedule_set(data)
+        }
+        RECORD_TYPE_SCHEDULE_FIRED if version >= WAL_VERSION_SCHEDULES => {
+            deserialize_schedule_fired(data)
+        }
         _ => Err(WalError::UnknownRecordType(record_type)),
     }
 }
@@ -563,6 +720,41 @@ fn deserialize_toast_mark(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
     let offset = u64::from_le_bytes(payload.try_into().map_err(|_| WalError::InvalidData)?);
     Ok((
         WalRecord::ToastMark(DurablePoint { seq, offset }),
+        total_len,
+    ))
+}
+
+fn deserialize_schedule_set(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+    let (_, payload, total_len) = unframe_record(data)?;
+    let mut r = PayloadReader(payload);
+    let owner = r.string()?;
+    let count = r.u32()?;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        entries.push(ScheduleRecord {
+            line: r.string()?,
+            body: r.bytes()?.to_vec(),
+            synced_at: r.time()?,
+            last_fire: r.opt_time()?,
+        });
+    }
+    r.finish()?;
+    Ok((WalRecord::ScheduleSet { owner, entries }, total_len))
+}
+
+fn deserialize_schedule_fired(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+    let (_, payload, total_len) = unframe_record(data)?;
+    let mut r = PayloadReader(payload);
+    let owner = r.string()?;
+    let name = r.string()?;
+    let last_fire = r.opt_time()?;
+    r.finish()?;
+    Ok((
+        WalRecord::ScheduleFired {
+            owner,
+            name,
+            last_fire,
+        },
         total_len,
     ))
 }
@@ -1033,13 +1225,16 @@ pub struct Wal {
     /// after each TOAST fsync, and every new segment repeats it after its
     /// id mark, so GC never takes the last one.
     toast_mark: Option<DurablePoint>,
+    /// The schedules the last replay found, until taken.
+    replayed_schedules: ReplayedSchedules,
     #[allow(dead_code)] // held for flock side effect
     lock_fd: Option<File>,
     #[cfg(test)]
     sync_count: u64,
-    /// Test-only: when set, every write and sync fails as a full disk would.
+    /// Test-only: when set, every write and sync after this many more fails
+    /// as a full disk would.
     #[cfg(test)]
-    fail_io: bool,
+    fail_io_after: Option<u32>,
 }
 
 impl Wal {
@@ -1155,11 +1350,12 @@ impl Wal {
             synced_ops: 0,
             body_store: None,
             toast_mark: None,
+            replayed_schedules: ReplayedSchedules::default(),
             lock_fd: Some(lock_fd),
             #[cfg(test)]
             sync_count: 0,
             #[cfg(test)]
-            fail_io: false,
+            fail_io_after: None,
         };
 
         wal.scan_dir()?;
@@ -1631,6 +1827,67 @@ impl Wal {
         }))
     }
 
+    /// Journal `owner`'s schedule set, replacing its earlier one and every
+    /// last fire written since. A set with entries holds a reference on its
+    /// segment until the owner's next set is written, and compaction
+    /// carries it forward. An empty one, the owner's removal, holds none:
+    /// it is only needed while an earlier set survives, and GC collects
+    /// segments oldest first.
+    pub fn write_schedule_set(
+        &mut self,
+        owner: &str,
+        entries: &[ScheduleRecord],
+    ) -> io::Result<Option<RecordRef>> {
+        let record = self.append(&serialize_schedule_set(owner, entries))?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        self.incref_file(record.seq, record.len as usize);
+        Ok(Some(record))
+    }
+
+    /// Journal the last fire of `owner`'s entry `name`. It holds a reference
+    /// on its segment until superseded: by the entry's next one, or by the
+    /// owner's next set, which carries every entry's last fire.
+    pub fn write_schedule_fired(
+        &mut self,
+        owner: &str,
+        name: &str,
+        last_fire: Option<Timestamp>,
+    ) -> io::Result<RecordRef> {
+        let record = self.append(&serialize_schedule_fired(owner, name, last_fire))?;
+        self.incref_file(record.seq, record.len as usize);
+        Ok(record)
+    }
+
+    /// Append `record` to the current segment, taking no reference.
+    fn append(&mut self, record: &[u8]) -> io::Result<RecordRef> {
+        #[cfg(test)]
+        self.injected_failure()?;
+        self.rotate_if_needed()?;
+
+        let file = self.current_file_mut()?;
+        let fd = file
+            .fd
+            .as_mut()
+            .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
+        fd.write_all(record)?;
+        file.bytes_written += record.len();
+        let seq = file.seq;
+        self.total_disk_bytes += record.len() as u64;
+        self.ops_written += 1;
+        self.dirty = true;
+        Ok(RecordRef {
+            seq,
+            len: record.len() as u32,
+        })
+    }
+
+    /// The schedules the last [`Wal::replay`] found. Empty if taken already.
+    pub fn take_replayed_schedules(&mut self) -> ReplayedSchedules {
+        std::mem::take(&mut self.replayed_schedules)
+    }
+
     /// Drop the reference a record holds on its segment, once what it
     /// records has ended (an expired cooldown) or been rewritten elsewhere.
     pub fn release_record(&mut self, record: RecordRef) {
@@ -1695,6 +1952,7 @@ impl Wal {
         // body orphaned in TOAST. Replay collects those ids so the
         // caller can drop them after rebuilding state.
         let mut orphan_bodies: Vec<BodyId> = Vec::new();
+        let mut schedules = ReplayedSchedules::default();
         let replay_time = SystemTime::now();
         let replay_epoch = replay_time
             .duration_since(UNIX_EPOCH)
@@ -2007,6 +2265,50 @@ impl Wal {
                             }
                             // Read before replay, by `read_toast_mark`.
                             WalRecord::ToastMark(_) => {}
+                            WalRecord::ScheduleSet { owner, entries } => {
+                                schedules.seen = true;
+                                // Supersedes the owner's last set, and the
+                                // last fires since: it carries its own.
+                                if let Some((_, old)) = schedules.sets.remove(&owner) {
+                                    self.release_record(old);
+                                }
+                                schedules.stamps.retain(|(o, _), (_, r)| {
+                                    let keep = *o != owner;
+                                    if !keep {
+                                        self.release_record(*r);
+                                    }
+                                    keep
+                                });
+                                if !entries.is_empty() {
+                                    let record = RecordRef {
+                                        seq: *seq,
+                                        len: consumed as u32,
+                                    };
+                                    self.incref_file(*seq, consumed);
+                                    schedules.sets.insert(owner, (entries, record));
+                                }
+                            }
+                            WalRecord::ScheduleFired {
+                                owner,
+                                name,
+                                last_fire,
+                            } => {
+                                schedules.seen = true;
+                                // Written only for an entry its owner's set
+                                // holds; without the set there's no entry.
+                                if schedules.sets.contains_key(&owner) {
+                                    let record = RecordRef {
+                                        seq: *seq,
+                                        len: consumed as u32,
+                                    };
+                                    self.incref_file(*seq, consumed);
+                                    if let Some((_, old)) =
+                                        schedules.stamps.insert((owner, name), (last_fire, record))
+                                    {
+                                        self.release_record(old);
+                                    }
+                                }
+                            }
                         }
                         offset += consumed;
                     }
@@ -2121,6 +2423,7 @@ impl Wal {
             }
         }
         buried_order.reverse();
+        self.replayed_schedules = schedules;
 
         Ok((jobs, max_id + 1, tombstones, orphan_bodies, buried_order))
     }
@@ -2213,15 +2516,25 @@ impl Wal {
     /// Test-only: make every later write and sync fail, as a full disk would.
     #[cfg(test)]
     pub fn inject_io_failure(&mut self) {
-        self.fail_io = true;
+        self.inject_io_failure_after(0);
+    }
+
+    /// Test-only: let `ops` more writes and syncs through (those that do
+    /// something), then fail every one after.
+    #[cfg(test)]
+    pub fn inject_io_failure_after(&mut self, ops: u32) {
+        self.fail_io_after = Some(ops);
     }
 
     #[cfg(test)]
-    fn injected_failure(&self) -> io::Result<()> {
-        if self.fail_io {
-            Err(io::Error::other("injected WAL I/O failure"))
-        } else {
-            Ok(())
+    fn injected_failure(&mut self) -> io::Result<()> {
+        match self.fail_io_after {
+            None => Ok(()),
+            Some(0) => Err(io::Error::other("injected WAL I/O failure")),
+            Some(n) => {
+                self.fail_io_after = Some(n - 1);
+                Ok(())
+            }
         }
     }
 }
@@ -2980,6 +3293,160 @@ mod tests {
             }
             other => panic!("expected a FullJob, got {other:?}"),
         }
+    }
+
+    fn ts(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn schedule_record(line: &str, last_fire: Option<&str>) -> ScheduleRecord {
+        ScheduleRecord {
+            line: line.to_string(),
+            body: b"{}".to_vec(),
+            synced_at: ts("2026-10-11T03:00:30Z"),
+            last_fire: last_fire.map(ts),
+        }
+    }
+
+    #[test]
+    fn test_schedule_records_round_trip_and_v8_segments_refuse_them() {
+        let entries = vec![
+            schedule_record(
+                "rollup maint 1024 0 120 2 idp:rollup 5 * * * *",
+                Some("2026-10-11T03:05:00.25Z"),
+            ),
+            schedule_record(
+                "retention maint 10 5 60 2 catchup:600 0 2 * * * Australia/Melbourne",
+                None,
+            ),
+        ];
+        let set = serialize_schedule_set("splat", &entries);
+        match deserialize_record(&set, WAL_VERSION).unwrap() {
+            (WalRecord::ScheduleSet { owner, entries: got }, len) => {
+                assert_eq!(owner, "splat");
+                assert_eq!(got, entries);
+                assert_eq!(len, set.len());
+            }
+            other => panic!("expected a ScheduleSet, got {other:?}"),
+        }
+
+        let fired = serialize_schedule_fired("splat", "rollup", Some(ts("2026-10-11T04:05:00Z")));
+        match deserialize_record(&fired, WAL_VERSION).unwrap() {
+            (
+                WalRecord::ScheduleFired {
+                    owner,
+                    name,
+                    last_fire,
+                },
+                len,
+            ) => {
+                assert_eq!((owner.as_str(), name.as_str()), ("splat", "rollup"));
+                assert_eq!(last_fire, Some(ts("2026-10-11T04:05:00Z")));
+                assert_eq!(len, fired.len());
+            }
+            other => panic!("expected a ScheduleFired, got {other:?}"),
+        }
+        // A fire put back: the entry hasn't fired.
+        let unfired = serialize_schedule_fired("splat", "rollup", None);
+        assert!(matches!(
+            deserialize_record(&unfired, WAL_VERSION).unwrap(),
+            (WalRecord::ScheduleFired { last_fire: None, .. }, _)
+        ));
+
+        assert!(matches!(
+            deserialize_record(&set, 8),
+            Err(WalError::UnknownRecordType(RECORD_TYPE_SCHEDULE_SET))
+        ));
+        assert!(matches!(
+            deserialize_record(&fired, 8),
+            Err(WalError::UnknownRecordType(RECORD_TYPE_SCHEDULE_FIRED))
+        ));
+    }
+
+    #[test]
+    fn test_replay_keeps_each_owner_s_latest_schedule_set_and_the_stamps_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = schedule_record("a jobs 0 0 60 2 @hourly", None);
+        let b = schedule_record("b jobs 0 0 60 2 @daily", None);
+        let a_fired = schedule_record("a jobs 0 0 60 2 @hourly", Some("2026-10-11T04:00:00Z"));
+        {
+            let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+            wal.write_schedule_set("splat", &[a, b.clone()]).unwrap();
+            // Superseded by the next set, which carries its own last fires.
+            wal.write_schedule_fired("splat", "b", Some(ts("2026-10-11T04:00:00Z")))
+                .unwrap();
+            wal.write_schedule_set("splat", std::slice::from_ref(&a_fired))
+                .unwrap();
+            wal.write_schedule_fired("splat", "a", Some(ts("2026-10-11T05:00:00Z")))
+                .unwrap();
+            wal.write_schedule_set("booko", &[b]).unwrap();
+            wal.write_schedule_set("booko", &[]).unwrap();
+            wal.sync().unwrap();
+        }
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        wal.replay().unwrap();
+        let replayed = wal.take_replayed_schedules();
+        assert!(replayed.seen);
+        assert_eq!(replayed.sets.len(), 1, "booko removed its entries");
+        assert_eq!(replayed.sets["splat"].0, vec![a_fired]);
+        assert_eq!(replayed.stamps.len(), 1, "b's stamp went with its set");
+        assert_eq!(
+            replayed.stamps[&("splat".to_string(), "a".to_string())].0,
+            Some(ts("2026-10-11T05:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn test_a_wal_without_schedule_records_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        wal.write_put(&mut make_test_job(1, b"x")).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        wal.replay().unwrap();
+        assert!(!wal.take_replayed_schedules().seen);
+    }
+
+    #[test]
+    fn test_live_schedule_records_pin_their_segments_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(1)).unwrap();
+        let set = wal
+            .write_schedule_set("splat", &[schedule_record("a jobs 0 0 60 2 @hourly", None)])
+            .unwrap()
+            .expect("a set with entries holds a reference");
+        let stamp = wal
+            .write_schedule_fired("splat", "a", Some(ts("2026-10-11T04:00:00Z")))
+            .unwrap();
+        let mut job = make_test_job(2, b"x");
+        external_body(&mut job);
+        wal.write_put(&mut job).unwrap();
+        wal.write_state_change(
+            &mut job,
+            None,
+            0,
+            Duration::ZERO,
+            0,
+            StateChangeReason::None,
+        )
+        .unwrap();
+        wal.sync().unwrap();
+        wal.gc();
+        assert!(segment(dir.path(), set.seq).exists(), "pinned by the set");
+        assert!(segment(dir.path(), stamp.seq).exists(), "pinned by the stamp");
+
+        wal.release_record(set);
+        wal.release_record(stamp);
+        assert!(
+            wal.write_schedule_set("splat", &[]).unwrap().is_none(),
+            "an owner's removal holds none"
+        );
+        wal.write_put(&mut make_test_job(3, b"y")).unwrap();
+        wal.sync().unwrap();
+        wal.gc();
+        assert!(!segment(dir.path(), set.seq).exists(), "collected once released");
+        assert!(!segment(dir.path(), stamp.seq).exists(), "collected once released");
     }
 
     /// A WAL with a body store attached, as the server runs it.
