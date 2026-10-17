@@ -1144,10 +1144,20 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Copy `from` to `to`, fsyncing the copy and its directory, so `from` can
-/// then be cut short without a crash leaving the cut but not the copy.
+/// then be cut short without a crash leaving the cut but not the copy. The
+/// copy is written beside `to` and renamed into place once whole, so one
+/// that fails partway (a full disk) leaves nothing that looks like a copy.
 pub(crate) fn copy_durably(from: &Path, to: &Path) -> io::Result<()> {
-    fs::copy(from, to)?;
-    File::open(to)?.sync_all()?;
+    let mut os = to.as_os_str().to_os_string();
+    os.push(".tmp");
+    let tmp = PathBuf::from(os);
+    let copied = fs::copy(from, &tmp)
+        .and_then(|_| File::open(&tmp)?.sync_all())
+        .and_then(|()| fs::rename(&tmp, to));
+    if let Err(e) = copied {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     match to.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => fsync_dir(dir),
         _ => fsync_dir(Path::new(".")),
@@ -2164,6 +2174,22 @@ mod tests {
         };
         assert!(msg.contains("couldn't keep a copy"), "{msg}");
         assert!(fs::read(&seg0).unwrap() == damaged, "left whole");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_copy_that_fails_partway_leaves_nothing_behind() {
+        // A full disk failed the copy after creating it, leaving an empty
+        // `.corrupt` that looked like a copy. /proc/self/mem opens as a
+        // regular file and then fails its first read, so it fails the same way.
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("body.000000.corrupt");
+        assert!(copy_durably(Path::new("/proc/self/mem"), &to).is_err());
+        let left: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
     }
 
     #[test]

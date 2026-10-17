@@ -211,6 +211,12 @@ enum Commands {
         #[arg(long, env = "TUBER_METRICS_PORT")]
         metrics_port: Option<u16>,
 
+        /// Address the metrics endpoint listens on [default: the -l address].
+        /// Set it to keep metrics private while the queue port is public, e.g.
+        /// `-l 0.0.0.0 --metrics-listen 127.0.0.1`.
+        #[arg(long, env = "TUBER_METRICS_LISTEN")]
+        metrics_listen: Option<String>,
+
         /// Instance name
         #[arg(long, env = "TUBER_NAME")]
         name: Option<String>,
@@ -357,6 +363,7 @@ async fn run() {
             wal_skip_corrupt,
             verbose,
             metrics_port,
+            metrics_listen,
             name,
         } => {
             let level = match verbose {
@@ -409,6 +416,7 @@ async fn run() {
                 migrate_wal,
                 wal_skip_corrupt,
                 metrics_port,
+                metrics_listen.as_deref(),
                 name,
                 max_connections,
                 // 0 means disabled, matching the other 0-is-no-limit knobs.

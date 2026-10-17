@@ -1,7 +1,6 @@
 use crate::client::{TuberClient, parse_yaml_list, parse_yaml_map};
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -16,9 +15,9 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start the Prometheus metrics HTTP server.
 /// Connects to the beanstalkd port as a client to gather stats.
-pub async fn serve(listen_addr: IpAddr, port: u16, beanstalk_addr: String) -> io::Result<()> {
+pub async fn serve(listen_addr: &str, port: u16, beanstalk_addr: String) -> io::Result<()> {
     let listener = TcpListener::bind((listen_addr, port)).await?;
-    tracing::info!("metrics endpoint on {}:{}/metrics", listen_addr, port);
+    tracing::info!("metrics endpoint on {}/metrics", listener.local_addr()?);
     serve_with_listener(listener, beanstalk_addr).await
 }
 

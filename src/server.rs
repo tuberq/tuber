@@ -1580,16 +1580,12 @@ impl ServerState {
             gs.pending += 1;
         }
 
-        // Check if this is an after-group job that should be held
-        let hold_for_group = if let Some(ag) = job.after_group() {
-            let gs = self
-                .groups
-                .entry(ag.clone())
-                .or_insert_with(GroupState::new);
-            !gs.is_complete()
-        } else {
-            false
-        };
+        // Check if this is an after-group job that should be held. A group
+        // with no record has no members, so it's complete: don't make one.
+        let hold_for_group = job
+            .after_group()
+            .and_then(|ag| self.groups.get(ag))
+            .is_some_and(|gs| !gs.is_complete());
 
         // Enqueue
         if delay > 0 {
@@ -3722,6 +3718,12 @@ impl ServerState {
             self.deliver_waiter_failure(waiter, now);
         }
 
+        // With no job ready anywhere, none can be served: don't walk every
+        // tube a parked reserve watches, which the tick would do each time.
+        if self.ready_ct == 0 {
+            return;
+        }
+
         // Second pass: fulfill waiters, the longest-waiting first, as long
         // as one can be served. Only tubes a reserve is parked on are
         // searched, and each tube once per waiter served, not every tube on
@@ -4626,6 +4628,7 @@ pub async fn run(
     migrate_wal: bool,
     wal_skip_corrupt: bool,
     metrics_port: Option<u16>,
+    metrics_listen: Option<&str>,
     name: Option<String>,
     max_connections: Option<usize>,
     conn_idle_timeout: Option<Duration>,
@@ -4682,8 +4685,11 @@ pub async fn run(
             opts.push_str(&format!(" sync={}ms", sync_interval.as_millis()));
         }
     }
+    let listen_addr = listener.local_addr()?.ip();
+    // Metrics listen where the protocol does unless given their own address.
+    let metrics_addr = metrics_listen.map_or_else(|| listen_addr.to_string(), str::to_owned);
     if let Some(mp) = metrics_port {
-        opts.push_str(&format!(" metrics={}:{mp}", listener.local_addr()?.ip()));
+        opts.push_str(&format!(" metrics={metrics_addr}:{mp}"));
     }
     if let Some(ref n) = name {
         tracing::info!(
@@ -4703,10 +4709,9 @@ pub async fn run(
     }
 
     if let Some(mp) = metrics_port {
-        let listen_addr = listener.local_addr()?.ip();
         let beanstalk_addr = format!("{listen_addr}:{port}");
         tokio::spawn(async move {
-            if let Err(e) = crate::metrics::serve(listen_addr, mp, beanstalk_addr).await {
+            if let Err(e) = crate::metrics::serve(&metrics_addr, mp, beanstalk_addr).await {
                 tracing::error!("metrics server error: {e}");
             }
         });

@@ -261,3 +261,67 @@ fn a_zone_the_host_database_lacks_comes_from_the_bundled_copy() {
     assert_eq!(begin.unwrap(), "SYNCING app\r\n");
     assert_eq!(put.unwrap(), "STAGED\r\n");
 }
+
+/// Start `tuber server -l <listen> --metrics-port <mport> <args>`, and say
+/// whether `/metrics` answers on each of `probes`, once it answers on the
+/// first (or doesn't within a second).
+#[cfg(target_os = "linux")]
+fn metrics_answer_on(listen: &str, mport: u16, args: &[&str], probes: &[&str]) -> Vec<bool> {
+    let port = free_port().to_string();
+    let mp = mport.to_string();
+    let mut cmd = Command::new(bin());
+    cmd.args(["server", "-l", listen, "-p", &port, "--metrics-port", &mp])
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for e in PERSIST_ENVS {
+        cmd.env_remove(e);
+    }
+    cmd.env_remove("TUBER_METRICS_PORT");
+    cmd.env_remove("TUBER_METRICS_LISTEN");
+    let mut child = cmd.spawn().expect("spawn tuber binary");
+    let scrape = |addr: &str| -> bool {
+        use std::io::{BufRead, Write};
+        let Ok(mut s) = std::net::TcpStream::connect((addr, mport)) else {
+            return false;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut status = String::new();
+        let sent = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n");
+        sent.is_ok()
+            && std::io::BufReader::new(s).read_line(&mut status).is_ok()
+            && status.starts_with("HTTP/1.1 200")
+    };
+    let first = (0..50).any(|_| {
+        scrape(probes[0]) || {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    let mut seen = vec![first];
+    seen.extend(probes[1..].iter().map(|a| scrape(a)));
+    let _ = child.kill();
+    let _ = child.wait();
+    seen
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metrics_listen_keeps_metrics_off_the_protocol_address() {
+    // Metrics bound wherever -l did, so `-l 0.0.0.0` put them on every
+    // interface with no way to keep them in. All of 127/8 is loopback on
+    // Linux, so 127.0.0.2 stands in for the public address.
+    let mport = free_port();
+    let seen = metrics_answer_on(
+        "127.0.0.2",
+        mport,
+        &["--metrics-listen", "127.0.0.1"],
+        &["127.0.0.1", "127.0.0.2"],
+    );
+    assert_eq!(seen, [true, false], "on 127.0.0.1, not on 127.0.0.2");
+
+    // Without it, metrics stay where -l is, as before.
+    let mport = free_port();
+    let seen = metrics_answer_on("127.0.0.2", mport, &[], &["127.0.0.2", "127.0.0.1"]);
+    assert_eq!(seen, [true, false], "on 127.0.0.2, not on 127.0.0.1");
+}

@@ -1274,6 +1274,16 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                 );
                 tube.ready.assert_consistent();
             }
+            // A pass over parked workers is skipped while this is 0.
+            let ready = s
+                .jobs
+                .values()
+                .filter(|j| j.state == JobState::Ready)
+                .count();
+            assert_eq!(
+                s.ready_ct, ready as u64,
+                "seed {seed} step {step}: ready count"
+            );
             // Each key's limits are those its ready and reserved jobs declare.
             let mut declared: HashMap<String, BTreeMap<u32, u32>> = HashMap::new();
             for j in s
@@ -2621,6 +2631,40 @@ fn test_reserve_job_respects_after_group() {
     );
 }
 
+#[test]
+fn an_aft_job_whose_group_has_no_members_leaves_no_group_behind() {
+    // A put asked whether its aft: group was complete by creating a record
+    // for it, which nothing removed: one leaked per name, never counted.
+    let mut s = make_state();
+    let c = register(&mut s);
+    for i in 0..3 {
+        let resp = s.handle_command(
+            c,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 10,
+                bytes: 1,
+                idempotency_key: None,
+                group: None,
+                after_group: Some(format!("g{i}")),
+                concurrency_key: None,
+            },
+            Some(b"x".to_vec()),
+        );
+        let Response::Inserted(id) = resp else {
+            panic!("put: {resp:?}")
+        };
+        assert!(matches!(
+            s.handle_command(c, Command::ReserveWithTimeout { timeout: 0 }, None),
+            Response::Reserved { id: r, .. } if r == id
+        ));
+        s.handle_command(c, Command::Delete { id }, None);
+    }
+    assert!(s.jobs.is_empty());
+    assert!(s.groups.is_empty(), "groups left: {:?}", s.groups.keys());
+}
+
 // --- waiting_ct accounting ---
 
 #[test]
@@ -2950,6 +2994,29 @@ fn a_pass_over_parked_workers_looks_only_in_tubes_they_watch() {
     let (mut s, _, _rx) = many_tubes_and_a_worker_parked_on_one();
     let n = tubes_looked_at(|| s.process_queue());
     assert!(n < 10, "searched {n} tubes for one parked worker");
+}
+
+#[test]
+fn an_idle_tick_doesnt_search_the_tubes_a_parked_worker_watches() {
+    // Every 100 ms tick searched each tube the worker watched, though no
+    // job was ready anywhere: at 80k tubes, most of a core while idle.
+    let mut s = make_state();
+    let worker = register(&mut s);
+    for i in 0..10_000 {
+        s.handle_command(
+            worker,
+            Command::Watch {
+                tube: format!("t{i}"),
+                weight: 1,
+            },
+            None,
+        );
+    }
+    let (tx, mut rx) = oneshot::channel();
+    s.add_waiter(worker, tx, None, None);
+    let n = tubes_looked_at(|| s.tick());
+    assert!(n < 10, "an idle tick searched {n} tubes");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
