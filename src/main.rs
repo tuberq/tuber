@@ -226,7 +226,7 @@ enum Commands {
         tube: String,
 
         /// Job priority (0 is most urgent)
-        #[arg(short = 'p', long = "pri", default_value_t = 0)]
+        #[arg(short = 'p', long = "pri", default_value_t = 65536)]
         priority: u32,
 
         /// Delay in seconds before job becomes ready

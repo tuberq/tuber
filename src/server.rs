@@ -993,7 +993,7 @@ impl ServerState {
             if let Some(t) = self.tubes.get_mut(&conn.use_tube) {
                 t.using_ct = t.using_ct.saturating_sub(1);
             }
-            for w in &conn.watched {
+            for w in conn.watched() {
                 if let Some(t) = self.tubes.get_mut(&w.name) {
                     t.watching_ct = t.watching_ct.saturating_sub(1);
                 }
@@ -2598,19 +2598,13 @@ impl ServerState {
         self.ensure_tube(tube);
 
         if let Some(conn) = self.conns.get_mut(&conn_id) {
-            // Update weight if already watching, otherwise add
-            if let Some(w) = conn.watched.iter_mut().find(|w| w.name == tube) {
-                w.weight = weight;
-            } else {
-                conn.watched.push(WatchedTube {
-                    name: tube.to_string(),
-                    weight,
-                });
-                if let Some(t) = self.tubes.get_mut(tube) {
-                    t.watching_ct += 1;
-                }
+            // Updates the weight if already watching.
+            if conn.watch(tube, weight)
+                && let Some(t) = self.tubes.get_mut(tube)
+            {
+                t.watching_ct += 1;
             }
-            Response::Watching(conn.watched.len())
+            Response::Watching(conn.watched().len())
         } else {
             Response::InternalError
         }
@@ -2618,15 +2612,15 @@ impl ServerState {
 
     fn cmd_ignore(&mut self, conn_id: u64, tube: &str) -> Response {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
-            if conn.watched.len() < 2 {
+            if conn.watched().len() < 2 {
                 return Response::NotIgnored;
             }
-            let was_watching = conn.watched.iter().any(|w| w.name == tube);
-            conn.watched.retain(|w| w.name != tube);
-            if was_watching && let Some(t) = self.tubes.get_mut(tube) {
+            if conn.ignore(tube)
+                && let Some(t) = self.tubes.get_mut(tube)
+            {
                 t.watching_ct = t.watching_ct.saturating_sub(1);
             }
-            Response::Watching(conn.watched.len())
+            Response::Watching(conn.watched().len())
         } else {
             Response::InternalError
         }
@@ -3490,7 +3484,7 @@ impl ServerState {
     fn cmd_list_tubes_watched(&self, conn_id: u64) -> Response {
         let mut yaml = "---\n".to_string();
         if let Some(conn) = self.conns.get(&conn_id) {
-            for w in &conn.watched {
+            for w in conn.watched() {
                 yaml.push_str(&format!("- {}\n", w.name));
             }
         }
@@ -3534,7 +3528,7 @@ impl ServerState {
             Some(c) => c,
             None => return false,
         };
-        for w in &conn.watched {
+        for w in conn.watched() {
             if let Some(tube) = self.tubes.get(&w.name) {
                 if tube.is_paused() {
                     continue;
@@ -3551,7 +3545,7 @@ impl ServerState {
         let conn = self.conns.get(&conn_id)?;
         let mut best: Option<((u32, u64), u64)> = None; // (key, job_id)
 
-        for w in &conn.watched {
+        for w in conn.watched() {
             if let Some(tube) = self.tubes.get(&w.name) {
                 if tube.is_paused() {
                     continue;
@@ -3596,7 +3590,7 @@ impl ServerState {
         let mut candidates: Vec<(u64, f64)> = Vec::new();
         let mut total_weight: f64 = 0.0;
 
-        for w in &conn.watched {
+        for w in conn.watched() {
             if let Some(tube) = self.tubes.get(&w.name) {
                 if tube.is_paused() || !tube.has_ready() {
                     continue;
@@ -3830,7 +3824,7 @@ impl ServerState {
         let conn = self.conns.get(&conn_id)?;
         let mut best: Option<((u32, u64), u64)> = None;
 
-        for w in &conn.watched {
+        for w in conn.watched() {
             if let Some(tube) = self.tubes.get(&w.name) {
                 if tube.is_paused() {
                     continue;
@@ -3873,7 +3867,7 @@ impl ServerState {
         let seq = self.next_waiter_seq;
         self.next_waiter_seq += 1;
         if let Some(conn) = self.conns.get(&conn_id) {
-            for w in &conn.watched {
+            for w in conn.watched() {
                 if let Some(tube) = self.tubes.get_mut(&w.name) {
                     tube.stat.waiting_ct += 1;
                     tube.waiters.insert(seq);
@@ -3941,7 +3935,7 @@ impl ServerState {
         let waiter = self.waiters.remove(i);
         self.stats.waiting_ct = self.stats.waiting_ct.saturating_sub(1);
         if let Some(conn) = self.conns.get(&waiter.conn_id) {
-            for w in &conn.watched {
+            for w in conn.watched() {
                 Self::unlist_waiter(&mut self.tubes, &mut self.waited_tubes, &w.name, waiter.seq);
                 if let Some(tube) = self.tubes.get_mut(&w.name) {
                     tube.stat.waiting_ct = tube.stat.waiting_ct.saturating_sub(1);

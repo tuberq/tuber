@@ -3022,7 +3022,7 @@ fn puts_stay_cheap_with_a_worker_parked_on_many_tubes() {
             let name = format!("t{i}");
             s.ensure_tube(&name);
             let conn = s.conns.get_mut(&worker).unwrap();
-            conn.watched.push(WatchedTube { name, weight: 1 });
+            conn.watch(&name, 1);
         }
         let _rx = park.then(|| {
             let (tx, rx) = oneshot::channel();
@@ -3046,6 +3046,45 @@ fn puts_stay_cheap_with_a_worker_parked_on_many_tubes() {
     let parked = time_puts(true);
     eprintln!("per put: {idle:?} with no worker parked, {parked:?} with one parked on 200k tubes");
     assert!(parked < idle * 10, "{parked:?} against {idle:?}");
+}
+
+#[test]
+#[ignore = "timing, run by hand"]
+fn watching_and_ignoring_many_tubes_stays_linear() {
+    // `watch` and `ignore` looked for the tube in the connection's whole
+    // watch list, so watching N tubes one at a time took O(N²) time: 41 s
+    // for 200,000. Run with
+    // `cargo test --release --lib watching_and_ignoring -- --ignored --nocapture`.
+    let time = |n: usize| {
+        let mut s = make_state();
+        let conn = register(&mut s);
+        let names: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
+        for name in &names {
+            s.ensure_tube(name);
+        }
+        let start = Instant::now();
+        for name in &names {
+            let tube = name.clone();
+            s.handle_command(conn, Command::Watch { tube, weight: 1 }, None);
+        }
+        let watch = start.elapsed();
+        let start = Instant::now();
+        for name in &names {
+            let tube = name.clone();
+            s.handle_command(conn, Command::Ignore { tube }, None);
+        }
+        (watch, start.elapsed())
+    };
+    let (watch1, ignore1) = time(25_000);
+    let (watch2, ignore2) = time(50_000);
+    eprintln!(
+        "watch: {watch1:?} for 25k tubes, {watch2:?} for 50k; ignore: {ignore1:?}, {ignore2:?}"
+    );
+    assert!(watch2 < watch1 * 3, "watch: {watch1:?} then {watch2:?}");
+    assert!(
+        ignore2 < ignore1 * 3,
+        "ignore: {ignore1:?} then {ignore2:?}"
+    );
 }
 
 #[test]
@@ -3198,7 +3237,7 @@ fn no_parked_worker_could_take_a_job_after_any_command_under_random_ops() {
                 let want: std::collections::BTreeSet<u64> = s
                     .waiters
                     .iter()
-                    .filter(|w| s.conns[&w.conn_id].watched.iter().any(|x| &x.name == name))
+                    .filter(|w| s.conns[&w.conn_id].watches_tube(name))
                     .map(|w| w.seq)
                     .collect();
                 assert_eq!(tube.waiters, want, "seed {seed} step {step} tube {name}");

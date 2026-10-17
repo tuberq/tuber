@@ -229,6 +229,28 @@ fn put_that_is_accepted_or_deduplicated_exits_zero() {
 }
 
 #[test]
+fn put_defaults_to_priority_65536_and_ttr_120() {
+    // As tuber-gem and beaneater put, so a job put by hand queues
+    // alongside theirs rather than ahead.
+    let server = Server::start(&[]);
+    let put = run(&["put", "-a", &server.addr(), "x"], &[], None);
+    assert_eq!(stdout(&put), "INSERTED 1\n");
+
+    let mut conn = TcpStream::connect(server.addr()).unwrap();
+    conn.write_all(b"stats-job 1\r\n").unwrap();
+    let mut reader = BufReader::new(conn);
+    let mut yaml = String::new();
+    let mut line = String::new();
+    while !line.trim_end().starts_with("file:") {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        yaml.push_str(&line);
+    }
+    assert!(yaml.lines().any(|l| l == "pri: 65536"), "{yaml}");
+    assert!(yaml.lines().any(|l| l == "ttr: 120"), "{yaml}");
+}
+
+#[test]
 fn put_deduplicated_against_a_buried_job_warns() {
     let server = Server::start(&[]);
     let first = run(&["put", "-a", &server.addr(), "-i", "k", "x"], &[], None);
