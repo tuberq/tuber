@@ -249,7 +249,8 @@ every 1h offset 5m                         :05 of every hour
 Response: `STAGED\r\n`, or `BAD_FORMAT\r\n` (malformed line, or a name
 staged twice), `BAD_SCHEDULE\r\n` (a spec or zone tuber can't use, or a
 cron that never matches), `JOB_TOO_BIG\r\n`, `OUT_OF_MEMORY\r\n` (the
-`--max-jobs-size` budget, or more than 10,000 entries), `NOT_SYNCING\r\n`.
+`--max-jobs-size` budget, more than 10,000 entries, or an owner's set over
+8 MiB), `NOT_SYNCING\r\n`.
 Any refusal makes the sync abort. The body is consumed either way.
 
 ### schedule-commit\r\n

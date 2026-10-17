@@ -146,7 +146,7 @@ Instead, a bad deploy leaves the last good schedule running. The refusals:
 | `BAD_SCHEDULE` | A spec tuber can't read, an unknown zone (`Australia/Melborne`), or a cron that never matches (`0 0 30 2 *`) |
 | `BAD_FORMAT` | A malformed line, an invalid name or tag, or the same name twice in one sync |
 | `JOB_TOO_BIG` | The body is over `--max-job-size` |
-| `OUT_OF_MEMORY` | The `--max-jobs-size` budget, or more than 10,000 entries |
+| `OUT_OF_MEMORY` | The `--max-jobs-size` budget, more than 10,000 entries, or a set over 8 MiB |
 
 If the connection drops mid-sync, tuber throws the staged set away. Resend
 the whole sync on a new connection. That's safe: a sync is idempotent. Never
@@ -307,10 +307,13 @@ A deploy that switches over:
 ## Limits
 
 - Up to 10,000 entries across all owners.
+- One owner's set is at most 8 MiB: its bodies, plus each entry's
+  `schedule-put` line and up to 33 bytes more.
 - A body is capped by `--max-job-size`.
 - Entries count toward `--max-jobs-size`: their bodies and names, plus about
   500 bytes each, shown as `current-schedules-size` in `stats`. A sync in
   progress counts too.
 - With `-b`, schedules are stored in the WAL and count toward
-  `--max-storage-bytes`. A commit
-  that only keeps or shrinks a set always goes through, even on a full disk.
+  `--max-storage-bytes`. A commit that grows a set needs room for all of it,
+  since it writes the whole set again. One that only keeps or shrinks a set
+  always goes through, even on a full disk.

@@ -100,7 +100,7 @@ SYNCED 9 0 0 0
 Errors from `schedule-put`: `BAD_FORMAT` (malformed line, or a name staged
 twice in one sync), `BAD_SCHEDULE` (a spec or zone tuber can't use, or a cron
 that never matches, e.g. `0 0 30 2 *`), `JOB_TOO_BIG`, `OUT_OF_MEMORY` (the
-`--max-jobs-size` budget, or the 10,000-entry cap). Any of them makes the
+`--max-jobs-size` budget, the 10,000-entry cap, or the 8 MiB set cap). Any of them makes the
 sync's commit reply `ABORTED`. As with `put`, the data block is drained even
 when the line is rejected, so a bad entry can't desync the connection; and
 a rejected line still reaches the engine, so that the sync knows. A second
@@ -505,8 +505,13 @@ at its start repeats. It costs about 100 ns a call, `* * * * *` included.
 ### 9. Limits
 
 Owner and name follow tube-name rules. The body is capped by
-`--max-job-size`. A total entry cap of 10,000 keeps the files and the per-tick
-scan bounded; entries count toward the `--max-jobs-size` memory budget as jobs
+`--max-job-size`. A total entry cap of 10,000 keeps the records and the
+per-tick scan bounded. An owner's set is capped at 8 MiB as stored, since it
+is one WAL record, written whole by each commit that changes it and by
+compaction. That keeps it under the default WAL segment, the reserve
+`--max-storage-bytes` holds for writes that always go through, such as a
+commit that shrinks a set; a commit that grows one needs disk room for all
+of it. Entries count toward the `--max-jobs-size` memory budget as jobs
 do (their body and strings plus 512 bytes each), reported as
 `current-schedules-size`.
 
