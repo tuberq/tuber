@@ -250,7 +250,8 @@ impl BodyStore {
     /// the bodies before the damage are used, a copy of the segment is kept
     /// as `.corrupt` and the segment is cut at the damage, or a segment with
     /// no usable file header is moved there. Either way a later start
-    /// doesn't need the flag again.
+    /// doesn't need the flag again. If the copy can't be written, it is an
+    /// error still, and the segment is left whole.
     pub fn open_with_skip_corrupt(
         dir: &Path,
         segment_size: u64,
@@ -262,7 +263,7 @@ impl BodyStore {
     /// [`BodyStore::open_with_skip_corrupt`], judging the newest segment by
     /// the WAL's recovery point (`Wal::read_toast_mark`). Only bytes past it
     /// can be a write cut short by a crash; damage before it is handled as
-    /// in an older segment. Without one, all of the newest segment counts as
+    /// in an older segment, and so is a segment that ends before it. Without one, all of the newest segment counts as
     /// possibly torn, as before WAL v9. Everything indexed is fsynced before
     /// this returns, so [`BodyStore::synced_point`] is the end of the store.
     pub fn open_with_recovery_point(
@@ -358,38 +359,44 @@ impl BodyStore {
                     }
                     continue;
                 }
-                let kept = match fs::copy(&path, &aside) {
-                    Ok(_) => {
-                        tracing::error!(
-                            "TOAST: segment {:?} {}; using the bodies before it, copy kept as \
-                             {:?} (--wal-skip-corrupt)",
-                            path,
-                            damage.what,
-                            aside,
-                        );
-                        true
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "TOAST: segment {:?} {}; using the bodies before it, failed to keep \
-                             a copy: {}",
-                            path,
-                            damage.what,
-                            e,
-                        );
-                        false
-                    }
-                };
-                // Cut the segment at the damage, so a later start finds it
-                // whole and doesn't need the flag again. An older one only
-                // once the copy is kept, since the bodies past the damage
-                // may still be recoverable from it. The newest regardless:
-                // appends continue there, and stray bytes left past a new
-                // record could later scan as a phantom body.
-                if newest || kept {
-                    file.set_len(scan.consumed)?;
-                    file.sync_data()?;
+                // Without a copy the segment is the only place the bodies
+                // past the damage are, and they may still be recoverable,
+                // so stop rather than cut it.
+                if let Err(e) = copy_durably(&path, &aside) {
+                    return Err(uncopied_segment_error(&path, &damage.what, &e));
                 }
+                tracing::error!(
+                    "TOAST: segment {:?} {}; using the bodies before it, copy kept as {:?} \
+                     (--wal-skip-corrupt)",
+                    path,
+                    damage.what,
+                    aside,
+                );
+                // Cut the segment at the damage, so a later start finds it
+                // whole and doesn't need the flag again. In the newest, where
+                // appends continue, this also keeps stray bytes from being
+                // left past a new record, where they could scan as a phantom
+                // body.
+                file.set_len(scan.consumed)?;
+                file.sync_data()?;
+            } else if let Some(t) = torn_from
+                && scan.consumed < t
+            {
+                // Nothing left is damaged, but the segment ends before the
+                // recovery point, so bodies that were fsynced are gone. Once
+                // started, the WAL's next mark is this end, so a later start
+                // doesn't need the flag again.
+                if !skip_corrupt {
+                    return Err(short_segment_error(&path, scan.consumed, t));
+                }
+                tracing::error!(
+                    "TOAST: segment {:?} ends at byte {}, before the TOAST recovery point at \
+                     byte {}; starting without the bodies that were past its end \
+                     (--wal-skip-corrupt)",
+                    path,
+                    scan.consumed,
+                    t,
+                );
             }
             if newest && scan.version == TOAST_VERSION {
                 current_seq = Some(*seq);
@@ -398,7 +405,7 @@ impl BodyStore {
             for entry in scan.entries {
                 max_body_id = max_body_id.max(entry.body_id.0 + 1);
                 live_bytes += entry.len as u64;
-                index.insert(
+                let earlier = index.insert(
                     entry.body_id,
                     BodyLocation {
                         seq: *seq,
@@ -407,6 +414,19 @@ impl BodyStore {
                         crc: entry.crc,
                     },
                 );
+                // The same body again: compaction copied it here, and a crash
+                // came before the segment it copied from was unlinked. Only
+                // this copy is indexed, so only it is live; counting the
+                // other too would keep that segment from ever compacting.
+                if let Some(earlier) = earlier {
+                    let len = earlier.len as u64;
+                    if earlier.seq == *seq {
+                        live_bytes = live_bytes.saturating_sub(len);
+                    } else if let Some(seg) = segments.get_mut(&earlier.seq) {
+                        seg.live_bytes = seg.live_bytes.saturating_sub(len);
+                        live_bytes_acc = live_bytes_acc.saturating_sub(len);
+                    }
+                }
             }
             total_bytes_acc += scan.consumed;
             live_bytes_acc += live_bytes;
@@ -1123,6 +1143,17 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Copy `from` to `to`, fsyncing the copy and its directory, so `from` can
+/// then be cut short without a crash leaving the cut but not the copy.
+pub(crate) fn copy_durably(from: &Path, to: &Path) -> io::Result<()> {
+    fs::copy(from, to)?;
+    File::open(to)?.sync_all()?;
+    match to.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => fsync_dir(dir),
+        _ => fsync_dir(Path::new(".")),
+    }
+}
+
 fn encode_body_header(body_id: BodyId, len: u32, crc: u32) -> [u8; BODY_HEADER_SIZE] {
     let mut h = [0u8; BODY_HEADER_SIZE];
     h[0..8].copy_from_slice(&body_id.0.to_le_bytes());
@@ -1204,6 +1235,32 @@ fn damaged_segment_error(path: &Path, damage: &str, why: &str) -> BodyStoreError
          keeping the damaged segment as {}.",
         path.display(),
         corrupt_copy_path(path).display(),
+    ))
+}
+
+/// The error that stops a `--wal-skip-corrupt` start at a damaged segment it
+/// can't keep a copy of. Cutting the segment without one would destroy the
+/// bodies past the damage, which may still be recoverable.
+fn uncopied_segment_error(path: &Path, damage: &str, err: &io::Error) -> BodyStoreError {
+    BodyStoreError::Damaged(format!(
+        "TOAST segment {} {damage}. --wal-skip-corrupt starts with the bodies before the \
+         damage and cuts the segment there, but couldn't keep a copy of it as {} first \
+         ({err}), and cutting it without one would destroy the bodies past the damage. \
+         Free some disk space, or fix whatever stopped the copy, and start again with \
+         --wal-skip-corrupt, or restore the WAL directory from a backup.",
+        path.display(),
+        corrupt_copy_path(path).display(),
+    ))
+}
+
+fn short_segment_error(path: &Path, len: u64, recovery_point: u64) -> BodyStoreError {
+    BodyStoreError::Damaged(format!(
+        "TOAST segment {} ends at byte {len}, before the TOAST recovery point the WAL recorded \
+         at byte {recovery_point}: bodies that were fsynced are gone, which a crash can't \
+         explain. Starting without them would drop the jobs they belong to. Restore the WAL \
+         directory from a backup, or start with --wal-skip-corrupt (env \
+         TUBER_WAL_SKIP_CORRUPT) to start without them.",
+        path.display(),
     ))
 }
 
@@ -1884,6 +1941,32 @@ mod tests {
     }
 
     #[test]
+    fn test_open_counts_a_body_found_twice_as_live_only_where_it_is_indexed() {
+        // Compaction copies a segment's live bodies into the newest one, then
+        // unlinks it. A crash before the unlink reaches disk leaves bodies in
+        // both. The later copy is the one indexed, but the old segment counted
+        // its copy as live too, and a delete uncounts only the indexed one, so
+        // the old segment never went sparse enough to compact.
+        let tmp = TempDir::new().unwrap();
+        let ids = store_with_older_segment(tmp.path());
+        let seg0 = segment_path(tmp.path(), 0);
+        let uncompacted = fs::read(&seg0).unwrap();
+        let bs = BodyStore::open(tmp.path(), 200).unwrap();
+        assert_eq!(bs.compact_segment(0).unwrap(), 3);
+        drop(bs);
+        fs::write(&seg0, &uncompacted).unwrap();
+
+        let bs = BodyStore::open(tmp.path(), 200).unwrap();
+        assert_eq!(bs.read_body(ids[0]).unwrap(), vec![0; 40]);
+        assert_eq!(bs.live_bytes(), 4 * 40);
+        assert_eq!(
+            bs.compaction_candidate(COMPACTION_LIVE_RATIO_THRESHOLD),
+            Some(0),
+            "nothing in segment 0 is live"
+        );
+    }
+
+    #[test]
     fn test_open_refuses_overlong_body_in_older_segment() {
         // The review's case: a corrupt length runs past the end of a sealed
         // segment. The scan took it for a torn tail and truncated the file
@@ -1987,18 +2070,31 @@ mod tests {
     }
 
     #[test]
-    fn test_open_skip_corrupt_leaves_an_older_segment_whole_without_a_copy() {
-        // The bodies past the damage may still be recoverable, and with no
-        // copy kept the segment is the only place they are.
+    fn test_open_skip_corrupt_refuses_an_older_segment_it_cannot_copy() {
+        // Cutting it without a copy would destroy the bodies past the
+        // damage, which may still be recoverable. A directory at the copy's
+        // path stands in for a full disk.
         let tmp = TempDir::new().unwrap();
         let ids = store_with_older_segment(tmp.path());
         let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
         let seg0 = segment_path(tmp.path(), 0);
-        fs::create_dir(corrupt_copy_path(&seg0)).unwrap();
+        let copy = corrupt_copy_path(&seg0);
+        fs::create_dir(&copy).unwrap();
 
+        let msg = match BodyStore::open_with_skip_corrupt(tmp.path(), 200, true) {
+            Ok(_) => panic!("open went ahead without keeping a copy"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("body.000000"), "{msg}");
+        assert!(msg.contains("couldn't keep a copy"), "{msg}");
+        assert!(msg.contains("--wal-skip-corrupt"), "{msg}");
+        assert!(fs::read(&seg0).unwrap() == damaged, "left whole");
+
+        // Once the copy can be written, the same switch gets past it.
+        fs::remove_dir(&copy).unwrap();
         let bs = BodyStore::open_with_skip_corrupt(tmp.path(), 200, true).unwrap();
         assert_eq!(bs.read_body(ids[0]).unwrap(), vec![0; 40]);
-        assert!(fs::read(&seg0).unwrap() == damaged, "left whole");
+        assert!(fs::read(&copy).unwrap() == damaged, "the copy is whole");
     }
 
     #[test]
@@ -2053,6 +2149,24 @@ mod tests {
     }
 
     #[test]
+    fn test_open_skip_corrupt_refuses_damage_before_the_recovery_point_it_cannot_copy() {
+        // The newest segment's bodies before the recovery point were fsynced
+        // too, so cutting there without a copy would destroy them the same.
+        let tmp = TempDir::new().unwrap();
+        let (_, point) = store_synced(tmp.path());
+        let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
+        let seg0 = segment_path(tmp.path(), 0);
+        fs::create_dir(corrupt_copy_path(&seg0)).unwrap();
+
+        let msg = match BodyStore::open_with_recovery_point(tmp.path(), 4096, true, Some(point)) {
+            Ok(_) => panic!("open went ahead without keeping a copy"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("couldn't keep a copy"), "{msg}");
+        assert!(fs::read(&seg0).unwrap() == damaged, "left whole");
+    }
+
+    #[test]
     fn test_open_refuses_damage_in_a_newest_segment_sealed_before_the_recovery_point() {
         // The segment holding the recovery point is gone: an old-format
         // newest segment takes no new bodies, so the compactor deletes it
@@ -2097,21 +2211,55 @@ mod tests {
         assert!(!bs.contains_body(ids[2]));
     }
 
-    #[test]
-    fn test_open_carries_on_when_the_newest_segment_is_shorter_than_the_recovery_point() {
-        // Bodies the WAL vouched for are gone, but nothing left is damaged.
-        // Open goes ahead, and replay reaps the jobs that lost them.
-        let tmp = TempDir::new().unwrap();
-        let (ids, point) = store_synced(tmp.path());
+    /// Cut segment 0 of `store_synced` short at a body boundary, before its
+    /// recovery point.
+    fn store_synced_then_cut_short(dir: &Path) -> (Vec<BodyId>, DurablePoint) {
+        let (ids, point) = store_synced(dir);
         let file = OpenOptions::new()
             .write(true)
-            .open(segment_path(tmp.path(), 0))
+            .open(segment_path(dir, 0))
             .unwrap();
         file.set_len(header_offset(2)).unwrap();
+        assert!(header_offset(2) < point.offset);
+        (ids, point)
+    }
 
-        let bs = open_at(tmp.path(), Some(point)).unwrap();
+    #[test]
+    fn test_open_refuses_a_newest_segment_shorter_than_the_recovery_point() {
+        // Nothing left is damaged, but bodies the WAL was told were fsynced
+        // are gone, and a crash can't take those.
+        let tmp = TempDir::new().unwrap();
+        let (_, point) = store_synced_then_cut_short(tmp.path());
+
+        let msg = match open_at(tmp.path(), Some(point)) {
+            Ok(_) => panic!("open went ahead without bodies before the recovery point"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("recovery point"), "{msg}");
+        assert!(msg.contains("--wal-skip-corrupt"), "{msg}");
+        assert_eq!(
+            fs::metadata(segment_path(tmp.path(), 0)).unwrap().len(),
+            header_offset(2)
+        );
+    }
+
+    #[test]
+    fn test_open_skip_corrupt_carries_on_past_a_newest_segment_cut_short() {
+        // Replay reaps the jobs whose bodies are gone.
+        let tmp = TempDir::new().unwrap();
+        let (ids, point) = store_synced_then_cut_short(tmp.path());
+
+        let bs = BodyStore::open_with_recovery_point(tmp.path(), 4096, true, Some(point)).unwrap();
         assert_eq!(bs.read_body(ids[1]).unwrap(), vec![1; 40]);
         assert!(!bs.contains_body(ids[2]));
+        assert_eq!(
+            bs.synced_point(),
+            Some(DurablePoint {
+                seq: 0,
+                offset: header_offset(2)
+            }),
+            "the WAL's next mark is the store's end, so a later start doesn't need the flag"
+        );
     }
 
     #[test]

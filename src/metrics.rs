@@ -171,6 +171,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     );
     prom_gauge(
         &mut out,
+        "tuber_jobs_held",
+        "Current aft: jobs their group holds",
+        &stats,
+        "current-jobs-held",
+    );
+    prom_gauge(
+        &mut out,
         "tuber_jobs_buried",
         "Current buried jobs",
         &stats,
@@ -537,6 +544,8 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         out.push_str("# TYPE tuber_tube_ready_jobs gauge\n");
         out.push_str("# HELP tuber_tube_delayed_jobs Delayed jobs per tube\n");
         out.push_str("# TYPE tuber_tube_delayed_jobs gauge\n");
+        out.push_str("# HELP tuber_tube_held_jobs aft: jobs their group holds, per tube\n");
+        out.push_str("# TYPE tuber_tube_held_jobs gauge\n");
         out.push_str("# HELP tuber_tube_buried_jobs Buried jobs per tube\n");
         out.push_str("# TYPE tuber_tube_buried_jobs gauge\n");
         out.push_str("# HELP tuber_tube_reserved_jobs Reserved jobs per tube\n");
@@ -582,6 +591,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
                     name,
                     &ts,
                     "current-jobs-delayed",
+                );
+                tube_metric(
+                    &mut out,
+                    "tuber_tube_held_jobs",
+                    name,
+                    &ts,
+                    "current-jobs-held",
                 );
                 tube_metric(
                     &mut out,

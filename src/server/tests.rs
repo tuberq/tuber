@@ -1217,10 +1217,10 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                         0 if !parked.is_empty() => parked[next(parked.len() as u64) as usize],
                         _ => 1 + next(max_id),
                     };
-                    let cmd = if next(2) == 0 {
-                        Command::KickJob { id }
-                    } else {
-                        Command::ReserveJob { id }
+                    let cmd = match next(3) {
+                        0 => Command::KickJob { id },
+                        1 => Command::ReserveJob { id },
+                        _ => Command::Delete { id },
                     };
                     s.handle_command(c, cmd, None);
                 }
@@ -1258,6 +1258,19 @@ fn test_find_best_unblocked_matches_brute_force_under_random_ops() {
                     tube.ready.len(),
                     ready,
                     "seed {seed} step {step} tube {name}: count"
+                );
+                let held = s
+                    .jobs
+                    .values()
+                    .filter(|j| {
+                        j.state == JobState::Delayed
+                            && j.deadline_at.is_none()
+                            && &*j.tube_name == name
+                    })
+                    .count();
+                assert_eq!(
+                    tube.stat.held_ct, held as u64,
+                    "seed {seed} step {step} tube {name}: held"
                 );
                 tube.ready.assert_consistent();
             }
@@ -1759,6 +1772,51 @@ fn test_idempotency_priority_upgrade_delayed() {
         Response::InsertedDup(1, "DELAYED", Some(40))
     ));
     assert_eq!(s.jobs.get(&1).unwrap().priority, 40);
+}
+
+/// A priority upgrade on a delayed job journals its delay with the new
+/// priority. It journalled the full delay, stamped at the upgrade, so a
+/// restart started the countdown over from there.
+#[test]
+fn a_priority_upgrade_keeps_a_delayed_jobs_countdown_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+    let put = |pri| Command::Put {
+        pri,
+        delay: 3600,
+        ttr: 10,
+        bytes: 1,
+        idempotency_key: Some(("k".into(), 0)),
+        group: None,
+        after_group: None,
+        concurrency_key: None,
+    };
+    assert_eq!(
+        s.handle_command(c, put(100), Some(b"a".to_vec())),
+        Response::Inserted(1)
+    );
+    // Most of the hour has gone by.
+    s.jobs.get_mut(&1).unwrap().deadline_at = Some(Instant::now() + Duration::from_secs(60));
+    assert_eq!(
+        s.handle_command(c, put(40), Some(b"a".to_vec())),
+        Response::InsertedDup(1, "DELAYED", Some(40))
+    );
+    s.wal.as_mut().unwrap().sync().unwrap();
+    drop(s);
+
+    let mut wal = crate::wal::Wal::open(dir.path(), Default::default()).unwrap();
+    let (jobs, ..) = wal.replay().unwrap();
+    let job = &jobs[&1];
+    assert_eq!(job.priority, 40);
+    let left = job
+        .deadline_at
+        .unwrap()
+        .saturating_duration_since(Instant::now());
+    assert!(
+        left <= Duration::from_secs(60),
+        "the countdown started over: {left:?} left"
+    );
 }
 
 #[test]
@@ -2821,6 +2879,364 @@ fn a_put_whose_wal_write_fails_is_not_run() {
     assert_eq!(ready_in(&s, "default"), 0);
 }
 
+/// Many tubes, and one worker parked on `jobs` alone.
+fn many_tubes_and_a_worker_parked_on_one() -> (ServerState, u64, oneshot::Receiver<Response>) {
+    let mut s = make_state();
+    for i in 0..10_000 {
+        s.ensure_tube(&format!("t{i}"));
+    }
+    let (producer, worker) = (register(&mut s), register(&mut s));
+    s.handle_command(
+        worker,
+        Command::Watch {
+            tube: "jobs".into(),
+            weight: 1,
+        },
+        None,
+    );
+    s.handle_command(
+        worker,
+        Command::Ignore {
+            tube: "default".into(),
+        },
+        None,
+    );
+    let (tx, rx) = oneshot::channel();
+    s.add_waiter(worker, tx, None, None);
+    (s, producer, rx)
+}
+
+/// Tubes searched for a ready job while `f` runs.
+fn tubes_looked_at(f: impl FnOnce()) -> u64 {
+    let before = TUBES_LOOKED_AT.with(|n| n.get());
+    f();
+    TUBES_LOOKED_AT.with(|n| n.get()) - before
+}
+
+#[test]
+fn a_put_looks_for_a_parked_worker_only_in_its_own_tube() {
+    // With any worker parked, each put searched every tube on the server,
+    // whether or not the worker watched the put's.
+    let (mut s, producer, mut rx) = many_tubes_and_a_worker_parked_on_one();
+    let n = tubes_looked_at(|| {
+        s.handle_command(producer, put_cmd(0, 0, 60, 1), Some(b"a".to_vec()));
+    });
+    assert!(
+        n < 10,
+        "a put into a tube nobody waits on searched {n} tubes"
+    );
+    assert!(rx.try_recv().is_err());
+
+    s.handle_command(
+        producer,
+        Command::Use {
+            tube: "jobs".into(),
+        },
+        None,
+    );
+    let n = tubes_looked_at(|| {
+        s.handle_command(producer, put_cmd(0, 0, 60, 1), Some(b"b".to_vec()));
+    });
+    assert!(n < 10, "a put for the parked worker searched {n} tubes");
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Response::Reserved { id: 2, .. })
+    ));
+}
+
+#[test]
+fn a_pass_over_parked_workers_looks_only_in_tubes_they_watch() {
+    // The tick's pass, and the one after a delete, release, kick or unpause.
+    let (mut s, _, _rx) = many_tubes_and_a_worker_parked_on_one();
+    let n = tubes_looked_at(|| s.process_queue());
+    assert!(n < 10, "searched {n} tubes for one parked worker");
+}
+
+#[test]
+fn a_freed_job_goes_to_the_longest_waiting_worker_that_watches_its_tube() {
+    let mut s = make_state();
+    let producer = register(&mut s);
+    let mut parked = Vec::new();
+    for watches in [&["x"][..], &["y", "x"], &["y"]] {
+        let c = register(&mut s);
+        s.handle_command(
+            c,
+            Command::Ignore {
+                tube: "default".into(),
+            },
+            None,
+        );
+        for &t in watches {
+            s.handle_command(
+                c,
+                Command::Watch {
+                    tube: t.into(),
+                    weight: 1,
+                },
+                None,
+            );
+        }
+        let (tx, rx) = oneshot::channel();
+        s.add_waiter(c, tx, None, None);
+        parked.push(rx);
+    }
+    for t in ["x", "y"] {
+        s.handle_command(
+            producer,
+            Command::PauseTube {
+                tube: t.into(),
+                delay: 60,
+            },
+            None,
+        );
+        s.handle_command(producer, Command::Use { tube: t.into() }, None);
+        s.handle_command(producer, put_cmd(0, 0, 60, 1), Some(t.as_bytes().to_vec()));
+    }
+    for t in ["x", "y"] {
+        s.tubes.get_mut(t).unwrap().unpause_at = None;
+    }
+
+    s.process_queue();
+    // The first worker takes x's job; y's goes to the second, which arrived
+    // before the third.
+    let got: Vec<Option<u64>> = parked
+        .iter_mut()
+        .map(|rx| match rx.try_recv() {
+            Ok(Response::Reserved { id, .. }) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got, [Some(1), Some(2), None]);
+}
+
+#[test]
+#[ignore = "timing, run by hand"]
+fn puts_stay_cheap_with_a_worker_parked_on_many_tubes() {
+    // The review's case: a worker parked while watching 200,000 tubes, and
+    // each put searching every one of them for it. Run with
+    // `cargo test --release --lib puts_stay_cheap -- --ignored --nocapture`.
+    let time_puts = |park: bool| {
+        let mut s = make_state();
+        let (producer, worker) = (register(&mut s), register(&mut s));
+        for i in 0..200_000 {
+            let name = format!("t{i}");
+            s.ensure_tube(&name);
+            let conn = s.conns.get_mut(&worker).unwrap();
+            conn.watched.push(WatchedTube { name, weight: 1 });
+        }
+        let _rx = park.then(|| {
+            let (tx, rx) = oneshot::channel();
+            s.add_waiter(worker, tx, None, None);
+            rx
+        });
+        s.handle_command(
+            producer,
+            Command::Use {
+                tube: "elsewhere".into(),
+            },
+            None,
+        );
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            s.handle_command(producer, put_cmd(0, 0, 60, 1), Some(b"x".to_vec()));
+        }
+        start.elapsed() / 1_000
+    };
+    let idle = time_puts(false);
+    let parked = time_puts(true);
+    eprintln!("per put: {idle:?} with no worker parked, {parked:?} with one parked on 200k tubes");
+    assert!(parked < idle * 10, "{parked:?} against {idle:?}");
+}
+
+#[test]
+fn no_parked_worker_could_take_a_job_after_any_command_under_random_ops() {
+    // A put looks only at its own tube for a parked worker. That is enough
+    // only if, after every command, no parked worker could take a job
+    // anywhere. Random puts, reserves, parks, deletes, releases, buries,
+    // kicks, delays coming due, pauses and disconnects across three tubes
+    // sharing con: keys; after each step, check that, and each tube's index
+    // of the reserves parked on it.
+    const TUBES: [&str; 3] = ["a", "b", "c"];
+    let mut served = 0;
+    for seed in 1..=8u64 {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut s = make_state();
+        let producer = register(&mut s);
+        let new_worker = |s: &mut ServerState, next: &mut dyn FnMut(u64) -> u64| {
+            let c = register(s);
+            let first = next(3) as usize;
+            for (i, t) in TUBES.iter().enumerate() {
+                if i == first || next(3) == 0 {
+                    s.handle_command(
+                        c,
+                        Command::Watch {
+                            tube: (*t).into(),
+                            weight: 1,
+                        },
+                        None,
+                    );
+                }
+            }
+            s.handle_command(
+                c,
+                Command::Ignore {
+                    tube: "default".into(),
+                },
+                None,
+            );
+            c
+        };
+        let mut workers: Vec<u64> = (0..5).map(|_| new_worker(&mut s, &mut next)).collect();
+        let mut parked: HashMap<u64, oneshot::Receiver<Response>> = HashMap::new();
+
+        for step in 0..2000 {
+            // A parked worker whose reserve was answered is free again.
+            parked.retain(|_, rx| match rx.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => true,
+                Ok(_) => {
+                    served += 1;
+                    false
+                }
+                Err(_) => false,
+            });
+            let w = workers[next(workers.len() as u64) as usize];
+            let free = !parked.contains_key(&w);
+            let held: Vec<u64> = s.conns[&w].reserved_jobs.clone();
+            let pick = |next: &mut dyn FnMut(u64) -> u64| {
+                (!held.is_empty()).then(|| held[next(held.len() as u64) as usize])
+            };
+            let tube = TUBES[next(3) as usize];
+            match next(100) {
+                0..=29 => {
+                    s.handle_command(producer, Command::Use { tube: tube.into() }, None);
+                    let cmd = Command::Put {
+                        pri: next(4) as u32,
+                        delay: if next(10) == 0 { 60 } else { 0 },
+                        ttr: 120,
+                        bytes: 1,
+                        idempotency_key: None,
+                        group: None,
+                        after_group: None,
+                        concurrency_key: (next(10) < 6)
+                            .then(|| (["k", "l"][next(2) as usize].into(), 1 + next(2) as u32)),
+                    };
+                    s.handle_command(producer, cmd, Some(b"x".to_vec()));
+                }
+                30..=49 if free => {
+                    if reserve_now(&mut s, w).is_none() {
+                        let (tx, rx) = oneshot::channel();
+                        s.add_waiter(w, tx, None, None);
+                        parked.insert(w, rx);
+                    }
+                }
+                50..=61 if free => {
+                    if let Some(id) = pick(&mut next) {
+                        s.handle_command(w, Command::Delete { id }, None);
+                    }
+                }
+                62..=69 if free => {
+                    if let Some(id) = pick(&mut next) {
+                        let delay = if next(4) == 0 { 60 } else { 0 };
+                        s.handle_command(w, Command::Release { id, pri: 0, delay }, None);
+                    }
+                }
+                70..=74 if free => {
+                    if let Some(id) = pick(&mut next) {
+                        s.handle_command(w, Command::Bury { id, pri: 0 }, None);
+                    }
+                }
+                75..=79 => {
+                    s.handle_command(producer, Command::Use { tube: tube.into() }, None);
+                    let bound = 1 + next(3) as u32;
+                    s.handle_command(producer, Command::Kick { bound }, None);
+                }
+                80..=84 => {
+                    let mut delayed: Vec<u64> = s
+                        .jobs
+                        .values()
+                        .filter(|j| j.state == JobState::Delayed)
+                        .map(|j| j.id)
+                        .collect();
+                    delayed.sort_unstable();
+                    if !delayed.is_empty() {
+                        make_due(&mut s, delayed[next(delayed.len() as u64) as usize]);
+                    }
+                    s.tick();
+                }
+                85..=89 => {
+                    let delay = if next(2) == 0 { 60 } else { 0 };
+                    let cmd = Command::PauseTube {
+                        tube: tube.into(),
+                        delay,
+                    };
+                    s.handle_command(producer, cmd, None);
+                }
+                90..=94 => {
+                    s.unregister_conn(w);
+                    parked.remove(&w);
+                    workers.retain(|&x| x != w);
+                    workers.push(new_worker(&mut s, &mut next));
+                }
+                _ => s.tick(),
+            }
+
+            for waiter in &s.waiters {
+                assert_eq!(
+                    s.find_ready_job_for_conn_inner(waiter.conn_id),
+                    None,
+                    "seed {seed} step {step}: conn {} is parked with a job it could take",
+                    waiter.conn_id
+                );
+            }
+            for (name, tube) in &s.tubes {
+                let want: std::collections::BTreeSet<u64> = s
+                    .waiters
+                    .iter()
+                    .filter(|w| s.conns[&w.conn_id].watched.iter().any(|x| &x.name == name))
+                    .map(|w| w.seq)
+                    .collect();
+                assert_eq!(tube.waiters, want, "seed {seed} step {step} tube {name}");
+                assert_eq!(tube.stat.waiting_ct, want.len() as u64);
+                assert_eq!(s.waited_tubes.contains(name), !want.is_empty());
+            }
+            assert!(s.waited_tubes.iter().all(|t| s.tubes.contains_key(t)));
+        }
+    }
+    eprintln!("parked reserves served: {served}");
+    assert!(served > 200, "only {served} parked reserves were served");
+}
+
+/// Taking back a put its group held leaves the tube's held count as it was.
+#[test]
+fn a_held_put_whose_wal_write_fails_is_not_counted_as_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::from_millis(100));
+    let c = register(&mut s);
+    let put = |group: Option<&str>, after_group: Option<&str>| Command::Put {
+        pri: 0,
+        delay: 0,
+        ttr: 60,
+        bytes: 1,
+        idempotency_key: None,
+        group: group.map(Into::into),
+        after_group: after_group.map(Into::into),
+        concurrency_key: None,
+    };
+    let resp = s.handle_command(c, put(Some("g"), None), Some(b"a".to_vec()));
+    assert_eq!(resp, Response::Inserted(1));
+
+    s.wal.as_mut().unwrap().inject_io_failure();
+    let resp = s.handle_command(c, put(None, Some("g")), Some(b"b".to_vec()));
+    assert_eq!(resp, Response::InternalError);
+    assert_eq!(s.tubes["default"].stat.held_ct, 0);
+}
+
 /// Strict mode: a batch whose fsync fails answers its puts INTERNAL_ERROR,
 /// and the worker woken by one of them INTERNAL_ERROR too. The job used to
 /// stay reserved by that worker, which never heard of it, and go to the next
@@ -3126,6 +3542,77 @@ fn schedule_fire_records_dedups_and_buried_streak() {
     assert_eq!(st.buried_streak, 2);
     assert_eq!(st.last_result.as_deref(), Some("INSERTED 1 BURIED"));
     assert_eq!(s.tubes["jobs"].stat.idp_dedups.buried, 2, "counted on the tube too");
+}
+
+/// The definitions file's inode: each rewrite renames a new file over it.
+fn schedules_inode(dir: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir.join("schedules")).unwrap().ino()
+}
+
+#[test]
+fn a_schedule_sync_that_changes_nothing_does_not_rewrite_the_file() {
+    // Every commit rewrote and fsynced the whole file on the engine task,
+    // stalling every client for as long as that took.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_state();
+    let c = register(&mut s);
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    s.schedule_files = Some(files);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let written = schedules_inode(dir.path());
+
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    assert_eq!(schedules_inode(dir.path()), written);
+}
+
+#[test]
+fn a_schedule_sync_that_only_respells_a_spec_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_state();
+    let c = register(&mut s);
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    s.schedule_files = Some(files);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+
+    sync_schedules(&mut s, c, &[("ping", "every 1m")]);
+    assert_eq!(fired(&s, "ping"), 0);
+    let (_, restored) = crate::schedule::store::ScheduleFiles::open(dir.path()).unwrap();
+    assert_eq!(
+        restored.get("app", "ping").unwrap().line.spec_text,
+        "every 1m"
+    );
+}
+
+#[test]
+fn a_schedule_sync_that_changes_nothing_saves_one_that_failed_to() {
+    // The failed commit's set stands in memory, so the retry finds nothing
+    // changed. It still has to reach the disk.
+    let dir = tempfile::tempdir().unwrap();
+    let defs = dir.path().join("defs");
+    let mut s = make_state();
+    let c = register(&mut s);
+    // Not there yet, so the first commit's write fails.
+    let (files, _) = crate::schedule::store::ScheduleFiles::open(&defs).unwrap();
+    s.schedule_files = Some(files);
+
+    s.handle_command(
+        c,
+        Command::ScheduleBegin {
+            owner: "app".into(),
+        },
+        None,
+    );
+    let line = "schedule-put ping jobs 0 0 60 2 every 60s";
+    let cmd = protocol::parse_line(line.as_bytes()).unwrap();
+    s.handle_command(c, cmd, Some(b"{}".to_vec()));
+    let resp = s.handle_command(c, Command::ScheduleCommit, None);
+    assert_eq!(resp, Response::InternalError);
+
+    std::fs::create_dir(&defs).unwrap();
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    let (_, restored) = crate::schedule::store::ScheduleFiles::open(&defs).unwrap();
+    assert!(restored.get("app", "ping").is_some());
 }
 
 #[test]

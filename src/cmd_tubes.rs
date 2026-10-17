@@ -32,10 +32,16 @@ pub async fn run(addr: &str) -> io::Result<()> {
                 let ready = get("current-jobs-ready");
                 let reserved = get("current-jobs-reserved");
                 let delayed = get("current-jobs-delayed");
+                // Not sent by beanstalkd or a tuber before 0.17.
+                let held = if stats.lines().any(|l| l.starts_with("current-jobs-held:")) {
+                    format!(" held={}", get("current-jobs-held"))
+                } else {
+                    String::new()
+                };
                 let buried = get("current-jobs-buried");
 
                 crate::outln!(
-                    "{tube}: ready={ready} reserved={reserved} delayed={delayed} buried={buried}"
+                    "{tube}: ready={ready} reserved={reserved} delayed={delayed}{held} buried={buried}"
                 )?;
             }
             Err(e) => {

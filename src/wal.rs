@@ -889,6 +889,21 @@ fn damaged_segment_error(path: &Path, damage: &str, older: bool) -> io::Error {
     ))
 }
 
+/// The error that stops a `--wal-skip-corrupt` replay at a damaged older
+/// segment it can't keep a copy of. Cutting the segment without one would
+/// destroy the records past the damage, which may still be recoverable.
+fn uncopied_segment_error(path: &Path, damage: &str, err: &io::Error) -> io::Error {
+    io::Error::other(format!(
+        "WAL segment {} {damage}. --wal-skip-corrupt replays the records before the \
+         damage and cuts the segment there, but couldn't keep a copy of it as {} first \
+         ({err}), and cutting it without one would destroy the records past the damage. \
+         Free some disk space, or fix whatever stopped the copy, and start again with \
+         --wal-skip-corrupt, or restore the WAL directory from a backup.",
+        path.display(),
+        corrupt_sidecar_path(path).display(),
+    ))
+}
+
 fn write_header(w: &mut impl Write) -> io::Result<()> {
     w.write_all(WAL_MAGIC)?;
     w.write_all(&WAL_VERSION.to_le_bytes())?;
@@ -1661,6 +1676,7 @@ impl Wal {
     /// that can't be read — means records that were once durable are lost,
     /// so replay returns an error before touching the disk, unless
     /// `skip_corrupt` lets it set the segment aside as `.corrupt` and go on.
+    /// A copy it can't write is an error still, with the segment left whole.
     pub fn replay(&mut self) -> io::Result<ReplayOutcome> {
         let mut jobs: HashMap<u64, Box<Job>> = HashMap::new();
         let mut max_id: u64 = 0;
@@ -1995,37 +2011,49 @@ impl Wal {
                         offset += consumed;
                     }
                     Err(e) => {
+                        let damage = format!(
+                            "has a corrupt record at offset {offset} of {} bytes ({e})",
+                            data.len()
+                        );
                         if older && !self.skip_corrupt {
-                            let damage = format!(
-                                "has a corrupt record at offset {offset} of {} bytes ({e})",
-                                data.len()
-                            );
                             return Err(damaged_segment_error(path, &damage, older));
                         }
-                        tracing::error!(
-                            "WAL: corrupt record in {:?} at offset {}: {}; preserving a .corrupt copy then truncating",
-                            path,
-                            offset,
-                            e
-                        );
                         // Preserve the whole segment before truncating so a
                         // mid-segment bit-rot — valid records (including deletes)
                         // after the bad one — is operator-recoverable rather than
                         // physically destroyed (which would resurrect deleted
-                        // jobs). The active file is still truncated to the last
-                        // good offset so the WAL can continue.
+                        // jobs). Then cut it at the last good offset, so a later
+                        // start doesn't need the flag again. An older segment
+                        // only once the copy is kept: without one it is the only
+                        // place those records are, so stop rather than cut. The
+                        // newest regardless: appends continue past a torn tail.
                         let dest = corrupt_sidecar_path(path);
-                        if let Err(ce) = fs::copy(path, &dest) {
-                            tracing::error!(
-                                "WAL: failed to preserve corrupt segment {:?}: {}",
+                        match crate::body_store::copy_durably(path, &dest) {
+                            Ok(()) => tracing::error!(
+                                "WAL: corrupt record in {:?} at offset {}: {}; copy kept as {:?}, \
+                                 truncating",
                                 path,
+                                offset,
+                                e,
+                                dest
+                            ),
+                            Err(ce) if older => {
+                                return Err(uncopied_segment_error(path, &damage, &ce));
+                            }
+                            Err(ce) => tracing::error!(
+                                "WAL: corrupt record in {:?} at offset {}: {}; failed to keep a \
+                                 copy ({}), truncating",
+                                path,
+                                offset,
+                                e,
                                 ce
-                            );
+                            ),
                         }
                         if let Ok(f) = OpenOptions::new().write(true).open(path)
-                            && let Err(te) = f.set_len(offset as u64) {
-                                tracing::warn!("WAL: failed to truncate {:?}: {}", path, te);
-                            }
+                            && let Err(te) = f.set_len(offset as u64).and_then(|()| f.sync_data())
+                        {
+                            tracing::warn!("WAL: failed to truncate {:?}: {}", path, te);
+                        }
                         break;
                     }
                 }
@@ -3285,6 +3313,62 @@ mod tests {
         assert_eq!(fs::read(corrupt_sidecar_path(&seg3)).unwrap(), data);
         let kept = HEADER_SIZE + ID_MARK_RECORD_SIZE;
         assert_eq!(fs::metadata(&seg3).unwrap().len(), kept as u64);
+    }
+
+    #[test]
+    fn test_replay_skip_corrupt_refuses_an_older_segment_it_cannot_copy() {
+        // Cutting it without a copy would destroy the records past the
+        // damage, which may still be recoverable. A directory at the copy's
+        // path stands in for a full disk.
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg3 = segment(dir.path(), 3);
+        let mut data = fs::read(&seg3).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 0xFF;
+        fs::write(&seg3, &data).unwrap();
+        let copy = corrupt_sidecar_path(&seg3);
+        fs::create_dir(&copy).unwrap();
+        let config = WalConfig {
+            skip_corrupt: true,
+            ..WalConfig::default()
+        };
+
+        let mut wal = Wal::open(dir.path(), config.clone()).unwrap();
+        let msg = replay_refusal(&mut wal);
+        assert!(msg.contains("binlog.000003"), "{msg}");
+        assert!(msg.contains("couldn't keep a copy"), "{msg}");
+        assert!(fs::read(&seg3).unwrap() == data, "left whole");
+        drop(wal);
+
+        // Once the copy can be written, the same switch gets past it.
+        fs::remove_dir(&copy).unwrap();
+        let mut wal = Wal::open(dir.path(), config).unwrap();
+        wal.replay().unwrap();
+        assert!(fs::read(&copy).unwrap() == data, "the copy is whole");
+        let kept = HEADER_SIZE + ID_MARK_RECORD_SIZE;
+        assert_eq!(fs::metadata(&seg3).unwrap().len(), kept as u64);
+    }
+
+    #[test]
+    fn test_replay_cuts_a_torn_newest_segment_without_a_copy() {
+        // Appends continue past a torn tail, so it is cut whether or not
+        // its copy is kept.
+        let dir = tempfile::tempdir().unwrap();
+        write_one_record_per_segment(dir.path());
+        let seg4 = segment(dir.path(), 4);
+        let whole = fs::metadata(&seg4).unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&seg4)
+            .unwrap()
+            .write_all(&[0xDE, 0xAD, 0xBE])
+            .unwrap();
+        fs::create_dir(corrupt_sidecar_path(&seg4)).unwrap();
+
+        let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
+        wal.replay().unwrap();
+        assert_eq!(fs::metadata(&seg4).unwrap().len(), whole);
     }
 
     #[test]

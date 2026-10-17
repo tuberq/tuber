@@ -359,8 +359,10 @@ pub fn parse_command(line: &str) -> Result<Command, Response> {
         Ok(Command::ListTubes)
     } else if line == "quit" {
         Ok(Command::Quit)
-    } else if line.starts_with("pause-tube") {
-        parse_pause_tube(line.strip_prefix("pause-tube").unwrap())
+    } else if let Some(rest) = line.strip_prefix("pause-tube")
+        && matches!(rest.as_bytes().first(), None | Some(b' '))
+    {
+        parse_pause_tube(rest)
     } else if let Some(rest) = line.strip_prefix("flush-tube ") {
         parse_flush_tube(rest)
     } else if let Some(rest) = line.strip_prefix("flush-buried ") {
@@ -1093,6 +1095,15 @@ mod tests {
                 tube: "foo".into(),
                 delay: 60
             }
+        );
+    }
+
+    #[test]
+    fn test_parse_pause_tube_needs_its_space() {
+        // It matched by prefix, so this paused tube "foo".
+        assert_eq!(
+            parse_command("pause-tubefoo 60"),
+            Err(Response::UnknownCommand)
         );
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -312,6 +312,9 @@ enum EnginePayload {
 
 /// Waiting reservation request, stored when no job is immediately available.
 struct WaitingReserve {
+    /// Arrival order: `waiters` is sorted by it, and each watched tube's
+    /// `waiters` set holds it.
+    seq: u64,
     conn_id: u64,
     reply_tx: oneshot::Sender<Response>,
     deadline: Option<Instant>,
@@ -379,9 +382,19 @@ impl GroupState {
         self.is_complete() && self.waiting_jobs.is_empty()
     }
 
-    fn remove_waiting_job(&mut self, id: u64) {
+    /// Take `id` off the waiting list; whether it was on it.
+    fn remove_waiting_job(&mut self, id: u64) -> bool {
+        let before = self.waiting_jobs.len();
         self.waiting_jobs.retain(|&jid| jid != id);
+        self.waiting_jobs.len() < before
     }
+}
+
+// How many times a tube was searched for a ready job, so tests can tell
+// work proportional to the tubes involved from work proportional to all.
+#[cfg(test)]
+thread_local! {
+    static TUBES_LOOKED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// All server state, owned by the engine task.
@@ -415,8 +428,11 @@ struct ServerState {
     started_at: Instant,
     rng_state: u64,
     stats: GlobalStats,
-    /// Connections waiting for a job via reserve.
+    /// Connections waiting for a job via reserve, in arrival order.
     waiters: Vec<WaitingReserve>,
+    next_waiter_seq: u64,
+    /// Tubes some parked reserve watches: those whose `waiters` isn't empty.
+    waited_tubes: HashSet<String>,
     /// Optional write-ahead log for persistence.
     wal: Option<Wal>,
     /// Set when a WAL write or fsync failed and the WAL was dropped. Puts
@@ -562,6 +578,8 @@ impl ServerState {
             rng_state: rng_seed,
             stats: GlobalStats::default(),
             waiters: Vec::new(),
+            next_waiter_seq: 0,
+            waited_tubes: HashSet::new(),
             wal: None,
             body_store: None,
             instance_id,
@@ -1101,6 +1119,8 @@ impl ServerState {
 
     /// Find the best unblocked ready job from a tube. See `ReadyQueue`.
     fn find_best_unblocked_ready(&self, tube: &Tube) -> Option<((u32, u64), u64)> {
+        #[cfg(test)]
+        TUBES_LOOKED_AT.with(|n| n.set(n.get() + 1));
         tube.ready
             .best_unblocked(|id| self.is_concurrency_blocked(id))
     }
@@ -1397,7 +1417,15 @@ impl ServerState {
             {
                 let old_pri = existing_job.priority;
                 let state = existing_job.state;
-                let delay = existing_job.delay;
+                // The record is stamped now, and replay counts its delay from
+                // the stamp, so journal what is left of a delay, as
+                // compaction does.
+                let delay = match existing_job.deadline_at {
+                    Some(deadline) if state == JobState::Delayed => {
+                        deadline.saturating_duration_since(Instant::now())
+                    }
+                    _ => existing_job.delay,
+                };
                 existing_job.priority = pri;
 
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
@@ -1583,6 +1611,9 @@ impl ServerState {
                 && let Some(gs) = self.groups.get_mut(ag)
             {
                 gs.waiting_jobs.push(id);
+                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+                    tube.stat.held_ct += 1;
+                }
             }
         } else {
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
@@ -1614,9 +1645,7 @@ impl ServerState {
             return Response::InternalError;
         }
 
-        if !self.waiters.is_empty() {
-            self.process_queue();
-        }
+        self.serve_waiters_on(&tube_name);
 
         Response::Inserted(id)
     }
@@ -2064,8 +2093,10 @@ impl ServerState {
         }
         if let Some(ref ag) = after_group_name
             && let Some(gs) = self.groups.get_mut(ag)
+            && gs.remove_waiting_job(id)
+            && let Some(tube) = self.tubes.get_mut(&*tube_name)
         {
-            gs.remove_waiting_job(id);
+            tube.stat.held_ct = tube.stat.held_ct.saturating_sub(1);
         }
 
         // WAL: write delete state change. A cooldown has its own record.
@@ -2190,6 +2221,7 @@ impl ServerState {
         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(reserved_removed);
         tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(buried_removed);
         tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(urgent_removed);
+        tube.stat.held_ct = 0;
 
         // Update global stats
         self.stats.total_delete_ct += count as u64;
@@ -3042,6 +3074,7 @@ impl ServerState {
              current-jobs-ready: {}\n\
              current-jobs-reserved: {}\n\
              current-jobs-delayed: {}\n\
+             current-jobs-held: {}\n\
              current-jobs-buried: {}\n\
              total-jobs: {}\n\
              current-using: {}\n\
@@ -3085,6 +3118,7 @@ impl ServerState {
             tube.ready.len(),
             tube.stat.reserved_ct,
             tube.delay.len(),
+            tube.stat.held_ct,
             tube.stat.buried_ct,
             tube.stat.total_jobs_ct,
             tube.using_ct,
@@ -3166,6 +3200,7 @@ impl ServerState {
 
     fn cmd_stats(&self) -> Response {
         let delayed_ct: usize = self.tubes.values().map(|t| t.delay.len()).sum();
+        let held_ct: u64 = self.tubes.values().map(|t| t.stat.held_ct).sum();
         let uptime = Instant::now().duration_since(self.started_at).as_secs();
 
         // rusage stats
@@ -3246,6 +3281,7 @@ impl ServerState {
              current-jobs-ready: {}\n\
              current-jobs-reserved: {}\n\
              current-jobs-delayed: {}\n\
+             current-jobs-held: {}\n\
              current-jobs-buried: {}\n\
              cmd-put: {}\n\
              cmd-peek: {}\n\
@@ -3335,6 +3371,7 @@ impl ServerState {
             self.ready_ct,
             self.stats.reserved_ct,
             delayed_ct,
+            held_ct,
             self.stats.buried_ct,
             self.stats.op_ct[OP_PUT],
             self.stats.op_ct[OP_PEEKJOB],
@@ -3640,6 +3677,7 @@ impl ServerState {
                     && let Some(job) = self.jobs.get(job_id)
                 {
                     tube.ready.insert(job);
+                    tube.stat.held_ct = tube.stat.held_ct.saturating_sub(1);
                 }
                 self.ready_ct += 1;
                 if key.0 < URGENT_THRESHOLD {
@@ -3690,57 +3728,101 @@ impl ServerState {
             self.deliver_waiter_failure(waiter, now);
         }
 
-        // Second pass: fulfill waiters. Recomputing the per-tube unblocked
-        // top once per outer pass keeps the per-waiter check O(watches)
-        // instead of the previous O(N) heap scan per waiter.
-        loop {
-            let mut tube_top: HashMap<String, ((u32, u64), u64)> = HashMap::new();
-            for (name, tube) in &self.tubes {
-                if tube.is_paused() {
-                    continue;
-                }
-                if let Some(top) = self.find_best_unblocked_ready(tube) {
-                    tube_top.insert(name.clone(), top);
-                }
-            }
-            if tube_top.is_empty() {
-                break;
-            }
-
-            let fulfilled_idx = self.waiters.iter().position(|waiter| {
-                self.conns
-                    .get(&waiter.conn_id)
-                    .is_some_and(|conn| conn.watched.iter().any(|w| tube_top.contains_key(&w.name)))
-            });
-
-            let Some(i) = fulfilled_idx else { break };
-            let conn_id = self.waiters[i].conn_id;
-            // If find_job_for_waiting_conn disagrees with the cache (e.g., a
-            // weighted RNG hits a zero-weight tube), break to avoid spinning.
-            let Some(job_id) = self.find_job_for_waiting_conn(conn_id) else {
-                break;
+        // Second pass: fulfill waiters, the longest-waiting first, as long
+        // as one can be served. Only tubes a reserve is parked on are
+        // searched, and each tube once per waiter served, not every tube on
+        // the server.
+        while let Some((tube_name, seq)) = self.oldest_servable_waiter() {
+            let Ok(i) = self.waiters.binary_search_by_key(&seq, |w| w.seq) else {
+                // Not parked any more. Can't happen while a connection's
+                // watches stay put during its wait, but don't spin on it.
+                Self::unlist_waiter(&mut self.tubes, &mut self.waited_tubes, &tube_name, seq);
+                continue;
             };
-            let waiter = self.remove_waiter_at(i);
-            match waiter.batch_count {
-                // Batch waiter: drain up to `count` ready jobs now. A job was
-                // just confirmed available, so the batch is normally non-empty;
-                // the only way back to empty is a body-store read failure, which
-                // surfaces as INTERNAL_ERROR (mirroring the single-waiter path).
-                Some(count) => {
-                    let (jobs, err) = self.collect_batch(conn_id, count);
-                    let resp = if jobs.is_empty() {
-                        err.unwrap_or(Response::ReservedBatch(Vec::new()))
-                    } else {
-                        Response::ReservedBatch(jobs)
-                    };
-                    self.reply_to_waiter(waiter.reply_tx, resp);
-                }
-                None => {
-                    let resp = self.do_reserve(conn_id, job_id);
-                    self.reply_to_waiter(waiter.reply_tx, resp);
-                }
+            if !self.serve_waiter(i) {
+                break;
             }
         }
+    }
+
+    /// Of the tubes some reserve is parked on, those with a job one could
+    /// take now; the earliest-parked reserve watching any of them, and the
+    /// tube that named it. That reserve came before every other one able to
+    /// take a job, so it is served next.
+    fn oldest_servable_waiter(&self) -> Option<(String, u64)> {
+        let mut oldest: Option<(&String, u64)> = None;
+        for name in &self.waited_tubes {
+            let Some(tube) = self.tubes.get(name) else {
+                continue;
+            };
+            let Some(&seq) = tube.waiters.first() else {
+                continue;
+            };
+            if oldest.is_some_and(|(_, o)| o < seq)
+                || tube.is_paused()
+                || self.find_best_unblocked_ready(tube).is_none()
+            {
+                continue;
+            }
+            oldest = Some((name, seq));
+        }
+        oldest.map(|(name, seq)| (name.clone(), seq))
+    }
+
+    /// A put made a job ready in `tube_name`, so only a reserve watching it
+    /// can take that job: serve the earliest-parked of those, while the tube
+    /// has a job to give. Everything else was served or couldn't be before
+    /// the put, so the rest of the server needn't be searched.
+    fn serve_waiters_on(&mut self, tube_name: &str) {
+        loop {
+            let Some(tube) = self.tubes.get(tube_name) else {
+                return;
+            };
+            let Some(&seq) = tube.waiters.first() else {
+                return;
+            };
+            if tube.is_paused() || self.find_best_unblocked_ready(tube).is_none() {
+                return;
+            }
+            let Ok(i) = self.waiters.binary_search_by_key(&seq, |w| w.seq) else {
+                Self::unlist_waiter(&mut self.tubes, &mut self.waited_tubes, tube_name, seq);
+                continue;
+            };
+            if !self.serve_waiter(i) {
+                return;
+            }
+        }
+    }
+
+    /// Hand the parked reserve at `i` its job, or its batch. False when its
+    /// reserve mode finds nothing for it after all (a weighted pick can land
+    /// on a tube with no job), leaving it parked.
+    fn serve_waiter(&mut self, i: usize) -> bool {
+        let conn_id = self.waiters[i].conn_id;
+        let Some(job_id) = self.find_job_for_waiting_conn(conn_id) else {
+            return false;
+        };
+        let waiter = self.remove_waiter_at(i);
+        match waiter.batch_count {
+            // Batch waiter: drain up to `count` ready jobs now. A job was
+            // just confirmed available, so the batch is normally non-empty;
+            // the only way back to empty is a body-store read failure, which
+            // surfaces as INTERNAL_ERROR (mirroring the single-waiter path).
+            Some(count) => {
+                let (jobs, err) = self.collect_batch(conn_id, count);
+                let resp = if jobs.is_empty() {
+                    err.unwrap_or(Response::ReservedBatch(Vec::new()))
+                } else {
+                    Response::ReservedBatch(jobs)
+                };
+                self.reply_to_waiter(waiter.reply_tx, resp);
+            }
+            None => {
+                let resp = self.do_reserve(conn_id, job_id);
+                self.reply_to_waiter(waiter.reply_tx, resp);
+            }
+        }
+        true
     }
 
     /// Same as find_ready_job_for_conn but uses inner state directly.
@@ -3788,14 +3870,19 @@ impl ServerState {
         batch_count: Option<u32>,
     ) {
         self.stats.waiting_ct += 1;
+        let seq = self.next_waiter_seq;
+        self.next_waiter_seq += 1;
         if let Some(conn) = self.conns.get(&conn_id) {
             for w in &conn.watched {
                 if let Some(tube) = self.tubes.get_mut(&w.name) {
                     tube.stat.waiting_ct += 1;
+                    tube.waiters.insert(seq);
+                    self.waited_tubes.insert(w.name.clone());
                 }
             }
         }
         self.waiters.push(WaitingReserve {
+            seq,
             conn_id,
             reply_tx,
             deadline,
@@ -3855,12 +3942,34 @@ impl ServerState {
         self.stats.waiting_ct = self.stats.waiting_ct.saturating_sub(1);
         if let Some(conn) = self.conns.get(&waiter.conn_id) {
             for w in &conn.watched {
+                Self::unlist_waiter(&mut self.tubes, &mut self.waited_tubes, &w.name, waiter.seq);
                 if let Some(tube) = self.tubes.get_mut(&w.name) {
                     tube.stat.waiting_ct = tube.stat.waiting_ct.saturating_sub(1);
                 }
             }
         }
         waiter
+    }
+
+    /// Take parked reserve `seq` off `tube_name`'s list. A field-level
+    /// helper, so callers iterating a connection's watches can use it.
+    fn unlist_waiter(
+        tubes: &mut HashMap<String, Tube>,
+        waited_tubes: &mut HashSet<String>,
+        tube_name: &str,
+        seq: u64,
+    ) {
+        match tubes.get_mut(tube_name) {
+            Some(tube) => {
+                tube.waiters.remove(&seq);
+                if tube.waiters.is_empty() {
+                    waited_tubes.remove(tube_name);
+                }
+            }
+            None => {
+                waited_tubes.remove(tube_name);
+            }
+        }
     }
 
     /// The client hung up, or half-closed, while parked. End the wait the way
@@ -4027,8 +4136,10 @@ impl ServerState {
         }
         if let Some(ref ag) = after_group_name
             && let Some(gs) = self.groups.get_mut(ag)
+            && gs.remove_waiting_job(id)
+            && let Some(tube) = self.tubes.get_mut(&*tube_name)
         {
-            gs.remove_waiting_job(id);
+            tube.stat.held_ct = tube.stat.held_ct.saturating_sub(1);
         }
 
         self.delete_job(id);

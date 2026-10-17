@@ -86,10 +86,9 @@ impl ServerState {
         // and the client hears INTERNAL_ERROR, as a put whose WAL write
         // fails does. Only a later commit rewrites the definitions (a fire
         // writes just the stamps), so a restart before then restores the
-        // previous set.
-        if let Some(files) = self.schedule_files.as_mut()
-            && let Err(e) = files.write_all(&self.schedules)
-        {
+        // previous set. A commit that changes nothing writes nothing,
+        // unless one before it failed to.
+        if let Err(e) = self.save_schedules() {
             tracing::error!(owner, "schedule sync not persisted: {e}");
             return Response::InternalError;
         }
@@ -102,6 +101,19 @@ impl ServerState {
             "schedule sync committed",
         );
         Response::Synced(counts)
+    }
+
+    /// Rewrite the definitions file if anything it holds has changed since
+    /// it was last written. It is the whole set, fsynced, on the engine
+    /// task, so a resync that changes nothing mustn't pay for it.
+    fn save_schedules(&mut self) -> std::io::Result<()> {
+        if let Some(files) = self.schedule_files.as_mut()
+            && self.schedules.unsaved()
+        {
+            files.write_all(&self.schedules)?;
+            self.schedules.mark_saved();
+        }
+        Ok(())
     }
 
     pub(super) fn cmd_schedule_abort(&mut self, conn_id: u64) -> Response {
@@ -279,11 +291,11 @@ impl ServerState {
         }
         // Persist corrected sync times, so a restart doesn't find them in
         // the future again. Corrected last fires go out with the stamps.
-        if corrected
-            && let Some(files) = self.schedule_files.as_mut()
-            && let Err(e) = files.write_all(&self.schedules)
-        {
-            tracing::error!("schedule clock correction not persisted: {e}");
+        if corrected {
+            self.schedules.mark_unsaved();
+            if let Err(e) = self.save_schedules() {
+                tracing::error!("schedule clock correction not persisted: {e}");
+            }
         }
         if due.is_empty() {
             return;

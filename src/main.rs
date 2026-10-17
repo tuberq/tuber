@@ -234,7 +234,7 @@ enum Commands {
         delay: u32,
 
         /// Time-to-run in seconds
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 120)]
         ttr: u32,
 
         /// Idempotency key (prevents duplicate jobs)

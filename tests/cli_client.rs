@@ -414,6 +414,27 @@ fn stats_and_tubes_read_tuber_url() {
     );
 }
 
+#[test]
+fn tubes_counts_jobs_held_for_their_group() {
+    let server = Server::start(&[]);
+    let addr = server.addr();
+    for flags in [["--grp", "g"], ["--aft", "g"]] {
+        let mut args = vec!["put", "-a", &addr, "-t", "pipe"];
+        args.extend(flags);
+        args.push("x");
+        let put = run(&args, &[], None);
+        assert!(put.status.success(), "put: {}", stderr(&put));
+    }
+
+    let tubes = run(&["tubes", "-a", &addr], &[], None);
+    assert!(tubes.status.success(), "tubes: {}", stderr(&tubes));
+    assert!(
+        stdout(&tubes).contains("pipe: ready=1 reserved=0 delayed=0 held=1 buried=0"),
+        "{}",
+        stdout(&tubes)
+    );
+}
+
 // --- output into a closed pipe (`tuber … | head`) ----------------------------
 
 #[test]

@@ -17,6 +17,8 @@ pub struct TubeStats {
     pub urgent_ct: u64,
     pub waiting_ct: u64,
     pub buried_ct: u64,
+    /// `aft:` jobs their group holds: on its waiting list, in no queue.
+    pub held_ct: u64,
     pub reserved_ct: u64,
     pub pause_ct: u64,
     pub total_delete_ct: u64,
@@ -371,6 +373,9 @@ pub struct Tube {
     pub watching_ct: u32,
     pub pause: Duration,
     pub unpause_at: Option<Instant>,
+    /// The parked reserves watching this tube, by arrival (`seq`), so the
+    /// first is the one a job here should go to.
+    pub waiters: BTreeSet<u64>,
 }
 
 impl Tube {
@@ -387,6 +392,7 @@ impl Tube {
             watching_ct: 0,
             pause: Duration::ZERO,
             unpause_at: None,
+            waiters: BTreeSet::new(),
         }
     }
 

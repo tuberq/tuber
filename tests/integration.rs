@@ -2260,6 +2260,63 @@ async fn test_group_after_held_until_complete() {
     c.ckresp("z\r\n").await;
 }
 
+/// An `aft:` job its group holds is in no queue: not the tube's delay heap,
+/// so not `current-jobs-delayed`. It was in no count at all.
+#[tokio::test]
+async fn test_held_aft_jobs_are_counted() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+    c.mustsend("use htube\r\n").await;
+    c.ckresp("USING htube\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:g\r\n").await;
+    c.mustsend("a\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 0 60 1 aft:g\r\n").await;
+    c.mustsend("z\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
+
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("current-jobs-held: 1\n"), "{body}");
+    assert!(body.contains("current-jobs-delayed: 0\n"), "{body}");
+    c.mustsend("stats-tube htube\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("current-jobs-held: 1\n"), "{body}");
+    assert!(body.contains("current-jobs-delayed: 0\n"), "{body}");
+
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mport = ml.local_addr().unwrap().port();
+    let baddr = format!("127.0.0.1:{}", srv.port);
+    tokio::spawn(async move {
+        tuber::metrics::serve_with_listener(ml, baddr).await.ok();
+    });
+    let mut s = TcpStream::connect(("127.0.0.1", mport)).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    let resp = String::from_utf8(resp).unwrap();
+    assert!(resp.contains("\ntuber_jobs_held 1\n"), "{resp}");
+    assert!(
+        resp.contains("\ntuber_tube_held_jobs{tube=\"htube\"} 1\n"),
+        "{resp}"
+    );
+
+    // The group completes and releases it.
+    c.mustsend("watch htube\r\n").await;
+    c.ckresp("WATCHING 2\r\n").await;
+    c.mustsend("reserve-with-timeout 0\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("a\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("stats-tube htube\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("current-jobs-held: 0\n"), "{body}");
+    assert!(body.contains("current-jobs-ready: 1\n"), "{body}");
+}
+
 /// Buried job blocks group completion.
 #[tokio::test]
 async fn test_group_buried_blocks_completion() {

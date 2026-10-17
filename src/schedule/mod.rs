@@ -202,6 +202,9 @@ pub struct Schedules {
     owners: BTreeMap<String, BTreeMap<String, Entry>>,
     /// Sum of `memory_cost` over every entry.
     bytes: u64,
+    /// Something the definitions file holds has changed since it was last
+    /// written, so the next commit rewrites it even if it changes nothing.
+    unsaved: bool,
 }
 
 impl Schedules {
@@ -215,6 +218,20 @@ impl Schedules {
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Whether the definitions file is behind: a commit or a clock
+    /// correction changed what it holds, and it hasn't been written since.
+    pub fn unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    pub fn mark_unsaved(&mut self) {
+        self.unsaved = true;
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.unsaved = false;
     }
 
     pub fn get(&self, owner: &str, name: &str) -> Option<&Entry> {
@@ -286,7 +303,10 @@ impl Schedules {
                     counts.unchanged += 1;
                     // A respelling of the same schedule: show the new text,
                     // change nothing that fires.
-                    e.line.spec_text = line.spec_text;
+                    if e.line.spec_text != line.spec_text {
+                        e.line.spec_text = line.spec_text;
+                        self.unsaved = true;
+                    }
                     e
                 }
                 Some(mut e) => {
@@ -303,6 +323,9 @@ impl Schedules {
             new.insert(name, entry);
         }
         counts.removed = old.len() as u32;
+        if counts.added + counts.changed + counts.removed > 0 {
+            self.unsaved = true;
+        }
         if !new.is_empty() {
             self.owners.insert(owner, new);
         }

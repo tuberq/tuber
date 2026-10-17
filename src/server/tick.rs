@@ -39,6 +39,9 @@ impl ServerState {
                             && let Some(gs) = self.groups.get_mut(&ag)
                         {
                             gs.waiting_jobs.push(job_id);
+                            if let Some(tube) = self.tubes.get_mut(tube_name) {
+                                tube.stat.held_ct += 1;
+                            }
                         }
                     } else if let Some(job) = self.jobs.get_mut(&job_id) {
                         let released_by_group = job.after_group().is_some() && job.reserve_ct == 0;
