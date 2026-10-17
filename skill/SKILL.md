@@ -66,8 +66,8 @@ tuber-cli list-tubes
 
 # One line per tube with its counts -- the quickest overview
 tuber tubes
-#   default: ready=4 reserved=0 delayed=0 buried=0
-#   emails: ready=16 reserved=2 delayed=0 buried=1
+#   default: ready=4 reserved=0 delayed=0 held=0 buried=0
+#   emails: ready=16 reserved=2 delayed=0 held=0 buried=1
 
 # Tube statistics
 tuber-cli stats-tube default
@@ -109,7 +109,7 @@ cat jobs.txt | tuber put -t batch
 ```
 
 `tuber put` takes `-t` tube, `-p`/`--pri`, `-d`/`--delay`, `--ttr` (default
-**60**, not 120), the tag flags below, and `-a`. It prints the raw protocol
+120), the tag flags below, and `-a`. It prints the raw protocol
 reply per job (`INSERTED 7`, or `INSERTED 4 READY` for a dedup). A rejected
 put prints its error reply (`JOB_TOO_BIG`, `DRAINING`, `OUT_OF_MEMORY`, …) in
 that line's place; the rest of stdin is still put, and the run then exits 1

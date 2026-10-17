@@ -11,7 +11,7 @@ Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, dela
 
 Job queues today fall into two camps, and both make compromises.
 
-**RAM-based queues** — Redis-backed Sidekiq (Ruby), BullMQ (Node), RQ (Python), Faktory, and Beanstalkd (which Tuber rewrites) — are fast, but every job lives in memory. Your queue depth is capped by host RAM, and a backlog of jobs with large payloads can push you into swap or OOM. (Celery is broker-agnostic but is most commonly deployed against Redis or RabbitMQ.) Redis adds a second problem: it's a general-purpose data store, not a queue, so priorities, delays, reservations, and timeouts are bolted on with complexity growing at every edge case.
+**RAM-based queues** — Redis-backed Sidekiq (Ruby), BullMQ (Node), RQ (Python), Faktory, and Beanstalkd (which Tuber rewrites) — are fast, but every job lives in memory. Your queue depth is capped by host RAM, and a backlog of jobs with large payloads can push you into swap or OOM. (Celery is broker-agnostic but is most commonly deployed against Redis or RabbitMQ. BullMQ can also run on PostgreSQL since v6, which puts it in the second camp.) Redis adds a second problem: it's a general-purpose data store, not a queue, so priorities, delays, reservations, and timeouts are bolted on with complexity growing at every edge case.
 
 **Disk-based queues** — Solid Queue and GoodJob (Ruby), pg-boss (Node), Procrastinate (Python), River (Go) — solve the capacity problem by piggybacking on your relational database, but the queue workload is a bad fit for MVCC storage engines. High-churn job tables generate dead tuples faster than autovacuum can reclaim them, indexes bloat, and dequeue queries (`FOR UPDATE SKIP LOCKED`) get slower as the backlog grows. You also inherit the operational weight of the database — connection pooling, tuning, vacuuming, backups — and either share capacity with your application or run a second instance.
 
@@ -37,6 +37,10 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | Oldest only ⁹ | In DB ⁸ | — | — |
 | **Persistence** | WAL, ~100ms fsync | Optional binlog (`-b`), 50 ms fsync | Redis RDB/AOF | Redis RDB/AOF, or PostgreSQL | PostgreSQL | DB ⁶ | Durable queues |
 | **Infrastructure** | None (single binary) | None (single binary) | Redis 7+, Valkey or Dragonfly | Redis, Valkey or Dragonfly; PostgreSQL since v6 | PostgreSQL | DB ⁶ | Erlang runtime |
+| **High availability** | — (single node) | — (single node) | Via Redis Sentinel | Via Redis or PostgreSQL | Via PostgreSQL | Via the DB | Quorum queues (Raft) |
+| **Automatic retries** | Fixed delay, in the gem ¹⁴ | Client-side (Backburner) | Yes (25 over ~20 days) | Yes (opt-in `attempts`) | Via ActiveJob `retry_on` | Via ActiveJob `retry_on` | Delivery limit; delayed retry since 4.3 ¹⁵ |
+| **Web dashboard** | — (tuber-tui is a terminal UI) | Third-party | Yes (built in) | Taskforce.sh (paid) | Yes (built in) | Mission Control — Jobs | Management plugin |
+| **Framework integration** | — | Rails `:backburner` ¹⁶ | ActiveJob (in the gem) | NestJS (`@nestjs/bullmq`) | ActiveJob | ActiveJob (Rails 8 default) | Spring AMQP, Celery; Rails `:sneakers` ¹⁶ |
 
 <sub>¹ Sidekiq OSS has queue weights and basic job processing. Batches require [Pro](https://sidekiq.org/products/pro.html); a batch's success callback can start the next stage, so multi-stage workflows are built from nested batches. Unique jobs, concurrency controls and periodic jobs require [Enterprise](https://sidekiq.org/products/enterprise.html) (the third-party sidekiq-cron gem covers periodic jobs).</sub>
 <sub>² Solid Queue has no unique jobs. Since v1.2, `limits_concurrency` with `on_conflict: :discard` drops a job while another with the same key is queued or running, but not once it has finished.</sub>
@@ -51,6 +55,9 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 <sub>¹¹ Redis `maxmemory` with an eviction policy can drop data silently. With `noeviction`, writes fail but workers have no built-in handling — they stall on Redis errors.</sub>
 <sub>¹² RabbitMQ's memory and disk alarms block every connection that publishes, across the cluster. A worker that publishes and acks on the same connection is blocked too and can't ack, so producers and consumers need separate connections. Tuber only refuses `put`, so a worker can always finish its jobs on the connection it has.</sub>
 <sub>¹³ RabbitMQ's delayed-message plugin was deprecated and archived in 2026. The open-source route is a message TTL with a dead-letter exchange; native delays for quorum queues are due in RabbitMQ 4.4, not yet released.</sub>
+<sub>¹⁴ Tuber's server doesn't retry: a job whose worker dies goes back to ready when its TTR runs out, as in beanstalkd. The `tuber` gem's `process!` loop releases a job that raised one of its `retry_on` errors, up to `max_retries` times (default 3), after a fixed `release_delay` (default 1 s). There is no backoff.</sub>
+<sub>¹⁵ Quorum queues requeue a rejected message up to a delivery limit (20 by default since RabbitMQ 4.0). 4.3 added opt-in delayed retry, with a linear backoff.</sub>
+<sub>¹⁶ Rails 8.1 still ships the `:backburner` and `:sneakers` adapters; both are deprecated on Rails main. Backburner 1.7 and Kicks (Sneakers' successor) ship their own.</sub>
 
 ## Features
 
@@ -318,7 +325,7 @@ SYNCED 2 0 0 0
 - **The schedule follows the app's releases.** An edited entry is updated in place, and one missing from the set is removed. A bad entry (`BAD_SCHEDULE` for an unknown zone, say) aborts the whole sync and leaves the old schedule running.
 - **A fire is a put.** It goes through the same path as a client's `put`, so `idp:` skips a fire while the last one's job is still live, and `con:` serialises them.
 - **DST is handled.** An entry at a fixed time fires once a day: on spring-forward day a time the clock skips runs late by the skip, and on fall-back day a repeated time runs on its first pass. `*/15`-style entries follow the clock.
-- **Downtime costs at most one run.** A run of ticks missed while tuber was down fires once on restart, not as a burst; `catchup:<seconds>` bounds how stale that can be, and `catchup:0` skips it. A crash just as an entry fires loses that tick rather than firing it twice.
+- **Downtime costs at most one run.** A run of ticks missed while tuber was down fires once on restart, not as a burst; `catchup:<seconds>` bounds how stale that can be, and `catchup:0` skips it. A crash just as an entry fires loses that tick rather than firing it twice. A tick whose put was refused (`OUT_OF_MEMORY`, say) counts as missed too, so a restart before the next tick can fire it late.
 - **It's visible.** `stats-schedule <owner> <name>` shows the next three fires in the entry's own zone and the last fire's reply. `buried-streak` and `tuber_schedule_fires_total{result="deduped_buried"}` catch an entry whose `idp:` key has been matching a buried job — the put "succeeds" and queues nothing.
 
 With `-b`, schedules persist beside the WAL. To move an app's cron jobs into tuber, start with [docs/scheduling.md](docs/scheduling.md); the commands are in [docs/protocol.md](docs/protocol.md#schedule-commands), and the design and its reasoning in [docs/scheduler.md](docs/scheduler.md).
@@ -485,7 +492,7 @@ tuber server [OPTIONS]
 | `-b`, `--binlog-dir` | `TUBER_BINLOG_DIR` | — | WAL + body-store directory (enables persistence) |
 | `-s`, `--max-storage-bytes` | `TUBER_MAX_STORAGE_BYTES` | — | Combined cap on WAL + body-store disk usage. **Mandatory** when `-b` is set. PUT returns `OUT_OF_STORAGE` when the projected footprint would exceed this; state changes (reserve/release/bury/kick/delete) always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `100g`). |
 | `-i`, `--sync-interval` | `TUBER_SYNC_INTERVAL` | `100ms` | How often the WAL and body store fsync to disk. Lower = less data loss on crash, more I/O. Accepts `ms`, `s`, `m`, `h`. |
-| `--wal-skip-corrupt` | `TUBER_WAL_SKIP_CORRUPT` | off | Start even when an older WAL or TOAST segment is damaged or a WAL segment can't be read, using what remains and keeping the segment as `<segment>.corrupt`. The damage is cut away, so a later start doesn't need this again. Without this the server refuses to start, since replaying past a lost delete brings its job back. See [WAL format: corruption handling](docs/wal-format.md#corruption-handling). |
+| `--wal-skip-corrupt` | `TUBER_WAL_SKIP_CORRUPT` | off | Start even when an older WAL or TOAST segment is damaged or a WAL segment can't be read, using what remains and keeping the segment as `<segment>.corrupt`. Once that copy is written the damage is cut away, so a later start doesn't need this again; if it can't be written (a full disk, say), the server still refuses, leaving the segment whole. Without this the server refuses to start, since replaying past a lost delete brings its job back. See [WAL format: corruption handling](docs/wal-format.md#corruption-handling). |
 | `--migrate-wal` | `TUBER_MIGRATE_WAL` | off | Opt in to upgrading a WAL written by an older tuber on startup. Without it the server refuses to start on one, since older versions can't read the files this one writes. Needed once: later starts find a current segment and don't ask again. |
 | `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `1m` | Max size of a single job body. **Bodies pass through RAM in full on both `put` and `reserve`** — see [Sizing `--max-job-size`](#sizing---max-job-size) before raising it. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
 | `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | `1g` | Max total in-memory footprint of jobs. With persistence enabled, bodies live on disk and don't count — this caps job *metadata* (~512 B/job) plus idempotency tombstones, so 1 GiB is roughly 2M resident jobs. Without persistence, bodies are in RAM and counted. PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Pass `0` for unlimited. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
@@ -587,7 +594,7 @@ tuber put [OPTIONS] [BODY]
 | `-t`, `--tube` | `default` | Tube name |
 | `-p`, `--pri` | `0` | Priority (0 is most urgent) |
 | `-d`, `--delay` | `0` | Delay in seconds before job becomes ready |
-| `--ttr` | `60` | Time-to-run in seconds |
+| `--ttr` | `120` | Time-to-run in seconds |
 | `-i`, `--idp` | — | Idempotency key — `key` or `key:ttl` (TTL seconds keeps deduping after delete) |
 | `-g`, `--grp` | — | Group name (for job grouping) |
 | `--aft` | — | After-group dependency (wait for this group to complete) |
@@ -659,8 +666,8 @@ tuber tubes [OPTIONS]
 
 ```bash
 $ tuber tubes
-default: ready=4 reserved=0 delayed=0 buried=0
-my-tube: ready=16 reserved=0 delayed=0 buried=0
+default: ready=4 reserved=0 delayed=0 held=0 buried=0
+my-tube: ready=16 reserved=0 delayed=0 held=0 buried=0
 ```
 
 ### Schedules

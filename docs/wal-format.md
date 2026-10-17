@@ -393,7 +393,12 @@ directory from a backup, or start with `--wal-skip-corrupt` (env
 `TUBER_WAL_SKIP_CORRUPT`) to replay what remains. A segment with a bad
 header or a read error is then renamed to `<segment>.corrupt`, and one
 with a corrupt record is copied there and truncated at the bad offset, so
-a later start doesn't need the flag again.
+a later start doesn't need the flag again. If the copy can't be written
+(a full disk, say), the server refuses to start, saying why, and leaves
+the segment whole, since it is then the only place the records past the
+damage are; once the copy can be written, the same flag gets past it. A
+torn tail in the newest segment is truncated either way, since appends
+continue past it.
 
 ## Durability
 
@@ -617,13 +622,15 @@ synchronisation point.
 - **Damage** — the same findings before the recovery point in the
   newest segment, anywhere in an older segment, or a segment with a bad
   file header, mean bodies that were durable are gone, and the server
-  refuses to start, leaving the files alone. With `--wal-skip-corrupt`
+  refuses to start, leaving the files alone. So does a newest segment
+  that ends before the recovery point; with `--wal-skip-corrupt` it
+  starts without the bodies that were past its end. With `--wal-skip-corrupt`
   it starts with the bodies before the damage and keeps a copy of the
   segment as `<segment>.corrupt` (or moves it there when its file header
   is bad). The segment is then truncated at the damage, so a later
-  start doesn't need the flag again: the newest regardless, since appends
-  continue there, and an older one only once the copy is kept, since the
-  bodies past the damage may still be recoverable from it. Jobs whose
+  start doesn't need the flag again. If the copy can't be written, the
+  server refuses to start and leaves the segment whole, since the bodies
+  past the damage may still be recoverable from it. Jobs whose
   bodies are lost are reaped as missing-body jobs (below).
 - **Version 1 segments** — read without the header check. A version 1
   newest segment is not appended to; the first write starts a version 2

@@ -15,6 +15,7 @@ Returns server-wide statistics in YAML format.
 | `current-jobs-ready` | Jobs waiting to be reserved |
 | `current-jobs-reserved` | Jobs currently reserved by workers |
 | `current-jobs-delayed` | Jobs waiting for their delay to expire |
+| `current-jobs-held` | `aft:` jobs waiting for their group to complete. `stats-job` shows them as `delayed`, but they are in no delay queue, so `peek-delayed` and `kick` don't reach them; `stats-group` says what they wait on |
 | `current-jobs-buried` | Buried jobs |
 | `total-jobs` | Cumulative jobs created since server start |
 
@@ -90,6 +91,7 @@ Returns per-tube statistics in YAML format.
 | `current-jobs-ready` | Ready jobs |
 | `current-jobs-reserved` | Reserved jobs |
 | `current-jobs-delayed` | Delayed jobs |
+| `current-jobs-held` | `aft:` jobs waiting for their group |
 | `current-jobs-buried` | Buried jobs |
 | `total-jobs` | Cumulative jobs created in this tube |
 | `current-using` | Connections using this tube for `put` |
@@ -262,6 +264,7 @@ Prometheus-format metrics.
 | `tuber_jobs_ready` | Current ready jobs |
 | `tuber_jobs_reserved` | Current reserved jobs |
 | `tuber_jobs_delayed` | Current delayed jobs |
+| `tuber_jobs_held` | Current `aft:` jobs waiting for their group |
 | `tuber_jobs_buried` | Current buried jobs |
 | `tuber_connections_current` | Current connections |
 | `tuber_producers_current` | Current producers |
@@ -287,6 +290,7 @@ Each has a `tube` label:
 |---|---|
 | `tuber_tube_ready_jobs{tube="..."}` | Ready jobs |
 | `tuber_tube_delayed_jobs{tube="..."}` | Delayed jobs |
+| `tuber_tube_held_jobs{tube="..."}` | `aft:` jobs waiting for their group |
 | `tuber_tube_buried_jobs{tube="..."}` | Buried jobs |
 | `tuber_tube_reserved_jobs{tube="..."}` | Reserved jobs |
 | `tuber_tube_waiting{tube="..."}` | Waiting connections |

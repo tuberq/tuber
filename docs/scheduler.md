@@ -449,7 +449,9 @@ A fire refused by the put itself (`OUT_OF_MEMORY`, `OUT_OF_STORAGE`,
 tries again. One that queued nothing has the entry's last fire put back (in
 memory and in `schedules.fired`): the staleness alert on
 `tuber_schedule_last_fire_timestamp_seconds` still sees the gap, and after a
-restart the tick counts as missed. That is all of them except the
+restart the tick counts as missed. So it is treated like downtime: a daily
+09:00 entry refused at 09:00 and restarted at 18:00 fires then, 9 hours
+late, unless `catchup:` says that's too stale. That is all of them except the
 `INTERNAL_ERROR` of the put that failed the WAL, which keeps its stamp: its
 record may still have reached disk, and a restart can bring the job back.
 An `INTERNAL_ERROR` from a failed TOAST write, or from a put refused because

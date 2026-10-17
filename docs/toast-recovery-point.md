@@ -44,14 +44,19 @@ is opened. Then:
 - Damage in the newest TOAST segment **before** the mark is corruption. It
   is handled like damage in an older segment: refuse to start, or with
   `--wal-skip-corrupt` keep a `.corrupt` copy, cut the segment at the
-  damage and carry on with the bodies before it.
+  damage and carry on with the bodies before it. If the copy can't be
+  written, it still refuses, leaving the segment whole: the bodies between
+  the damage and the mark were fsynced too, and may still be recoverable.
 - Damage **after** the mark is a torn tail and is truncated quietly, as
   before.
 - A newest segment shorter than the mark lost bodies the WAL vouched for,
-  but what is left isn't damaged. Startup carries on, and replay reaps
-  each job whose body is missing, logged as lost data and counted in
-  `recovered-missing-bodies`, as for a body lost any other way. Refusing
-  instead is left open.
+  though what is left isn't damaged. A crash can't explain that, so it
+  is handled like damage: refuse to start, or with `--wal-skip-corrupt`
+  carry on without them. Replay then reaps each job whose body is
+  missing, logged as lost data and counted in `recovered-missing-bodies`.
+  Carrying on by default was considered, since nothing is left to cut
+  away, but the operator should know fsynced bodies are gone before the
+  jobs that held them are dropped.
 - A newest segment older than the mark's segment: the mark's segment is
   gone. Usually the compactor deleted it, since an old-format newest
   segment takes no new bodies and is emptied once its own are dead;
