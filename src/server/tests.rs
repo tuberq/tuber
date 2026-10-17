@@ -49,7 +49,7 @@ fn test_put_and_reserve() {
     let c = register(&mut s);
 
     let resp = s.handle_command(c, put_cmd(0, 0, 10, 5), Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp { Response::Inserted(id) => assert_eq!(id, 1), other => panic!("put failed: {other:?}") }
 
     let resp = s.handle_command(c, Command::Reserve, None);
     match resp {
@@ -1329,7 +1329,10 @@ fn test_idempotency_ttl_cooldown() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd, Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Reserve and delete
     let resp = s.handle_command(c, Command::Reserve, None);
@@ -1369,7 +1372,10 @@ fn test_idempotency_no_ttl_no_cooldown() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd, Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Reserve and delete
     let resp = s.handle_command(c, Command::Reserve, None);
@@ -1389,7 +1395,7 @@ fn test_idempotency_no_ttl_no_cooldown() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-    assert!(matches!(resp, Response::Inserted(2)));
+    match resp { Response::Inserted(id) => assert_eq!(id, 2), other => panic!("put failed: {other:?}") }
 }
 
 #[test]
@@ -1409,7 +1415,10 @@ fn test_idempotency_ttl_flush_clears_cooldowns() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd, Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Delete to start cooldown, then flush
     let resp = s.handle_command(c, Command::Reserve, None);
@@ -1439,7 +1448,10 @@ fn test_idempotency_ttl_flush_clears_cooldowns() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
-    assert!(matches!(resp, Response::Inserted(2)));
+    match resp {
+        Response::Inserted(id) => assert_eq!(id, 2),
+        other => panic!("put failed: {other:?}"),
+    }
 }
 
 /// Put a job with `idp:<key>:<ttl>` on `tube`, then reserve and delete it,
@@ -1573,6 +1585,7 @@ fn cooldowns_restored_from_the_wal_still_end_on_time() {
         wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
+        wal_observer: None,
     })
     .unwrap();
     assert_eq!(cooldown_keys(&s, "default"), ["k0", "k1"]);
@@ -1742,7 +1755,10 @@ fn test_idempotency_dedup_returns_ready_state() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd.clone(), Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Duplicate put returns InsertedDup with READY state
     let resp = s.handle_command(c, cmd, Some(b"world".to_vec()));
@@ -1875,7 +1891,10 @@ fn test_idempotency_priority_upgrade_ready() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd1, Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Put another job at pri 75 (no IDP) to compare ordering
     let cmd2 = Command::Put {
@@ -1889,7 +1908,10 @@ fn test_idempotency_priority_upgrade_ready() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd2, Some(b"other".to_vec()));
-    assert!(matches!(resp, Response::Inserted(2)));
+    match resp {
+        Response::Inserted(id) => assert_eq!(id, 2),
+        other => panic!("put failed: {other:?}"),
+    }
 
     // Duplicate put at pri 50 — should upgrade
     let cmd3 = Command::Put {
@@ -1931,7 +1953,10 @@ fn test_idempotency_priority_upgrade_no_downgrade() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd1, Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Duplicate put at pri 100 — should NOT downgrade
     let cmd2 = Command::Put {
@@ -2047,7 +2072,10 @@ fn test_idempotency_priority_upgrade_delayed() {
         concurrency_key: None,
     };
     let resp = s.handle_command(c, cmd1, Some(b"hello".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Duplicate put at pri 40 — should upgrade delayed job
     let cmd2 = Command::Put {
@@ -2209,7 +2237,10 @@ fn test_chained_aft_pipeline() {
         },
         Some(b"ext-1".to_vec()),
     );
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     let resp = s.handle_command(
         c,
@@ -2225,7 +2256,10 @@ fn test_chained_aft_pipeline() {
         },
         Some(b"ext-2".to_vec()),
     );
-    assert!(matches!(resp, Response::Inserted(2)));
+    match resp {
+        Response::Inserted(id) => assert_eq!(id, 2),
+        other => panic!("put failed: {other:?}"),
+    }
 
     // Step 2: Put 1 transform job with aft:extract grp:transform
     // It should be held because the extract group is not yet complete.
@@ -2873,7 +2907,10 @@ fn test_reserve_job_respects_after_group() {
         },
         Some(b"pre1".to_vec()),
     );
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
 
     // Put a dependent job with aft:g1
     let resp = s.handle_command(
@@ -2890,7 +2927,10 @@ fn test_reserve_job_respects_after_group() {
         },
         Some(b"dep1".to_vec()),
     );
-    assert!(matches!(resp, Response::Inserted(2)));
+    match resp {
+        Response::Inserted(id) => assert_eq!(id, 2),
+        other => panic!("put failed: {other:?}"),
+    }
 
     // reserve-job 2 should fail — g1 is not complete
     let r = s.handle_command(c, Command::ReserveJob { id: 2 }, None);
@@ -3022,7 +3062,10 @@ fn test_reserve_batch_surfaces_body_store_error() {
     let c = register(&mut s);
 
     let resp = s.handle_command(c, put_cmd(0, 0, 10, 4), Some(b"poof".to_vec()));
-    assert!(matches!(resp, Response::Inserted(1)));
+    match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
     poison_body(&mut s, 1);
 
     let resp = s.handle_command(
@@ -3947,6 +3990,7 @@ fn reopen(dir: &std::path::Path) -> ServerState {
         wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
+        wal_observer: None,
     })
     .unwrap()
 }
@@ -4393,4 +4437,79 @@ fn a_sync_under_a_clock_far_ahead_does_not_silence_the_entry() {
 
     s.fire_due_schedules(t);
     assert_eq!(next_fire(&s, "ping"), t + mins(1));
+}
+
+// --- WalObserver wiring (ServerConfig → build_state → Wal) ---
+
+/// Minimal observer for wiring tests: records the job id of every teed
+/// record that names a job, behind a shared handle.
+struct JobIdObserver {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl crate::wal::WalObserver for JobIdObserver {
+    fn on_record(&mut self, _pos: crate::wal::Position, event: crate::wal::WalEvent<'_>) {
+        let id = match event {
+            crate::wal::WalEvent::Put { job } => job.id,
+            crate::wal::WalEvent::StateChange { job_id, .. }
+            | crate::wal::WalEvent::Tombstone { job_id, .. } => job_id,
+            crate::wal::WalEvent::IdMark { .. }
+            | crate::wal::WalEvent::ToastMark(_)
+            | crate::wal::WalEvent::ScheduleSet { .. }
+            | crate::wal::WalEvent::ScheduleFired { .. } => return,
+        };
+        self.seen.lock().unwrap().push(id);
+    }
+}
+
+#[test]
+fn test_wal_observer_attaches_after_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = |observer: Option<Box<dyn crate::wal::WalObserver>>| StateConfig {
+        max_job_size: 65535,
+        max_job_bytes: None,
+        max_storage_bytes: Some(1024 * 1024 * 1024),
+        wal_dir: Some(dir.path()),
+        sync_interval: Duration::ZERO,
+        migrate_wal: false,
+        wal_skip_corrupt: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0))),
+        wal_observer: observer,
+    };
+
+    // Seed the WAL with one job, observer-free, and make it durable.
+    {
+        let mut s = build_state(cfg(None)).unwrap();
+        let c = register(&mut s);
+        let resp = s.handle_command(c, put_cmd(0, 0, 10, 3), Some(b"old".to_vec()));
+        match resp {
+            Response::Inserted(id) => assert_eq!(id, 1),
+            other => panic!("put failed: {other:?}"),
+        }
+        s.wal.as_mut().unwrap().flush_and_sync();
+    }
+
+    // Reopen with an observer: replayed history must not tee — the tee
+    // covers only what happens after the attach point; everything before
+    // it is the WalReader's territory.
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+    let mut s = build_state(cfg(Some(Box::new(JobIdObserver { seen: seen.clone() })))).unwrap();
+    assert_eq!(s.jobs.len(), 1, "seeded job must survive replay");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "observer must not see replayed history"
+    );
+
+    let c = register(&mut s);
+    let resp = s.handle_command(c, put_cmd(0, 0, 10, 3), Some(b"new".to_vec()));
+    match resp {
+        Response::Inserted(id) => assert_eq!(id, 2),
+        other => panic!("put failed: {other:?}"),
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![2],
+        "post-attach writes must reach the observer"
+    );
 }

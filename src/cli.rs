@@ -470,6 +470,7 @@ fn server_config(args: ServerArgs, server: &ArgMatches) -> ServerConfig {
         // 0 means disabled, matching the other 0-is-no-limit knobs.
         conn_idle_timeout: (conn_idle_timeout != 0).then(|| Duration::from_secs(conn_idle_timeout)),
         tcp_keepalive: (tcp_keepalive != 0).then(|| Duration::from_secs(tcp_keepalive)),
+        wal_observer: None,
     }
 }
 

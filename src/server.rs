@@ -14,7 +14,7 @@ use crate::conn::{ConnState, ReserveMode, WatchedTube};
 use crate::job::{BodyId, BodyRef, Job, JobExt, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, MAX_DELETE_BATCH, Response};
 use crate::tube::{Cooldown, Tube, TubeStats};
-use crate::wal::{IdpTombstone, StateChangeReason, Wal};
+use crate::wal::{IdpTombstone, StateChangeReason, Wal, WalObserver};
 
 /// EWMA smoothing factor for all timing stats (processing time, queue time).
 const EWMA_ALPHA: f64 = 0.1;
@@ -4252,6 +4252,7 @@ struct StateConfig<'a> {
     wal_skip_corrupt: bool,
     name: Option<String>,
     fd_budget: Arc<FdBudget>,
+    wal_observer: Option<Box<dyn WalObserver>>,
 }
 
 /// Build ServerState, replaying the WAL if `wal_dir` is set.
@@ -4275,6 +4276,7 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         wal_skip_corrupt,
         name,
         fd_budget,
+        wal_observer,
     } = cfg;
     let mut state = ServerState::new(
         max_job_size,
@@ -4519,6 +4521,13 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // Hand the body store to the WAL so every WAL fsync is preceded
         // by a TOAST fsync — the durability invariant for v5 records.
         wal.set_body_store(Arc::clone(&body_store));
+        // Attach the observer only now, after replay and the reap pass
+        // above, so the tee begins at a well-defined point: everything
+        // below `wal.end_position()` is history (reachable by `WalReader`
+        // scan), everything teed is new.
+        if let Some(obs) = wal_observer {
+            wal.set_observer(obs);
+        }
         state.wal = Some(wal);
         state.body_store = Some(body_store);
         state.persist_legacy_cooldowns();
@@ -4561,6 +4570,9 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
 /// an owned value so an embedding binary can start the server
 /// programmatically: build one with [`Default::default`], override what you
 /// need, and hand it to [`run`].
+///
+/// The one field with no flag is `wal_observer`: a hook, not a knob. Only
+/// an embedder can build an observer, so a command line has nothing to say.
 pub struct ServerConfig {
     /// Listen address (default `0.0.0.0`).
     pub addr: String,
@@ -4593,6 +4605,10 @@ pub struct ServerConfig {
     pub conn_idle_timeout: Option<Duration>,
     /// TCP keepalive idle time on accepted sockets; `None` = off.
     pub tcp_keepalive: Option<Duration>,
+    /// Tap on the WAL write path, attached after replay and before the
+    /// first serving write; see [`WalObserver`]. Ignored (dropped) when
+    /// `wal_dir` is `None` — with no WAL there are no records to observe.
+    pub wal_observer: Option<Box<dyn WalObserver>>,
 }
 
 impl Default for ServerConfig {
@@ -4613,6 +4629,7 @@ impl Default for ServerConfig {
             max_connections: None,
             conn_idle_timeout: None,
             tcp_keepalive: Some(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS)),
+            wal_observer: None,
         }
     }
 }
@@ -4641,6 +4658,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         max_connections,
         conn_idle_timeout,
         tcp_keepalive,
+        wal_observer,
     } = config;
     let fd_budget = Arc::new(
         FdBudget::new(max_connections)
@@ -4657,6 +4675,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         wal_skip_corrupt,
         name: name.clone(),
         fd_budget: Arc::clone(&fd_budget),
+        wal_observer,
     })?;
 
     let listener = TcpListener::bind((addr.as_str(), port)).await?;
@@ -4777,6 +4796,7 @@ pub async fn run_with_listener_limited(
         wal_skip_corrupt: false,
         name,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
+        wal_observer: None,
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4801,6 +4821,7 @@ pub async fn run_with_listener_sync_zero(
         wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0))),
+        wal_observer: None,
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4823,6 +4844,7 @@ pub async fn run_with_listener_max_connections(
         wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(max_connections))),
+        wal_observer: None,
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4845,6 +4867,7 @@ pub async fn run_with_listener_idle_timeout(
         wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_idle_timeout(Some(idle_timeout))),
+        wal_observer: None,
     })?;
     serve(listener, state, max_job_size).await
 }
@@ -4866,6 +4889,7 @@ pub async fn run_with_listener_tcp_keepalive(
         wal_skip_corrupt: false,
         name: None,
         fd_budget: Arc::new(FdBudget::new(Some(0)).with_tcp_keepalive(idle)),
+        wal_observer: None,
     })?;
     serve(listener, state, max_job_size).await
 }
