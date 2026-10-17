@@ -254,7 +254,9 @@ none yet. Counters live in memory and restart from 0 with the server;
 ## Prometheus Metrics
 
 When `--metrics-port` is set, an HTTP endpoint at `/metrics` serves
-Prometheus-format metrics.
+Prometheus-format metrics. It listens on the `-l` address unless
+`--metrics-listen` gives it another, e.g. `127.0.0.1` to keep it local while
+the queue port is public.
 
 ### Gauges (instantaneous values)
 

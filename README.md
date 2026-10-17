@@ -26,31 +26,31 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Unique / idempotent jobs** | Yes | — | Enterprise ¹ | Yes | Via concurrency limits | — ² | — ³ |
 | **Concurrency control** | Yes (per-key) | — | Enterprise ¹ | Per-queue; per-key in Pro | Yes | Yes | — |
 | **Fan-in batches** | Yes | — | Pro ¹ | Yes (flows) | Yes ⁴ | Yes (v1.7+) | — |
-| **Multi-stage DAG pipelines** | Yes | — | Via batch callbacks (Pro) ¹ | Trees only (flows) ⁴ | Via batch callbacks ⁴ | — | — |
+| **Multi-stage DAG pipelines** | Yes | — | Via batch callbacks (Pro) ¹ | Trees only (flows) ⁴ | Via batch callbacks ⁴ | Via batch callbacks (v1.7+) ⁴ | — |
 | **Weighted queues** | Yes | — | Yes | — | — | — | — |
 | **Per-job priority** | Yes (numeric) | Yes (numeric) | Queue-level ⁵ | Yes | Yes | Yes | Yes |
 | **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Yes | TTL + dead-letter ¹³ |
 | **Recurring (cron) jobs** | Yes (in the server) | — | Enterprise ¹ | Yes | Yes | Yes | — |
-| **Batch reserve / delete** | Yes | — | — | — | — | — | Prefetch |
-| **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory and disk alarms ¹² |
-| **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | Metrics events | In DB ⁸ | — | — |
-| **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | Oldest only ⁹ | In DB ⁸ | — | — |
+| **Batch reserve / delete** | Yes | — | — | Pro (batches) | — | — | Prefetch |
+| **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹; DB limits on PostgreSQL | DB limits | DB limits | Memory and disk alarms ¹² |
+| **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | Via OpenTelemetry ¹⁷ | Avg/min/max on the dashboard ⁸ | — | — |
+| **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | — | On the dashboard (v4.21+) ⁸ | Oldest only (v1.1+) ⁹ | — |
 | **Persistence** | WAL, ~100ms fsync | Optional binlog (`-b`), 50 ms fsync | Redis RDB/AOF | Redis RDB/AOF, or PostgreSQL | PostgreSQL | DB ⁶ | Durable queues |
 | **Infrastructure** | None (single binary) | None (single binary) | Redis 7+, Valkey or Dragonfly | Redis, Valkey or Dragonfly; PostgreSQL since v6 | PostgreSQL | DB ⁶ | Erlang runtime |
 | **High availability** | — (single node) | — (single node) | Via Redis Sentinel | Via Redis or PostgreSQL | Via PostgreSQL | Via the DB | Quorum queues (Raft) |
 | **Automatic retries** | Fixed delay, in the gem ¹⁴ | Client-side (Backburner) | Yes (25 over ~20 days) | Yes (opt-in `attempts`) | Via ActiveJob `retry_on` | Via ActiveJob `retry_on` | Delivery limit; delayed retry since 4.3 ¹⁵ |
-| **Web dashboard** | — (tuber-tui is a terminal UI) | Third-party | Yes (built in) | Taskforce.sh (paid) | Yes (built in) | Mission Control — Jobs | Management plugin |
+| **Web dashboard** | — (tuber-tui is a terminal UI) | Third-party | Yes (built in) | Third-party: bull-board (free), or Taskforce.sh (paid) | Yes (built in) | Mission Control — Jobs | Management plugin |
 | **Framework integration** | — | Rails `:backburner` ¹⁶ | ActiveJob (in the gem) | NestJS (`@nestjs/bullmq`) | ActiveJob | ActiveJob (Rails 8 default) | Spring AMQP, Celery; Rails `:sneakers` ¹⁶ |
 
 <sub>¹ Sidekiq OSS has queue weights and basic job processing. Batches require [Pro](https://sidekiq.org/products/pro.html); a batch's success callback can start the next stage, so multi-stage workflows are built from nested batches. Unique jobs, concurrency controls and periodic jobs require [Enterprise](https://sidekiq.org/products/enterprise.html) (the third-party sidekiq-cron gem covers periodic jobs).</sub>
 <sub>² Solid Queue has no unique jobs. Since v1.2, `limits_concurrency` with `on_conflict: :discard` drops a job while another with the same key is queued or running, but not once it has finished.</sub>
 <sub>³ RabbitMQ has a community deduplication plugin, but no built-in uniqueness.</sub>
-<sub>⁴ GoodJob batches fire a callback when all their jobs finish; a multi-stage pipeline re-opens the batch from that callback to enqueue the next stage. BullMQ flows are trees: a parent waits for all its children, but a job has at most one parent, so two stages can't share a dependency.</sub>
+<sub>⁴ GoodJob batches fire a callback when all their jobs finish; a multi-stage pipeline re-opens the batch from that callback to enqueue the next stage. Solid Queue's batches (v1.7+) work the same way: a callback is a job, which can enqueue the next stage's batch. BullMQ flows are trees: a parent waits for all its children, but a job has at most one parent, so two stages can't share a dependency.</sub>
 <sub>⁵ Sidekiq uses queue-level ordering (strict or weighted), not per-job numeric priority.</sub>
 <sub>⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.</sub>
 <sub>⁷ Sidekiq 7+ tracks execution time per job class in exponential histogram buckets. No percentiles without external APM.</sub>
-<sub>⁸ GoodJob stores timestamps in PostgreSQL — you can query for percentiles with SQL, but nothing is computed or displayed by default.</sub>
-<sub>⁹ `Queue#latency` and BullMQ's queue age return the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.</sub>
+<sub>⁸ GoodJob's Performance dashboard shows average, minimum and maximum execution time, and since v4.21 queue latency too. For percentiles, query its PostgreSQL tables with SQL.</sub>
+<sub>⁹ Sidekiq's and Solid Queue's `Queue#latency` return the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.</sub>
 <sub>¹⁰ Tuber's `--max-jobs-size` rejects new `put` commands with `OUT_OF_MEMORY` when the budget is full, but workers can always reserve, release, bury, kick, and delete — the queue keeps draining even at capacity.</sub>
 <sub>¹¹ Redis `maxmemory` with an eviction policy can drop data silently. With `noeviction`, writes fail but workers have no built-in handling — they stall on Redis errors.</sub>
 <sub>¹² RabbitMQ's memory and disk alarms block every connection that publishes, across the cluster. A worker that publishes and acks on the same connection is blocked too and can't ack, so producers and consumers need separate connections. Tuber only refuses `put`, so a worker can always finish its jobs on the connection it has.</sub>
@@ -58,6 +58,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 <sub>¹⁴ Tuber's server doesn't retry: a job whose worker dies goes back to ready when its TTR runs out, as in beanstalkd. The `tuber` gem's `process!` loop releases a job that raised one of its `retry_on` errors, up to `max_retries` times (default 3), after a fixed `release_delay` (default 1 s). There is no backoff.</sub>
 <sub>¹⁵ Quorum queues requeue a rejected message up to a delivery limit (20 by default since RabbitMQ 4.0). 4.3 added opt-in delayed retry, with a linear backoff.</sub>
 <sub>¹⁶ Rails 8.1 still ships the `:backburner` and `:sneakers` adapters; both are deprecated on Rails main. Backburner 1.7 and Kicks (Sneakers' successor) ship their own.</sub>
+<sub>¹⁷ BullMQ's own metrics are per-minute counts of completed and failed jobs. Since v5.69 its OpenTelemetry integration (`bullmq-otel`) also emits a job-duration histogram, which goes to your OpenTelemetry backend rather than anywhere BullMQ can query.</sub>
 
 ## Features
 
@@ -501,6 +502,7 @@ tuber server [OPTIONS]
 | `--conn-idle-timeout` | `TUBER_CONN_IDLE_TIMEOUT` | `0` (off) | Close connections idle this many seconds, so a client that opens connections and leaves them open can't hold slots against the ceiling. A worker parked in `reserve` or still running jobs it reserved is never closed, however long it stays silent. Pick a period longer than your slowest legitimate client gap. See [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md). |
 | `--tcp-keepalive` | `TUBER_TCP_KEEPALIVE` | `60` | Seconds of silence before TCP keepalive probes start on a client connection; `0` turns it off. A peer that vanished without closing (host crash, partition, a NAT or load balancer dropping the flow) is noticed within about twice this, and its reserved jobs go straight back to ready. Probes are answered by the client's kernel, so a worker busy on a long job is never mistaken for a dead one. Max 32767. See [Connection & file-descriptor lifecycle](docs/connection-lifecycle.md#tcp-keepalive). |
 | `--metrics-port` | `TUBER_METRICS_PORT` | — | Prometheus metrics endpoint port |
+| `--metrics-listen` | `TUBER_METRICS_LISTEN` | the `-l` address | Address the metrics endpoint listens on. Set it to keep metrics private while the queue port is public, e.g. `-l 0.0.0.0 --metrics-listen 127.0.0.1`. |
 | `--name` | `TUBER_NAME` | — | Instance name (shown in stats and metrics) |
 
 ```bash
@@ -558,7 +560,7 @@ storage and queue the key.
 
 #### Prometheus metrics
 
-Pass `--metrics-port <port>` to expose a `/metrics` endpoint in Prometheus text format. Scrape it with Prometheus, or just `curl` it:
+Pass `--metrics-port <port>` to expose a `/metrics` endpoint in Prometheus text format. It listens on the same address as the queue port, so with the default `-l 0.0.0.0` it's on every interface too; `--metrics-listen 127.0.0.1` keeps it local. Scrape it with Prometheus, or just `curl` it:
 
 ```bash
 curl localhost:9100/metrics

@@ -38,7 +38,7 @@ The codebase mirrors the original C beanstalkd structure:
 - **`src/cmd_schedules.rs`** - CLI `schedules` command: lists recurring schedule entries with next fire and last result.
 - **`src/schedule/`** - Recurring schedules (design: `docs/scheduler.md`). `spec.rs` parses cron/`@macro`/`every` specs and computes next fires with the DST rules (jiff for zones); `mod.rs` holds entries keyed by (owner, name) and the sync diff; `store.rs` persists them. **`src/server/schedules.rs`** has the sync/inspection commands and `fire_due_schedules`, called from the tick with the wall clock. A fire goes through `ServerState::put_job`, the same path as a client `put`.
 - **`src/body_store.rs`** - External body store ("TOAST"). Append-only segment files (`body.NNNNNN`) under `<binlog_dir>/toast/` hold raw job payloads addressed by `BodyId`. Used when persistence is enabled so the WAL only references bodies by id rather than carrying their bytes. Background tokio task compacts sealed segments whose live ratio drops below `COMPACTION_LIVE_RATIO_THRESHOLD` (0.5).
-- **`src/metrics.rs`** - Prometheus metrics HTTP server (optional, enabled with `--metrics-port`). Exposes WAL, TOAST, jobs, and per-tube gauges/counters.
+- **`src/metrics.rs`** - Prometheus metrics HTTP server (optional, enabled with `--metrics-port`; listens on the `-l` address unless `--metrics-listen` is set). Exposes WAL, TOAST, jobs, and per-tube gauges/counters.
 - **`src/telemetry.rs`** - Installs the tracing subscriber (level from `-V`) and a global panic hook that reports panics via `tracing::error!` before chaining to the default hook. Without it, a panic in a per-connection tokio task unwinds that task alone and leaves only an unstructured stderr line.
 
 ## Persistence model (when `-b` is set)
