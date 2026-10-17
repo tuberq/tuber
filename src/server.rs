@@ -355,6 +355,17 @@ struct GlobalStats {
     reclaimed_stranded_bodies: u64,
 }
 
+/// What [`ServerState::detach_job`] took out of the queues, for the rest
+/// of a delete or an `unput`.
+struct Detached {
+    state: JobState,
+    tube_name: Arc<str>,
+    reserved_at: Option<Instant>,
+    idempotency_key: Option<(String, u32)>,
+    group: Option<String>,
+    has_concurrency_key: bool,
+}
+
 /// State for a job group (grp:/aft: feature).
 #[derive(Debug)]
 struct GroupState {
@@ -442,7 +453,7 @@ struct ServerState {
     waiters: Vec<WaitingReserve>,
     next_waiter_seq: u64,
     /// Tubes some parked reserve watches: those whose `waiters` isn't empty.
-    waited_tubes: HashSet<String>,
+    waited_tubes: HashSet<Arc<str>>,
     /// Optional write-ahead log for persistence.
     wal: Option<Wal>,
     /// Set when a WAL write or fsync failed and the WAL was dropped. Puts
@@ -627,11 +638,7 @@ impl ServerState {
             unreachable!("as_inline_bytes returned None ⇒ External");
         };
         let bs = self.body_store.as_ref()?;
-        let read = match crc {
-            Some(crc) => bs.read_body_expecting(*id, *crc),
-            None => bs.read_body(*id),
-        };
-        match read {
+        match bs.read_body_checked(*id, *crc) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
                 tracing::error!(
@@ -771,11 +778,12 @@ impl ServerState {
             return;
         };
         if add {
-            *limits
-                .entry(key.clone())
-                .or_default()
-                .entry(*limit)
-                .or_insert(0) += 1;
+            // Look the key up before cloning it: it's usually there already.
+            if let Some(declared) = limits.get_mut(key) {
+                *declared.entry(*limit).or_insert(0) += 1;
+            } else {
+                limits.insert(key.clone(), BTreeMap::from([(*limit, 1)]));
+            }
         } else if let Some(declared) = limits.get_mut(key) {
             if let Some(n) = declared.get_mut(limit) {
                 *n -= 1;
@@ -1003,7 +1011,7 @@ impl ServerState {
 
     fn unregister_conn(&mut self, conn_id: u64) {
         // Remove from waiting lists first: remove_waiter_at reads conn.watched
-        // to decrement per-tube waiting_ct, so the conn must still be in
+        // to unlist the reserve from each tube, so the conn must still be in
         // self.conns when it runs.
         self.remove_waiter(conn_id);
         // A sync in progress is abandoned with the connection.
@@ -1103,7 +1111,11 @@ impl ServerState {
     /// Increment the concurrency counter for a job's key.
     fn acquire_concurrency_key(&mut self, job_id: u64) {
         if let Some((key, _limit)) = self.jobs.get(&job_id).and_then(|j| j.concurrency_key()) {
-            *self.concurrency_keys.entry(key.clone()).or_insert(0) += 1;
+            if let Some(n) = self.concurrency_keys.get_mut(key) {
+                *n += 1;
+            } else {
+                self.concurrency_keys.insert(key.clone(), 1);
+            }
         }
     }
 
@@ -1624,14 +1636,8 @@ impl ServerState {
             job.deadline_at = None;
             let after_group_name = job.after_group().cloned();
             self.insert_job(id, job);
-            // Add to group's waiting list (will be promoted when group completes)
-            if let Some(ref ag) = after_group_name
-                && let Some(gs) = self.groups.get_mut(ag)
-            {
-                gs.waiting_jobs.push(id);
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.stat.held_ct += 1;
-                }
+            if let Some(ag) = &after_group_name {
+                self.hold_for_group(ag, id, &tube_name);
             }
         } else {
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
@@ -1663,7 +1669,7 @@ impl ServerState {
             return Response::InternalError;
         }
 
-        self.serve_waiters_on(&tube_name);
+        self.serve_waiters(Some(&tube_name));
 
         Response::Inserted(id)
     }
@@ -1998,66 +2004,23 @@ impl ServerState {
     }
 
     fn cmd_delete(&mut self, conn_id: u64, id: u64) -> Response {
-        let job = match self.jobs.get(&id) {
-            Some(j) => j,
+        match self.jobs.get(&id) {
             None => return Response::NotFound,
+            // Must be reserved by this connection
+            Some(job) if job.state == JobState::Reserved && job.reserver_id != Some(conn_id) => {
+                return Response::NotFound;
+            }
+            Some(_) => {}
+        }
+        let Some(d) = self.detach_job(id) else {
+            return Response::NotFound;
         };
 
-        let state = job.state;
-        let tube_name = job.tube_name.clone();
-        let pri = job.priority;
-        let reserved_at = job.reserved_at;
-        let idempotency_key = job.idempotency_key().cloned();
-        let group_name = job.group().cloned();
-        let after_group_name = job.after_group().cloned();
-        let has_concurrency_key = job.concurrency_key().is_some();
-
-        match state {
-            JobState::Reserved => {
-                // Must be reserved by this connection
-                if job.reserver_id != Some(conn_id) {
-                    return Response::NotFound;
-                }
-                if has_concurrency_key {
-                    self.release_concurrency_key(id);
-                }
-                self.unreserve(conn_id, id);
-                self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
-                }
-            }
-            JobState::Ready => {
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.ready.remove_by_id(id);
-                }
-                self.ready_ct = self.ready_ct.saturating_sub(1);
-                if pri < URGENT_THRESHOLD {
-                    self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
-                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
-                    }
-                }
-            }
-            JobState::Buried => {
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.buried.retain(|&jid| jid != id);
-                    tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
-                }
-                self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
-            }
-            JobState::Delayed => {
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.delay.remove_by_id(id);
-                }
-            }
-        }
-
-        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
             tube.stat.total_delete_ct += 1;
 
-            if state == JobState::Reserved
-                && let Some(ra) = reserved_at
+            if d.state == JobState::Reserved
+                && let Some(ra) = d.reserved_at
             {
                 let secs = Instant::now().duration_since(ra).as_secs_f64();
 
@@ -2094,47 +2057,117 @@ impl ServerState {
         // Remove idempotency key from tube index (with optional cooldown).
         // A buried job failed, and deleting it gives up on it rather than
         // finishing it, so a put sending it again should queue it.
-        if let Some(ref key_tuple) = idempotency_key {
-            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.idempotency_keys.remove(&key_tuple.0);
+        if let Some((key, ttl)) = &d.idempotency_key {
+            if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
+                tube.idempotency_keys.remove(key);
             }
-            if key_tuple.1 > 0 && state != JobState::Buried {
-                let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
-                self.record_tombstone(&tube_name, key_tuple.0.as_str().into(), id, expires_at);
+            if *ttl > 0 && d.state != JobState::Buried {
+                let expires_at = SystemTime::now() + Duration::from_secs(*ttl as u64);
+                self.record_tombstone(&d.tube_name, key.as_str().into(), id, expires_at);
             }
-        }
-        if let Some(ref grp) = group_name
-            && let Some(gs) = self.groups.get_mut(grp)
-        {
-            gs.pending = gs.pending.saturating_sub(1);
-            if state == JobState::Buried {
-                gs.buried = gs.buried.saturating_sub(1);
-            }
-        }
-        if let Some(ref ag) = after_group_name
-            && let Some(gs) = self.groups.get_mut(ag)
-            && gs.remove_waiting_job(id)
-            && let Some(tube) = self.tubes.get_mut(&*tube_name)
-        {
-            tube.stat.held_ct = tube.stat.held_ct.saturating_sub(1);
         }
 
         // WAL: write delete state change. A cooldown has its own record.
         self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
 
-        self.delete_job(id);
+        self.remove_detached(id, &d);
+        Response::Deleted
+    }
 
-        // Check if any group completed and promote waiting after-jobs
-        if let Some(ref grp) = group_name {
+    /// Take job `id` out of its queue, its reserver's hold and its groups'
+    /// counts, ahead of removing it: the part a delete and an `unput` share.
+    fn detach_job(&mut self, id: u64) -> Option<Detached> {
+        let job = self.jobs.get(&id)?;
+        let d = Detached {
+            state: job.state,
+            tube_name: job.tube_name.clone(),
+            reserved_at: job.reserved_at,
+            idempotency_key: job.idempotency_key().cloned(),
+            group: job.group().cloned(),
+            has_concurrency_key: job.concurrency_key().is_some(),
+        };
+        let (pri, reserver) = (job.priority, job.reserver_id);
+        let after_group = job.after_group().cloned();
+
+        match d.state {
+            JobState::Reserved => {
+                if d.has_concurrency_key {
+                    self.release_concurrency_key(id);
+                }
+                if let Some(conn_id) = reserver {
+                    self.unreserve(conn_id, id);
+                }
+                self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
+                if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
+                    tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
+                }
+            }
+            JobState::Ready => {
+                if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
+                    tube.ready.remove_by_id(id);
+                }
+                self.ready_ct = self.ready_ct.saturating_sub(1);
+                if pri < URGENT_THRESHOLD {
+                    self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
+                    if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
+                        tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
+                    }
+                }
+            }
+            JobState::Buried => {
+                if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
+                    tube.buried.retain(|&jid| jid != id);
+                    tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
+                }
+                self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
+            }
+            JobState::Delayed => {
+                if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
+                    tube.delay.remove_by_id(id);
+                }
+            }
+        }
+
+        if let Some(grp) = &d.group
+            && let Some(gs) = self.groups.get_mut(grp)
+        {
+            gs.pending = gs.pending.saturating_sub(1);
+            if d.state == JobState::Buried {
+                gs.buried = gs.buried.saturating_sub(1);
+            }
+        }
+        if let Some(ag) = &after_group
+            && let Some(gs) = self.groups.get_mut(ag)
+            && gs.remove_waiting_job(id)
+            && let Some(tube) = self.tubes.get_mut(&*d.tube_name)
+        {
+            tube.stat.held_ct = tube.stat.held_ct.saturating_sub(1);
+        }
+        Some(d)
+    }
+
+    /// Hold `aft:` job `id` until its group completes: on the group's
+    /// waiting list, which promotes it then, and counted as held in its tube.
+    fn hold_for_group(&mut self, group: &str, id: u64, tube_name: &str) {
+        if let Some(gs) = self.groups.get_mut(group) {
+            gs.waiting_jobs.push(id);
+            if let Some(tube) = self.tubes.get_mut(tube_name) {
+                tube.stat.held_ct += 1;
+            }
+        }
+    }
+
+    /// Remove job `id`, detached by [`ServerState::detach_job`], and act on
+    /// what that frees: its group may be complete, and a `con:` slot may
+    /// unblock a parked worker (mirroring `cmd_release`).
+    fn remove_detached(&mut self, id: u64, d: &Detached) {
+        self.delete_job(id);
+        if let Some(grp) = &d.group {
             self.check_group_completion(grp);
         }
-
-        // Freeing a concurrency slot can unblock a parked waiter; mirror cmd_release.
-        if has_concurrency_key && !self.waiters.is_empty() {
+        if d.has_concurrency_key && !self.waiters.is_empty() {
             self.process_queue();
         }
-
-        Response::Deleted
     }
 
     fn cmd_delete_batch(&mut self, conn_id: u64, ids: Vec<u64>) -> Response {
@@ -3133,7 +3166,7 @@ impl ServerState {
             tube.stat.total_jobs_ct,
             tube.using_ct,
             tube.watching_ct,
-            tube.stat.waiting_ct,
+            tube.waiters.len() as u64,
             oldest_ready_id,
             oldest_ready_age,
             oldest_delayed_age,
@@ -3748,7 +3781,15 @@ impl ServerState {
         // as one can be served. Only tubes a reserve is parked on are
         // searched, and each tube once per waiter served, not every tube on
         // the server.
-        while let Some((tube_name, seq)) = self.oldest_servable_waiter() {
+        self.serve_waiters(None);
+    }
+
+    /// Serve parked reserves, the earliest-parked first, while one can be.
+    /// With `only`, just those watching that tube: a put made a job ready
+    /// there, so only they can take it, and everything else was served or
+    /// couldn't be before the put.
+    fn serve_waiters(&mut self, only: Option<&str>) {
+        while let Some((tube_name, seq)) = self.oldest_servable_waiter(only) {
             let Ok(i) = self.waiters.binary_search_by_key(&seq, |w| w.seq) else {
                 // Not parked any more. Can't happen while a connection's
                 // watches stay put during its wait, but don't spin on it.
@@ -3761,20 +3802,33 @@ impl ServerState {
         }
     }
 
-    /// Of the tubes some reserve is parked on, those with a job one could
-    /// take now; the earliest-parked reserve watching any of them, and the
-    /// tube that named it. That reserve came before every other one able to
-    /// take a job, so it is served next.
-    fn oldest_servable_waiter(&self) -> Option<(String, u64)> {
-        let mut oldest: Option<(&String, u64)> = None;
-        for name in &self.waited_tubes {
-            let Some(tube) = self.tubes.get(name) else {
+    /// Of the tubes some reserve is parked on (or just `only`), those with a
+    /// job one could take now; the earliest-parked reserve watching any of
+    /// them, and the tube that named it. That reserve came before every
+    /// other one able to take a job, so it is served next.
+    fn oldest_servable_waiter(&self, only: Option<&str>) -> Option<(Arc<str>, u64)> {
+        let (mut one, mut all);
+        let names: &mut dyn Iterator<Item = &Arc<str>> = match only {
+            Some(name) => {
+                one = self.waited_tubes.get(name).into_iter();
+                &mut one
+            }
+            None => {
+                all = self.waited_tubes.iter();
+                &mut all
+            }
+        };
+        let mut oldest: Option<(&Arc<str>, u64)> = None;
+        for name in names {
+            let Some(tube) = self.tubes.get(&**name) else {
                 continue;
             };
             let Some(&seq) = tube.waiters.first() else {
                 continue;
             };
-            if oldest.is_some_and(|(_, o)| o < seq)
+            // A tube whose first reserve is the one already found has
+            // nothing to add.
+            if oldest.is_some_and(|(_, o)| o <= seq)
                 || tube.is_paused()
                 || self.find_best_unblocked_ready(tube).is_none()
             {
@@ -3782,32 +3836,7 @@ impl ServerState {
             }
             oldest = Some((name, seq));
         }
-        oldest.map(|(name, seq)| (name.clone(), seq))
-    }
-
-    /// A put made a job ready in `tube_name`, so only a reserve watching it
-    /// can take that job: serve the earliest-parked of those, while the tube
-    /// has a job to give. Everything else was served or couldn't be before
-    /// the put, so the rest of the server needn't be searched.
-    fn serve_waiters_on(&mut self, tube_name: &str) {
-        loop {
-            let Some(tube) = self.tubes.get(tube_name) else {
-                return;
-            };
-            let Some(&seq) = tube.waiters.first() else {
-                return;
-            };
-            if tube.is_paused() || self.find_best_unblocked_ready(tube).is_none() {
-                return;
-            }
-            let Ok(i) = self.waiters.binary_search_by_key(&seq, |w| w.seq) else {
-                Self::unlist_waiter(&mut self.tubes, &mut self.waited_tubes, tube_name, seq);
-                continue;
-            };
-            if !self.serve_waiter(i) {
-                return;
-            }
-        }
+        oldest.map(|(name, seq)| (Arc::clone(name), seq))
     }
 
     /// Hand the parked reserve at `i` its job, or its batch. False when its
@@ -3891,9 +3920,10 @@ impl ServerState {
         if let Some(conn) = self.conns.get(&conn_id) {
             for w in conn.watched() {
                 if let Some(tube) = self.tubes.get_mut(&w.name) {
-                    tube.stat.waiting_ct += 1;
                     tube.waiters.insert(seq);
-                    self.waited_tubes.insert(w.name.clone());
+                    if !self.waited_tubes.contains(&*tube.name) {
+                        self.waited_tubes.insert(Arc::clone(&tube.name));
+                    }
                 }
             }
         }
@@ -3951,17 +3981,15 @@ impl ServerState {
         (collected, None)
     }
 
-    /// Pop the waiter at `i` and decrement both global and per-tube waiting
-    /// counters. Keeps the `waiters` vec and stats strictly in sync.
+    /// Pop the waiter at `i`, decrement the global waiting count and take it
+    /// off each tube it watches. Keeps the `waiters` vec, the tubes' lists
+    /// and stats strictly in sync.
     fn remove_waiter_at(&mut self, i: usize) -> WaitingReserve {
         let waiter = self.waiters.remove(i);
         self.stats.waiting_ct = self.stats.waiting_ct.saturating_sub(1);
         if let Some(conn) = self.conns.get(&waiter.conn_id) {
             for w in conn.watched() {
                 Self::unlist_waiter(&mut self.tubes, &mut self.waited_tubes, &w.name, waiter.seq);
-                if let Some(tube) = self.tubes.get_mut(&w.name) {
-                    tube.stat.waiting_ct = tube.stat.waiting_ct.saturating_sub(1);
-                }
             }
         }
         waiter
@@ -3971,7 +3999,7 @@ impl ServerState {
     /// helper, so callers iterating a connection's watches can use it.
     fn unlist_waiter(
         tubes: &mut HashMap<String, Tube>,
-        waited_tubes: &mut HashSet<String>,
+        waited_tubes: &mut HashSet<Arc<str>>,
         tube_name: &str,
         seq: u64,
     ) {
@@ -4082,90 +4110,19 @@ impl ServerState {
     /// and a restart may bring the job back, which is why a client should
     /// retry such a put with an `idp:` key.
     fn unput(&mut self, id: u64) {
-        let Some(job) = self.jobs.get(&id) else {
+        let Some(d) = self.detach_job(id) else {
             return;
         };
-        let state = job.state;
-        let tube_name = job.tube_name.clone();
-        let pri = job.priority;
-        let reserver = job.reserver_id;
-        let idempotency_key = job.idempotency_key().map(|(key, _)| key.clone());
-        let group_name = job.group().cloned();
-        let after_group_name = job.after_group().cloned();
-        let has_concurrency_key = job.concurrency_key().is_some();
-
-        match state {
-            JobState::Reserved => {
-                if has_concurrency_key {
-                    self.release_concurrency_key(id);
-                }
-                if let Some(conn_id) = reserver {
-                    self.unreserve(conn_id, id);
-                }
-                self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
-                }
-            }
-            JobState::Ready => {
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.ready.remove_by_id(id);
-                }
-                self.ready_ct = self.ready_ct.saturating_sub(1);
-                if pri < URGENT_THRESHOLD {
-                    self.stats.urgent_ct = self.stats.urgent_ct.saturating_sub(1);
-                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.stat.urgent_ct = tube.stat.urgent_ct.saturating_sub(1);
-                    }
-                }
-            }
-            JobState::Buried => {
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.buried.retain(|&jid| jid != id);
-                    tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
-                }
-                self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
-            }
-            JobState::Delayed => {
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.delay.remove_by_id(id);
-                }
-            }
-        }
-
         self.stats.total_jobs_ct = self.stats.total_jobs_ct.saturating_sub(1);
-        if let Some(tube) = self.tubes.get_mut(&*tube_name) {
+        if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
             tube.stat.total_jobs_ct = tube.stat.total_jobs_ct.saturating_sub(1);
-            if let Some(key) = idempotency_key
-                && tube.idempotency_keys.get(&key) == Some(&id)
+            if let Some((key, _)) = &d.idempotency_key
+                && tube.idempotency_keys.get(key) == Some(&id)
             {
-                tube.idempotency_keys.remove(&key);
+                tube.idempotency_keys.remove(key);
             }
         }
-        if let Some(ref grp) = group_name
-            && let Some(gs) = self.groups.get_mut(grp)
-        {
-            gs.pending = gs.pending.saturating_sub(1);
-            if state == JobState::Buried {
-                gs.buried = gs.buried.saturating_sub(1);
-            }
-        }
-        if let Some(ref ag) = after_group_name
-            && let Some(gs) = self.groups.get_mut(ag)
-            && gs.remove_waiting_job(id)
-            && let Some(tube) = self.tubes.get_mut(&*tube_name)
-        {
-            tube.stat.held_ct = tube.stat.held_ct.saturating_sub(1);
-        }
-
-        self.delete_job(id);
-
-        if let Some(ref grp) = group_name {
-            self.check_group_completion(grp);
-        }
-        if has_concurrency_key && !self.waiters.is_empty() {
-            self.process_queue();
-        }
+        self.remove_detached(id, &d);
     }
 
     /// Drop the WAL after an I/O error and refuse puts until restart. The
@@ -4197,19 +4154,12 @@ impl ServerState {
     }
 
     fn wal_write_put(&mut self, job_id: u64) {
-        if self.wal.is_none() {
-            return;
-        }
-        // Temporarily take the job out to satisfy the borrow checker while
-        // calling into the WAL. Accounting is net-zero across the pair because
-        // `wal.write_put` does not change `job.body`, only bookkeeping fields.
-        if let Some(mut job) = self.take_job(job_id) {
-            if let Some(wal) = self.wal.as_mut()
-                && let Err(e) = wal.write_put(&mut job)
-            {
-                self.fail_wal("write_put", e);
-            }
-            self.insert_job(job_id, job);
+        // `write_put` changes only the job's WAL bookkeeping, nothing the
+        // job map's accounting counts, so the job is written in place.
+        if let (Some(wal), Some(job)) = (self.wal.as_mut(), self.jobs.get_mut(&job_id))
+            && let Err(e) = wal.write_put(job)
+        {
+            self.fail_wal("write_put", e);
         }
     }
 
@@ -4239,17 +4189,11 @@ impl ServerState {
         expiry_epoch_secs: u64,
         reason: StateChangeReason,
     ) {
-        if self.wal.is_none() {
-            return;
-        }
-        if let Some(mut job) = self.take_job(job_id) {
-            if let Some(wal) = self.wal.as_mut()
-                && let Err(e) =
-                    wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs, reason)
-            {
-                self.fail_wal("write_state_change", e);
-            }
-            self.insert_job(job_id, job);
+        if let (Some(wal), Some(job)) = (self.wal.as_mut(), self.jobs.get_mut(&job_id))
+            && let Err(e) =
+                wal.write_state_change(job, state, pri, delay, expiry_epoch_secs, reason)
+        {
+            self.fail_wal("write_state_change", e);
         }
     }
 

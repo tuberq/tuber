@@ -215,8 +215,6 @@ pub struct Schedules {
     owners: BTreeMap<String, BTreeMap<String, Entry>>,
     /// Sum of `memory_cost` over every entry.
     bytes: u64,
-    /// The last commit changed something its owner's stored set holds.
-    unsaved: bool,
 }
 
 impl Schedules {
@@ -232,12 +230,6 @@ impl Schedules {
         self.bytes
     }
 
-    /// Whether the last commit changed what its owner's stored set holds
-    /// (a respelled spec included), so it must be written. Reads once.
-    pub fn take_unsaved(&mut self) -> bool {
-        std::mem::take(&mut self.unsaved)
-    }
-
     pub fn owners(&self) -> impl Iterator<Item = &str> {
         self.owners.keys().map(String::as_str)
     }
@@ -250,8 +242,10 @@ impl Schedules {
         self.owners.get_mut(owner)?.get_mut(name)
     }
 
-    /// Add an entry read back from disk.
-    pub fn restore(&mut self, entry: Entry) {
+    /// Add an entry read back from disk. It next fires at its first tick
+    /// after its last fire, or its sync time if it hasn't fired.
+    pub fn restore(&mut self, mut entry: Entry) {
+        entry.next_fire = entry.line.spec.next_after(entry.recorded());
         self.bytes += memory_cost(&entry.owner, &entry.line, &entry.body);
         let names = self.owners.entry(entry.owner.clone()).or_default();
         if let Some(old) = names.insert(entry.line.name.clone(), entry) {
@@ -283,8 +277,10 @@ impl Schedules {
 
     /// Replace the staged owner's entries with the staged set, as of `now`.
     /// New and changed entries first fire at their first tick strictly after
-    /// `now`, so a sync never fires anything itself.
-    pub fn commit(&mut self, staging: Staging, now: Timestamp) -> SyncCounts {
+    /// `now`, so a sync never fires anything itself. Also says whether the
+    /// owner's stored set must be written: whether anything was added,
+    /// changed or removed, or a spec respelled.
+    pub fn commit(&mut self, staging: Staging, now: Timestamp) -> (SyncCounts, bool) {
         let owner = staging.owner;
         let mut old = self.owners.remove(&owner).unwrap_or_default();
         for e in old.values() {
@@ -292,6 +288,7 @@ impl Schedules {
         }
 
         let mut counts = SyncCounts::default();
+        let mut respelled = false;
         let mut new = BTreeMap::new();
         for (name, (line, body)) in staging.entries {
             let entry = match old.remove(&name) {
@@ -313,7 +310,7 @@ impl Schedules {
                     // change nothing that fires.
                     if e.line.spec_text != line.spec_text {
                         e.line.spec_text = line.spec_text;
-                        self.unsaved = true;
+                        respelled = true;
                     }
                     e
                 }
@@ -331,13 +328,11 @@ impl Schedules {
             new.insert(name, entry);
         }
         counts.removed = old.len() as u32;
-        if counts.added + counts.changed + counts.removed > 0 {
-            self.unsaved = true;
-        }
         if !new.is_empty() {
             self.owners.insert(owner, new);
         }
-        counts
+        let unsaved = respelled || counts.added + counts.changed + counts.removed > 0;
+        (counts, unsaved)
     }
 }
 
@@ -390,7 +385,7 @@ mod tests {
             line("stats", "7 * * * *"),
         ];
         assert_eq!(
-            s.commit(staging("splat", first.clone()), t0),
+            s.commit(staging("splat", first.clone()), t0).0,
             counts(3, 0, 0, 0)
         );
         assert_eq!(
@@ -398,9 +393,9 @@ mod tests {
             Some(ts("2026-10-11T03:05:00Z"))
         );
 
-        // Same set again: nothing moves.
+        // Same set again: nothing moves, and nothing needs writing.
         let t1 = ts("2026-10-11T03:01:30Z");
-        assert_eq!(s.commit(staging("splat", first), t1), counts(0, 0, 0, 3));
+        assert_eq!(s.commit(staging("splat", first), t1), (counts(0, 0, 0, 3), false));
         assert_eq!(s.get("splat", "rollup").unwrap().synced_at, t0);
 
         // Edit one, drop one, rename one.
@@ -408,7 +403,7 @@ mod tests {
             line("rollup", "15 * * * *"),
             line("stats_hourly", "7 * * * *"),
         ];
-        assert_eq!(s.commit(staging("splat", next), t1), counts(1, 1, 2, 0));
+        assert_eq!(s.commit(staging("splat", next), t1).0, counts(1, 1, 2, 0));
         let rollup = s.get("splat", "rollup").unwrap();
         assert_eq!(rollup.next_fire, Some(ts("2026-10-11T03:15:00Z")));
         assert_eq!(rollup.synced_at, t1);
@@ -429,9 +424,10 @@ mod tests {
             t0,
         );
         let respelled = vec![line("retention", "CRON_TZ=Australia/Melbourne 0 2 * * *")];
+        // Unchanged, but the stored set holds the old text.
         assert_eq!(
             s.commit(staging("splat", respelled), t0),
-            counts(0, 0, 0, 1)
+            (counts(0, 0, 0, 1), true)
         );
         assert_eq!(
             s.get("splat", "retention").unwrap().line.spec_text,
@@ -448,19 +444,19 @@ mod tests {
         let mut st = staging("splat", vec![]);
         st.entries
             .insert("a".into(), (line("a", "@hourly"), b"other".to_vec()));
-        assert_eq!(s.commit(st, t0), counts(0, 1, 0, 0));
+        assert_eq!(s.commit(st, t0).0, counts(0, 1, 0, 0));
 
         let mut tagged = line("a", "@hourly");
         tagged.tags.idempotency_key = Some(("a".into(), 0));
         let mut st = staging("splat", vec![]);
         st.entries
             .insert("a".into(), (tagged.clone(), b"other".to_vec()));
-        assert_eq!(s.commit(st, t0), counts(0, 1, 0, 0));
+        assert_eq!(s.commit(st, t0).0, counts(0, 1, 0, 0));
 
         tagged.catchup = Catchup::Never;
         let mut st = staging("splat", vec![]);
         st.entries.insert("a".into(), (tagged, b"other".to_vec()));
-        assert_eq!(s.commit(st, t0), counts(0, 1, 0, 0));
+        assert_eq!(s.commit(st, t0).0, counts(0, 1, 0, 0));
     }
 
     #[test]
@@ -472,10 +468,10 @@ mod tests {
             t0,
         );
         assert_eq!(
-            s.commit(staging("booko", vec![line("a", "@hourly")]), t0),
+            s.commit(staging("booko", vec![line("a", "@hourly")]), t0).0,
             counts(1, 0, 0, 0)
         );
-        assert_eq!(s.commit(staging("booko", vec![]), t0), counts(0, 0, 1, 0));
+        assert_eq!(s.commit(staging("booko", vec![]), t0).0, counts(0, 0, 1, 0));
         assert_eq!(s.owner_entries("splat").count(), 2);
         assert_eq!(s.owner_entries("booko").count(), 0);
     }

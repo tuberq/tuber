@@ -81,14 +81,14 @@ impl ServerState {
             }
         }
         let owner = sync.owner.clone();
-        let counts = self.schedules.commit(sync, Timestamp::now());
+        let (counts, unsaved) = self.schedules.commit(sync, Timestamp::now());
         // Durable before the reply. On failure the new set stands in memory
         // and the client hears INTERNAL_ERROR, as a put whose WAL write
         // fails does; the WAL is dropped, so a restart restores the set last
         // written. A commit that changes nothing writes nothing, unless the
         // stored set holds entries startup dropped; and once the WAL has
         // failed none can be kept.
-        let unsaved = self.schedules.take_unsaved() || self.schedule_refs.is_stale(&owner);
+        let unsaved = unsaved || self.schedule_refs.is_stale(&owner);
         if (unsaved || self.wal_failed) && !(self.journal_schedule_set(&owner) && self.sync_wal())
         {
             tracing::error!(owner, "schedule sync not persisted");

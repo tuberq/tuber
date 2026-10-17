@@ -15,7 +15,6 @@ pub type DelayKey = (Instant, u64);
 #[derive(Debug, Default, Clone)]
 pub struct TubeStats {
     pub urgent_ct: u64,
-    pub waiting_ct: u64,
     pub buried_ct: u64,
     /// `aft:` jobs their group holds: on its waiting list, in no queue.
     pub held_ct: u64,
@@ -438,7 +437,7 @@ impl Tube {
         self.ready.is_empty()
             && self.delay.is_empty()
             && self.buried.is_empty()
-            && self.stat.waiting_ct == 0
+            && self.waiters.is_empty()
             && self.stat.reserved_ct == 0
             && self.idempotency_keys.is_empty()
             && self.idempotency_cooldowns.is_empty()
@@ -460,7 +459,7 @@ mod tests {
         assert!(t.ready.is_empty());
         assert!(t.delay.is_empty());
         assert!(t.buried.is_empty());
-        assert_eq!(t.stat.waiting_ct, 0);
+        assert!(t.waiters.is_empty());
         assert!(!t.is_paused());
         assert!(t.is_idle());
     }

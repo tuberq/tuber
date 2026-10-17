@@ -331,22 +331,22 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     // `stats` reports this as true/false; Prometheus needs a number. With
     // `-b` set, 0 means a WAL write or fsync failed and puts are being
     // refused until restart — alert on it.
-    if let Some(val) = stats.get("binlog-enabled") {
-        let val = u8::from(*val == "true");
-        out.push_str(&format!(
-            "# HELP tuber_binlog_enabled 1 while the WAL is persisting jobs; 0 without -b, or after a WAL I/O error\n\
-             # TYPE tuber_binlog_enabled gauge\ntuber_binlog_enabled {val}\n\n"
-        ));
-    }
+    prom_bool_gauge(
+        &mut out,
+        "tuber_binlog_enabled",
+        "1 while the WAL is persisting jobs; 0 without -b, or after a WAL I/O error",
+        &stats,
+        "binlog-enabled",
+    );
     // Tells a failed WAL apart from running without -b, which
     // tuber_binlog_enabled alone can't: alert on 1 without knowing the config.
-    if let Some(val) = stats.get("binlog-failed") {
-        let val = u8::from(*val == "true");
-        out.push_str(&format!(
-            "# HELP tuber_binlog_failed 1 after a WAL I/O error, while puts are refused until restart\n\
-             # TYPE tuber_binlog_failed gauge\ntuber_binlog_failed {val}\n\n"
-        ));
-    }
+    prom_bool_gauge(
+        &mut out,
+        "tuber_binlog_failed",
+        "1 after a WAL I/O error, while puts are refused until restart",
+        &stats,
+        "binlog-failed",
+    );
     prom_gauge(
         &mut out,
         "tuber_binlog_file_count",
@@ -712,6 +712,16 @@ async fn schedule_metrics(client: &mut TuberClient, out: &mut String) -> io::Res
 
 fn prom_gauge(out: &mut String, name: &str, help: &str, stats: &HashMap<&str, &str>, key: &str) {
     if let Some(val) = stats.get(key) {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n\n"
+        ));
+    }
+}
+
+/// A `true`/`false` stat as a 1/0 gauge.
+fn prom_bool_gauge(out: &mut String, name: &str, help: &str, stats: &HashMap<&str, &str>, key: &str) {
+    if let Some(val) = stats.get(key) {
+        let val = u8::from(*val == "true");
         out.push_str(&format!(
             "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n\n"
         ));

@@ -35,13 +35,8 @@ impl ServerState {
                         if let Some(job) = self.jobs.get_mut(&job_id) {
                             job.deadline_at = None;
                         }
-                        if let Some(ag) = self.jobs.get(&job_id).and_then(|j| j.after_group().cloned())
-                            && let Some(gs) = self.groups.get_mut(&ag)
-                        {
-                            gs.waiting_jobs.push(job_id);
-                            if let Some(tube) = self.tubes.get_mut(tube_name) {
-                                tube.stat.held_ct += 1;
-                            }
+                        if let Some(ag) = self.jobs.get(&job_id).and_then(|j| j.after_group().cloned()) {
+                            self.hold_for_group(&ag, job_id, tube_name);
                         }
                     } else if let Some(job) = self.jobs.get_mut(&job_id) {
                         let released_by_group = job.after_group().is_some() && job.reserve_ct == 0;
@@ -284,8 +279,8 @@ impl ServerState {
             }
 
             // Live cooldowns in the target segment hold references on it
-            // too. Rewrite each into the current segment, then release the
-            // old record, so the segment can be collected.
+            // too. Record each again, in the current segment, which releases
+            // the old record, so the segment can be collected.
             let migrate_cooldowns: Vec<(String, Arc<str>, Cooldown)> = self
                 .tubes
                 .iter()
@@ -298,32 +293,9 @@ impl ServerState {
                 .take(count)
                 .collect();
             for (tube_name, key, cooldown) in migrate_cooldowns {
+                self.record_tombstone(&tube_name, key, cooldown.job_id, cooldown.expires_at);
                 let Some(wal) = self.wal.as_mut() else { break };
-                let expires_epoch_secs = cooldown
-                    .expires_at
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .max(1);
-                match wal.write_tombstone(&tube_name, &key, cooldown.job_id, expires_epoch_secs) {
-                    Ok(record) => {
-                        if let Some(old) = cooldown.record {
-                            wal.release_record(old);
-                        }
-                        wal.record_migration();
-                        if let Some(c) = self
-                            .tubes
-                            .get_mut(&tube_name)
-                            .and_then(|t| t.idempotency_cooldowns.get_mut(&key))
-                        {
-                            c.record = record;
-                        }
-                    }
-                    Err(e) => {
-                        self.fail_wal("compaction tombstone write", e);
-                        break;
-                    }
-                }
+                wal.record_migration();
             }
 
             // So do schedule records. Rewriting an owner's set moves it out,

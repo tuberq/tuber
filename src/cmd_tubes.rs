@@ -20,24 +20,17 @@ pub async fn run(addr: &str) -> io::Result<()> {
     for tube in &tubes {
         match client.stats_tube(tube).await {
             Ok(stats) => {
-                let get = |key: &str| -> String {
-                    stats
-                        .lines()
-                        .find(|l| l.starts_with(&format!("{key}:")))
-                        .and_then(|l| l.split_once(':'))
-                        .map(|(_, v)| v.trim().to_string())
-                        .unwrap_or_else(|| "?".to_string())
-                };
+                let stats = crate::client::parse_yaml_map(&stats);
+                let get = |key: &str| stats.get(key).copied().unwrap_or("?");
 
                 let ready = get("current-jobs-ready");
                 let reserved = get("current-jobs-reserved");
                 let delayed = get("current-jobs-delayed");
                 // Not sent by beanstalkd or a tuber before 0.17.
-                let held = if stats.lines().any(|l| l.starts_with("current-jobs-held:")) {
-                    format!(" held={}", get("current-jobs-held"))
-                } else {
-                    String::new()
-                };
+                let held = stats
+                    .get("current-jobs-held")
+                    .map(|n| format!(" held={n}"))
+                    .unwrap_or_default();
                 let buried = get("current-jobs-buried");
 
                 crate::outln!(

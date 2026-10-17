@@ -340,7 +340,7 @@ impl BodyStore {
                     };
                     return Err(damaged_segment_error(&path, &damage.what, why));
                 }
-                let aside = corrupt_copy_path(&path);
+                let aside = crate::wal::corrupt_sidecar_path(&path);
                 if damage.unusable {
                     drop(file);
                     match fs::rename(&path, &aside) {
@@ -576,15 +576,12 @@ impl BodyStore {
         self.read_body_checked(id, None)
     }
 
-    /// [`BodyStore::read_body`], first checking that the record is the body
-    /// the WAL wrote: its header's CRC must be `wal_crc`. A record whose
-    /// own CRCs agree but name other bytes — a misdirected write, a segment
-    /// from another backup — fails with [`BodyStoreError::NotTheWalsBody`].
-    pub fn read_body_expecting(&self, id: BodyId, wal_crc: u32) -> Result<Vec<u8>, BodyStoreError> {
-        self.read_body_checked(id, Some(wal_crc))
-    }
-
-    fn read_body_checked(
+    /// [`BodyStore::read_body`], given the CRC the WAL recorded for the
+    /// body, if it did, first checking that the record is the body the WAL
+    /// wrote: its header's CRC must be `wal_crc`. A record whose own CRCs
+    /// agree but name other bytes — a misdirected write, a segment from
+    /// another backup — fails with [`BodyStoreError::NotTheWalsBody`].
+    pub fn read_body_checked(
         &self,
         id: BodyId,
         wal_crc: Option<u32>,
@@ -605,7 +602,7 @@ impl BodyStore {
 
         let mut header = [0u8; BODY_HEADER_SIZE];
         file.read_exact_at(&mut header, location.offset - BODY_HEADER_SIZE as u64)?;
-        let expected_crc = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let (_, _, expected_crc) = decode_body_header(&header);
         if let Some(wal_crc) = wal_crc
             && wal_crc != expected_crc
         {
@@ -704,22 +701,24 @@ impl BodyStore {
     pub fn fsync(&self) -> Result<Option<DurablePoint>, BodyStoreError> {
         // Take the point before the fsync: bytes appended after it may or
         // may not make this one, so only what was written before counts.
-        let current = {
+        let (file, point) = {
             let inner = self.inner.lock().unwrap();
-            inner.current_seq.and_then(|seq| {
-                inner.segments.get(&seq).map(|seg| {
-                    (
-                        Arc::clone(&seg.file),
-                        DurablePoint {
-                            seq,
-                            offset: seg.total_bytes,
-                        },
-                    )
-                })
-            })
-        };
-        let Some((file, point)) = current else {
-            return Ok(self.synced_point());
+            let Some((seq, seg)) = inner
+                .current_seq
+                .and_then(|seq| inner.segments.get(&seq).map(|seg| (seq, seg)))
+            else {
+                return Ok(inner.synced);
+            };
+            let point = DurablePoint {
+                seq,
+                offset: seg.total_bytes,
+            };
+            // Nothing appended since a completed fsync covered it: every
+            // append, compaction's included, moves the point.
+            if inner.synced == Some(point) {
+                return Ok(inner.synced);
+            }
+            (Arc::clone(&seg.file), point)
         };
         file.sync_data()?;
         let mut inner = self.inner.lock().unwrap();
@@ -772,6 +771,7 @@ impl BodyStore {
     /// bodies that no longer exist in TOAST (silent bit-rot in a segment
     /// header, manual file removal, the corruption-drop path in
     /// `compact_segment`, etc.).
+    #[cfg(test)]
     pub fn contains_body(&self, id: BodyId) -> bool {
         self.inner.lock().unwrap().index.contains_key(&id)
     }
@@ -983,8 +983,7 @@ impl BodyStore {
             // the move source against silent disk corruption.
             let mut header = [0u8; BODY_HEADER_SIZE];
             seg_file.read_exact_at(&mut header, old_loc.offset - BODY_HEADER_SIZE as u64)?;
-            let expected_crc =
-                u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+            let (_, _, expected_crc) = decode_body_header(&header);
             let mut buf = vec![0u8; old_loc.len as usize];
             seg_file.read_exact_at(&mut buf, old_loc.offset)?;
             let found_crc = crc32fast::hash(&buf);
@@ -1129,13 +1128,6 @@ fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{}{:06}", TOAST_FILE_PREFIX, seq))
 }
 
-/// Where a damaged segment is copied or moved aside: `<path>.corrupt`.
-fn corrupt_copy_path(path: &Path) -> PathBuf {
-    let mut os = path.as_os_str().to_os_string();
-    os.push(".corrupt");
-    PathBuf::from(os)
-}
-
 /// fsync a directory so file creations/unlinks inside it survive a crash.
 /// POSIX only persists dirents when the directory itself is synced; an
 /// fsynced file can still vanish wholesale if its dirent never lands.
@@ -1179,12 +1171,14 @@ fn body_header_crc_ok(h: &[u8; BODY_HEADER_SIZE]) -> bool {
     crc32fast::hash(&h[0..16]) == u32::from_le_bytes([h[16], h[17], h[18], h[19]])
 }
 
-fn decode_body_header(h: &[u8; BODY_HEADER_SIZE]) -> (BodyId, u32) {
+/// A body header's id, body length and body CRC.
+fn decode_body_header(h: &[u8; BODY_HEADER_SIZE]) -> (BodyId, u32, u32) {
     let body_id = BodyId(u64::from_le_bytes([
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
     ]));
     let len = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);
-    (body_id, len)
+    let crc = u32::from_le_bytes([h[12], h[13], h[14], h[15]]);
+    (body_id, len, crc)
 }
 
 fn write_file_header(file: &mut File) -> io::Result<()> {
@@ -1244,7 +1238,7 @@ fn damaged_segment_error(path: &Path, damage: &str, why: &str) -> BodyStoreError
          with --wal-skip-corrupt (env TUBER_WAL_SKIP_CORRUPT) to start without them, \
          keeping the damaged segment as {}.",
         path.display(),
-        corrupt_copy_path(path).display(),
+        crate::wal::corrupt_sidecar_path(path).display(),
     ))
 }
 
@@ -1259,7 +1253,7 @@ fn uncopied_segment_error(path: &Path, damage: &str, err: &io::Error) -> BodySto
          Free some disk space, or fix whatever stopped the copy, and start again with \
          --wal-skip-corrupt, or restore the WAL directory from a backup.",
         path.display(),
-        corrupt_copy_path(path).display(),
+        crate::wal::corrupt_sidecar_path(path).display(),
     ))
 }
 
@@ -1343,7 +1337,7 @@ fn scan_segment(file: &mut File, torn_from: Option<u64>) -> Result<SegmentScan, 
             damage = Some(format!("has a corrupt body header at offset {offset}"));
             break;
         }
-        let (body_id, len) = decode_body_header(&bh);
+        let (body_id, len, crc) = decode_body_header(&bh);
         let body_offset = offset + BODY_HEADER_SIZE as u64;
         let next_offset = body_offset + len as u64;
         if next_offset > file_len {
@@ -1355,7 +1349,6 @@ fn scan_segment(file: &mut File, torn_from: Option<u64>) -> Result<SegmentScan, 
             ));
             break;
         }
-        let crc = u32::from_le_bytes([bh[12], bh[13], bh[14], bh[15]]);
         entries.push(ScanEntry { body_id, body_offset, len, crc });
         offset = next_offset;
     }
@@ -1993,7 +1986,7 @@ mod tests {
         );
         let seg0 = segment_path(tmp.path(), 0);
         assert_eq!(fs::read(&seg0).unwrap(), damaged, "segment left as found");
-        assert!(!corrupt_copy_path(&seg0).exists());
+        assert!(!crate::wal::corrupt_sidecar_path(&seg0).exists());
     }
 
     #[test]
@@ -2074,7 +2067,7 @@ mod tests {
             "cut at the damage"
         );
         assert!(
-            fs::read(corrupt_copy_path(&seg0)).unwrap() == damaged,
+            fs::read(crate::wal::corrupt_sidecar_path(&seg0)).unwrap() == damaged,
             "the copy is whole"
         );
     }
@@ -2088,7 +2081,7 @@ mod tests {
         let ids = store_with_older_segment(tmp.path());
         let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
         let seg0 = segment_path(tmp.path(), 0);
-        let copy = corrupt_copy_path(&seg0);
+        let copy = crate::wal::corrupt_sidecar_path(&seg0);
         fs::create_dir(&copy).unwrap();
 
         let msg = match BodyStore::open_with_skip_corrupt(tmp.path(), 200, true) {
@@ -2121,7 +2114,7 @@ mod tests {
         assert_eq!(bs.read_body(ids[3]).unwrap(), vec![3; 40]);
         let seg0 = segment_path(tmp.path(), 0);
         assert!(!seg0.exists());
-        assert!(corrupt_copy_path(&seg0).exists());
+        assert!(crate::wal::corrupt_sidecar_path(&seg0).exists());
         // New bodies still get fresh ids and land in a new segment.
         let id = bs.write_body(b"after").unwrap();
         assert!(id.0 > ids[3].0);
@@ -2166,7 +2159,7 @@ mod tests {
         let (_, point) = store_synced(tmp.path());
         let damaged = patch_segment(tmp.path(), 0, header_offset(1) + 8, &u32::MAX.to_le_bytes());
         let seg0 = segment_path(tmp.path(), 0);
-        fs::create_dir(corrupt_copy_path(&seg0)).unwrap();
+        fs::create_dir(crate::wal::corrupt_sidecar_path(&seg0)).unwrap();
 
         let msg = match BodyStore::open_with_recovery_point(tmp.path(), 4096, true, Some(point)) {
             Ok(_) => panic!("open went ahead without keeping a copy"),
@@ -2311,11 +2304,11 @@ mod tests {
         assert_eq!(crc, crc32fast::hash(b"the body the WAL wrote"));
         assert_eq!(bs.body_crc(id), Some(crc));
         assert_eq!(
-            bs.read_body_expecting(id, crc).unwrap(),
+            bs.read_body_checked(id, Some(crc)).unwrap(),
             b"the body the WAL wrote"
         );
         assert!(matches!(
-            bs.read_body_expecting(id, crc ^ 1),
+            bs.read_body_checked(id, Some(crc ^ 1)),
             Err(BodyStoreError::NotTheWalsBody { .. })
         ));
         drop(bs);

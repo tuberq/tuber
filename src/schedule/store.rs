@@ -88,7 +88,6 @@ impl ScheduleRefs {
                         .or_default()
                         .insert(entry.line.name.clone(), stamp);
                 }
-                entry.next_fire = entry.line.spec.next_after(entry.recorded());
                 schedules.restore(entry);
             }
         }
@@ -234,7 +233,6 @@ pub fn read_files(dir: &Path) -> io::Result<Option<Schedules>> {
             continue;
         };
         entry.last_fire = stamps.get(&(owner, entry.line.name.clone())).copied();
-        entry.next_fire = entry.line.spec.next_after(entry.recorded());
         schedules.restore(entry);
     }
     Ok(Some(schedules))

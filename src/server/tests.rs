@@ -2958,7 +2958,7 @@ fn test_waiting_ct_reserve_blocks() {
     let (tx, _rx) = oneshot::channel();
     s.add_waiter(c, tx, None, None);
     assert_eq!(s.stats.waiting_ct, 1);
-    assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 1);
+    assert_eq!(s.tubes.get("default").unwrap().waiters.len(), 1);
 }
 
 #[test]
@@ -2972,7 +2972,7 @@ fn test_waiting_ct_fulfilled_waiter_resets() {
     // Put a job — process_queue should wake the waiter
     s.handle_command(c, put_cmd(0, 0, 10, 1), Some(b"x".to_vec()));
     assert_eq!(s.stats.waiting_ct, 0);
-    assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 0);
+    assert_eq!(s.tubes.get("default").unwrap().waiters.len(), 0);
 }
 
 #[test]
@@ -2997,14 +2997,14 @@ fn test_waiting_ct_disconnect_clears() {
     s.add_waiter(c2, tx2, None, None);
 
     assert_eq!(s.stats.waiting_ct, 2);
-    assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 2);
-    assert_eq!(s.tubes.get("foo").unwrap().stat.waiting_ct, 1);
+    assert_eq!(s.tubes.get("default").unwrap().waiters.len(), 2);
+    assert_eq!(s.tubes.get("foo").unwrap().waiters.len(), 1);
 
     // Disconnect c1 — its waiter should be removed
     s.unregister_conn(c1);
     assert_eq!(s.stats.waiting_ct, 1);
-    assert_eq!(s.tubes.get("default").unwrap().stat.waiting_ct, 1);
-    assert_eq!(s.tubes.get("foo").unwrap().stat.waiting_ct, 1);
+    assert_eq!(s.tubes.get("default").unwrap().waiters.len(), 1);
+    assert_eq!(s.tubes.get("foo").unwrap().waiters.len(), 1);
 }
 
 // Point an already-ready job at a non-existent external body. make_state has no
@@ -3592,10 +3592,9 @@ fn no_parked_worker_could_take_a_job_after_any_command_under_random_ops() {
                     .map(|w| w.seq)
                     .collect();
                 assert_eq!(tube.waiters, want, "seed {seed} step {step} tube {name}");
-                assert_eq!(tube.stat.waiting_ct, want.len() as u64);
-                assert_eq!(s.waited_tubes.contains(name), !want.is_empty());
+                assert_eq!(s.waited_tubes.contains(name.as_str()), !want.is_empty());
             }
-            assert!(s.waited_tubes.iter().all(|t| s.tubes.contains_key(t)));
+            assert!(s.waited_tubes.iter().all(|t| s.tubes.contains_key(&**t)));
         }
     }
     eprintln!("parked reserves served: {served}");

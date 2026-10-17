@@ -71,9 +71,11 @@ const WAL_VERSION_TOAST_MARKS: u32 = 9;
 /// First version with schedule records.
 const WAL_VERSION_SCHEDULES: u32 = 9;
 /// Size of an id-mark record: type(1) + high_water(8) + payload_len(4) + crc(4).
+#[cfg(test)]
 const ID_MARK_RECORD_SIZE: usize = 1 + 8 + 4 + 4;
 /// Size of a TOAST mark record: type(1) + seq(8) + payload_len(4) +
 /// offset(8) + crc(4).
+#[cfg(test)]
 const TOAST_MARK_RECORD_SIZE: usize = 1 + 8 + 4 + 8 + 4;
 const STATE_CHANGE_PAYLOAD_LEN_V3: u32 = 21;
 const STATE_CHANGE_PAYLOAD_LEN_V4: u32 = 22; // v4: added reason byte
@@ -323,7 +325,9 @@ pub enum WalRecord {
 // --- Serialization ---
 
 pub fn serialize_full_job(job: &Job) -> Vec<u8> {
-    let mut payload = Vec::new();
+    let inline_len = job.body.as_inline_bytes().map_or(0, <[u8]>::len);
+    let mut p = Payload::with_capacity(128 + job.tube_name.len() + inline_len);
+    let payload = &mut p.0;
 
     // priority, delay_nanos, ttr_nanos, created_at_epoch_secs
     payload.extend_from_slice(&job.priority.to_le_bytes());
@@ -348,7 +352,7 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
 
     // extension fields (grouped: key + its associated value)
     // idempotency_key + ttl
-    write_option_string(&mut payload, job.idempotency_key().map(|(k, _)| k.as_str()));
+    write_option_string(payload, job.idempotency_key().map(|(k, _)| k.as_str()));
     payload.extend_from_slice(
         &job.idempotency_key()
             .map_or(0u32, |(_, ttl)| *ttl)
@@ -356,11 +360,11 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
     );
 
     // group, after_group
-    write_option_string(&mut payload, job.group().map(String::as_str));
-    write_option_string(&mut payload, job.after_group().map(String::as_str));
+    write_option_string(payload, job.group().map(String::as_str));
+    write_option_string(payload, job.after_group().map(String::as_str));
 
     // concurrency_key + limit
-    write_option_string(&mut payload, job.concurrency_key().map(|(k, _)| k.as_str()));
+    write_option_string(payload, job.concurrency_key().map(|(k, _)| k.as_str()));
     payload.extend_from_slice(
         &job.concurrency_key()
             .map_or(0u32, |(_, l)| *l)
@@ -392,17 +396,7 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
         }
     }
 
-    // Build full record: type + job_id + payload_len + payload + crc
-    let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
-    record.push(RECORD_TYPE_FULL_JOB);
-    record.extend_from_slice(&job.id.to_le_bytes());
-    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    record.extend_from_slice(&payload);
-
-    let crc = crc32fast::hash(&record);
-    record.extend_from_slice(&crc.to_le_bytes());
-
-    record
+    p.frame(RECORD_TYPE_FULL_JOB, job.id)
 }
 
 pub fn serialize_state_change(
@@ -438,43 +432,26 @@ pub fn serialize_state_change(
     record
 }
 
-/// Frame `payload` as a record: type(1) + job_id(8) + payload_len(4) +
-/// payload + crc(4), the CRC covering everything before it.
-fn frame_record(record_type: u8, job_id: u64, payload: &[u8]) -> Vec<u8> {
-    let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
-    record.push(record_type);
-    record.extend_from_slice(&job_id.to_le_bytes());
-    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    record.extend_from_slice(payload);
-    let crc = crc32fast::hash(&record);
-    record.extend_from_slice(&crc.to_le_bytes());
-    record
-}
-
 /// A v8 tombstone record. `expires_epoch_secs == 0` clears the cooldown.
 pub fn serialize_tombstone(job_id: u64, tube: &str, key: &str, expires_epoch_secs: u64) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(8 + 2 + tube.len() + 2 + key.len());
-    payload.extend_from_slice(&expires_epoch_secs.to_le_bytes());
-    payload.extend_from_slice(&(tube.len() as u16).to_le_bytes());
-    payload.extend_from_slice(tube.as_bytes());
-    payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
-    payload.extend_from_slice(key.as_bytes());
-    frame_record(RECORD_TYPE_TOMBSTONE, job_id, &payload)
+    let mut p = Payload::with_capacity(8 + 2 + tube.len() + 2 + key.len());
+    p.0.extend_from_slice(&expires_epoch_secs.to_le_bytes());
+    p.str16(tube);
+    p.str16(key);
+    p.frame(RECORD_TYPE_TOMBSTONE, job_id)
 }
 
 /// A v8 id mark, carrying `high_water` in the job-id field.
 pub fn serialize_id_mark(high_water: u64) -> Vec<u8> {
-    frame_record(RECORD_TYPE_ID_MARK, high_water, &[])
+    Payload::with_capacity(0).frame(RECORD_TYPE_ID_MARK, high_water)
 }
 
 /// A v9 TOAST mark, carrying the segment seq in the job-id field and the
 /// offset as its payload.
 pub fn serialize_toast_mark(point: DurablePoint) -> Vec<u8> {
-    frame_record(
-        RECORD_TYPE_TOAST_MARK,
-        point.seq,
-        &point.offset.to_le_bytes(),
-    )
+    let mut p = Payload::with_capacity(8);
+    p.0.extend_from_slice(&point.offset.to_le_bytes());
+    p.frame(RECORD_TYPE_TOAST_MARK, point.seq)
 }
 
 /// A v9 schedule set record: `owner`'s entries, replacing its earlier set.
@@ -488,7 +465,7 @@ pub fn serialize_schedule_set<B: AsRef<[u8]>>(owner: &str, entries: &[ScheduleRe
         p.time(e.synced_at);
         p.opt_time(e.last_fire);
     }
-    p.frame(RECORD_TYPE_SCHEDULE_SET)
+    p.frame(RECORD_TYPE_SCHEDULE_SET, 0)
 }
 
 /// The payload size of a schedule set record, at most.
@@ -503,36 +480,42 @@ fn schedule_set_size<B: AsRef<[u8]>>(owner: &str, entries: &[ScheduleRecord<B>])
 /// What one entry adds to a schedule set record, at most: its line, its
 /// body, its sync time and its last fire.
 pub fn schedule_entry_size(line: &str, body_len: usize) -> usize {
-    4 + line.len() + 4 + body_len + 12 + 13
+    4 + line.len() + 4 + body_len + Payload::TIME + Payload::OPT_TIME
 }
 
 /// A v9 schedule fired record: the last fire of `owner`'s entry `name`.
 pub fn serialize_schedule_fired(owner: &str, name: &str, last_fire: Option<Timestamp>) -> Vec<u8> {
-    let mut p = Payload::with_capacity(4 + owner.len() + 4 + name.len() + 13);
+    let mut p = Payload::with_capacity(4 + owner.len() + 4 + name.len() + Payload::OPT_TIME);
     p.bytes(owner.as_bytes());
     p.bytes(name.as_bytes());
     p.opt_time(last_fire);
-    p.frame(RECORD_TYPE_SCHEDULE_FIRED)
+    p.frame(RECORD_TYPE_SCHEDULE_FIRED, 0)
 }
 
-/// Builds a schedule record, its payload written after room for the
-/// header [`Payload::frame`] fills in, so a set's bodies are copied once.
-/// Little-endian; bytes are `len:u32 + bytes`, a time `seconds:i64
-/// nanos:i32`, an optional time a flag byte and then the time if the flag
-/// is 1.
+/// Builds a record: type(1) + job_id(8) + payload_len(4) + payload +
+/// crc(4), the CRC covering everything before it. The payload is written
+/// after room for the header [`Payload::frame`] fills in, so it is copied
+/// once. Little-endian; bytes are `len:u32 + bytes` (`len:u16` for
+/// [`Payload::str16`]), a time `seconds:i64 nanos:i32`, an optional time a
+/// flag byte and then the time if the flag is 1.
 struct Payload(Vec<u8>);
 
 impl Payload {
+    const HEADER: usize = 1 + 8 + 4;
+    const TIME: usize = 8 + 4;
+    const OPT_TIME: usize = 1 + Self::TIME;
+
     fn with_capacity(payload_len: usize) -> Payload {
-        let mut record = Vec::with_capacity(13 + payload_len + 4);
-        record.resize(13, 0);
+        let mut record = Vec::with_capacity(Self::HEADER + payload_len + 4);
+        record.resize(Self::HEADER, 0);
         Payload(record)
     }
 
-    /// The record, framed as [`frame_record`] frames one, with job id 0.
-    fn frame(mut self, record_type: u8) -> Vec<u8> {
-        let payload_len = (self.0.len() - 13) as u32;
+    /// The framed record.
+    fn frame(mut self, record_type: u8, job_id: u64) -> Vec<u8> {
+        let payload_len = (self.0.len() - Self::HEADER) as u32;
         self.0[0] = record_type;
+        self.0[1..9].copy_from_slice(&job_id.to_le_bytes());
         self.0[9..13].copy_from_slice(&payload_len.to_le_bytes());
         let crc = crc32fast::hash(&self.0);
         self.0.extend_from_slice(&crc.to_le_bytes());
@@ -542,6 +525,11 @@ impl Payload {
     fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(&(b.len() as u32).to_le_bytes());
         self.0.extend_from_slice(b);
+    }
+
+    fn str16(&mut self, s: &str) {
+        self.0.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        self.0.extend_from_slice(s.as_bytes());
     }
 
     fn time(&mut self, t: Timestamp) {
@@ -575,6 +563,15 @@ impl<'a> PayloadReader<'a> {
 
     fn u32(&mut self) -> Result<u32, WalError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, WalError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn str16(&mut self) -> Result<String, WalError> {
+        let len = u16::from_le_bytes(self.take(2)?.try_into().unwrap());
+        String::from_utf8(self.take(len as usize)?.to_vec()).map_err(|_| WalError::InvalidData)
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], WalError> {
@@ -715,20 +712,10 @@ fn unframe_record(data: &[u8]) -> Result<(u64, &[u8], usize), WalError> {
 
 fn deserialize_tombstone(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
     let (job_id, payload, total_len) = unframe_record(data)?;
-    let mut off = 0;
-    let mut take = |n: usize| -> Result<&[u8], WalError> {
-        let bytes = payload.get(off..off + n).ok_or(WalError::InvalidData)?;
-        off += n;
-        Ok(bytes)
-    };
-    let expires_epoch_secs =
-        u64::from_le_bytes(take(8)?.try_into().map_err(|_| WalError::InvalidData)?);
-    let mut take_str = || -> Result<String, WalError> {
-        let len = u16::from_le_bytes(take(2)?.try_into().map_err(|_| WalError::InvalidData)?);
-        String::from_utf8(take(len as usize)?.to_vec()).map_err(|_| WalError::InvalidData)
-    };
-    let tube = take_str()?;
-    let key = take_str()?;
+    let mut r = PayloadReader(payload);
+    let expires_epoch_secs = r.u64()?;
+    let tube = r.str16()?;
+    let key = r.str16()?;
     Ok((
         WalRecord::Tombstone {
             job_id,
@@ -790,33 +777,7 @@ fn deserialize_schedule_fired(data: &[u8]) -> Result<(WalRecord, usize), WalErro
 }
 
 fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize), WalError> {
-    // type(1) + job_id(8) + payload_len(4) = 13 byte header minimum
-    if data.len() < 13 {
-        return Err(WalError::Truncated);
-    }
-
-    let job_id = u64::from_le_bytes(data[1..9].try_into().map_err(|_| WalError::Truncated)?);
-    let payload_len =
-        u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?) as usize;
-
-    let total_len = 1 + 8 + 4 + payload_len + 4; // +4 for CRC
-    if data.len() < total_len {
-        return Err(WalError::Truncated);
-    }
-
-    // Verify CRC
-    let stored_crc = u32::from_le_bytes(
-        data[total_len - 4..total_len]
-            .try_into()
-            .map_err(|_| WalError::Truncated)?,
-    );
-    let computed_crc = crc32fast::hash(&data[..total_len - 4]);
-    if stored_crc != computed_crc {
-        return Err(WalError::BadCrc);
-    }
-
-    // Parse payload
-    let payload = &data[13..13 + payload_len];
+    let (job_id, payload, total_len) = unframe_record(data)?;
     let mut off = 0;
 
     macro_rules! read_u32 {
@@ -1605,11 +1566,13 @@ impl Wal {
         // segment, so the mark survives every older segment being collected,
         // and replay can't hand out an id twice. The TOAST recovery point
         // follows for the same reason.
-        fd.write_all(&serialize_id_mark(self.max_job_id))?;
-        let mut opening_bytes = HEADER_SIZE + ID_MARK_RECORD_SIZE;
+        let id_mark = serialize_id_mark(self.max_job_id);
+        fd.write_all(&id_mark)?;
+        let mut opening_bytes = HEADER_SIZE + id_mark.len();
         if let Some(point) = self.toast_mark {
-            fd.write_all(&serialize_toast_mark(point))?;
-            opening_bytes += TOAST_MARK_RECORD_SIZE;
+            let toast_mark = serialize_toast_mark(point);
+            fd.write_all(&toast_mark)?;
+            opening_bytes += toast_mark.len();
         }
         // Make the header durable immediately. Without this, a crash any
         // time before the first sync leaves a 0-byte or partial file that
@@ -1695,43 +1658,20 @@ impl Wal {
     // --- Write operations ---
 
     pub fn write_put(&mut self, job: &mut Job) -> io::Result<()> {
-        #[cfg(test)]
-        self.injected_failure()?;
-        self.rotate_if_needed()?;
-
-        let record = serialize_full_job(job);
-        let record_len = record.len();
         self.max_job_id = self.max_job_id.max(job.id);
-
-        // Group commit: bytes go into the BufWriter and `dirty` is set, but
-        // no fsync happens here. The engine task batches the fsync across
-        // every write that landed since the last sync.
-        let file = self.current_file_mut()?;
-        let fd = file
-            .fd
-            .as_mut()
-            .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
-        fd.write_all(&record)?;
-        file.bytes_written += record_len;
-        let file_seq = file.seq;
-        self.total_disk_bytes += record_len as u64;
-        // Count the op before the decref below: the old file's zero-refs
-        // stamp must include this record, since this record is what
-        // supersedes it.
-        self.ops_written += 1;
+        let record = self.append(&serialize_full_job(job))?;
 
         // Update job's WAL tracking
         let old_seq = job.wal_seq();
         let old_used = job.wal_used;
-        job.set_wal_ref(file_seq, record_len);
+        job.set_wal_ref(record.seq, record.len as usize);
 
         // Decref old file
         if let Some(old) = old_seq {
             self.decref_file(old, old_used as usize);
         }
 
-        // Incref new file
-        self.incref_file(file_seq, record_len);
+        self.hold(record);
 
         // Reserve space for future state change (delete).
         // Only add a reservation for NEW jobs (old_seq is None).
@@ -1741,8 +1681,6 @@ impl Wal {
         if old_seq.is_none() {
             self.reserved_bytes += STATE_CHANGE_RECORD_SIZE as u64;
         }
-
-        self.dirty = true;
         Ok(())
     }
 
@@ -1755,10 +1693,6 @@ impl Wal {
         expiry_epoch_secs: u64,
         reason: StateChangeReason,
     ) -> io::Result<()> {
-        #[cfg(test)]
-        self.injected_failure()?;
-        self.rotate_if_needed()?;
-
         let delay_nanos = new_delay.as_nanos().min(u64::MAX as u128) as u64;
         // Stamp the wall-clock instant of this change so a delayed replay can
         // subtract the elapsed time (v7). For a release/kick-to-delayed, this
@@ -1767,7 +1701,7 @@ impl Wal {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let record = serialize_state_change(
+        self.append(&serialize_state_change(
             job.id,
             new_state,
             new_priority,
@@ -1775,21 +1709,7 @@ impl Wal {
             expiry_epoch_secs,
             reason,
             change_epoch_secs,
-        );
-        let record_len = record.len();
-
-        // Group commit: writes go to the BufWriter and `dirty` is set, but
-        // no fsync until the engine drains its channel and calls sync().
-        let file = self.current_file_mut()?;
-        let fd = file
-            .fd
-            .as_mut()
-            .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
-        fd.write_all(&record)?;
-        file.bytes_written += record_len;
-        self.total_disk_bytes += record_len as u64;
-        // Count the op before the delete-decref below (see write_put).
-        self.ops_written += 1;
+        ))?;
 
         // Release reservation
         self.reserved_bytes = self
@@ -1809,8 +1729,6 @@ impl Wal {
             // carry the full job body. Moving the ref would allow GC to delete
             // the FullJob's file, causing silent data loss on replay.
         }
-
-        self.dirty = true;
         Ok(())
     }
 
@@ -1828,33 +1746,9 @@ impl Wal {
         job_id: u64,
         expires_epoch_secs: u64,
     ) -> io::Result<Option<RecordRef>> {
-        #[cfg(test)]
-        self.injected_failure()?;
-        self.rotate_if_needed()?;
-
-        let record = serialize_tombstone(job_id, tube, key, expires_epoch_secs);
-        let record_len = record.len();
         self.max_job_id = self.max_job_id.max(job_id);
-        let file = self.current_file_mut()?;
-        let fd = file
-            .fd
-            .as_mut()
-            .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
-        fd.write_all(&record)?;
-        file.bytes_written += record_len;
-        let seq = file.seq;
-        self.total_disk_bytes += record_len as u64;
-        self.ops_written += 1;
-        self.dirty = true;
-
-        if expires_epoch_secs == 0 {
-            return Ok(None);
-        }
-        self.incref_file(seq, record_len);
-        Ok(Some(RecordRef {
-            seq,
-            len: record_len as u32,
-        }))
+        let record = self.append(&serialize_tombstone(job_id, tube, key, expires_epoch_secs))?;
+        Ok((expires_epoch_secs != 0).then(|| self.hold(record)))
     }
 
     /// Journal `owner`'s schedule set, replacing its earlier one and every
@@ -1877,11 +1771,7 @@ impl Wal {
             ));
         }
         let record = self.append(&serialize_schedule_set(owner, entries))?;
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        self.incref_file(record.seq, record.len as usize);
-        Ok(Some(record))
+        Ok((!entries.is_empty()).then(|| self.hold(record)))
     }
 
     /// Journal the last fire of `owner`'s entry `name`. It holds a reference
@@ -1894,11 +1784,15 @@ impl Wal {
         last_fire: Option<Timestamp>,
     ) -> io::Result<RecordRef> {
         let record = self.append(&serialize_schedule_fired(owner, name, last_fire))?;
-        self.incref_file(record.seq, record.len as usize);
-        Ok(record)
+        Ok(self.hold(record))
     }
 
-    /// Append `record` to the current segment, taking no reference.
+    /// Append `record` to the current segment, taking no reference. Every
+    /// record goes through here. Group commit: the bytes go into the
+    /// BufWriter and `dirty` is set, but nothing is fsynced until the
+    /// engine drains its channel and calls [`Wal::sync`]. The op is counted
+    /// before a caller decrefs what the record supersedes: that segment's
+    /// zero-refs stamp must include this record.
     fn append(&mut self, record: &[u8]) -> io::Result<RecordRef> {
         #[cfg(test)]
         self.injected_failure()?;
@@ -1930,6 +1824,13 @@ impl Wal {
     /// records has ended (an expired cooldown) or been rewritten elsewhere.
     pub fn release_record(&mut self, record: RecordRef) {
         self.decref_file(record.seq, record.len as usize);
+    }
+
+    /// Take a reference on `record`'s segment, keeping it from GC until
+    /// [`Wal::release_record`].
+    fn hold(&mut self, record: RecordRef) -> RecordRef {
+        self.incref_file(record.seq, record.len as usize);
+        record
     }
 
     fn incref_file(&mut self, seq: u64, used: usize) {
@@ -2280,11 +2181,10 @@ impl Wal {
                                     self.release_record(r);
                                 }
                                 if expires_epoch_secs > replay_epoch {
-                                    let record = RecordRef {
+                                    let record = self.hold(RecordRef {
                                         seq: *seq,
                                         len: consumed as u32,
-                                    };
-                                    self.incref_file(*seq, consumed);
+                                    });
                                     cooldowns.insert(
                                         slot,
                                         IdpTombstone {
@@ -2318,11 +2218,10 @@ impl Wal {
                                     keep
                                 });
                                 if !entries.is_empty() {
-                                    let record = RecordRef {
+                                    let record = self.hold(RecordRef {
                                         seq: *seq,
                                         len: consumed as u32,
-                                    };
-                                    self.incref_file(*seq, consumed);
+                                    });
                                     schedules.sets.insert(owner, (entries, record));
                                 }
                             }
@@ -2335,11 +2234,10 @@ impl Wal {
                                 // Written only for an entry its owner's set
                                 // holds; without the set there's no entry.
                                 if schedules.sets.contains_key(&owner) {
-                                    let record = RecordRef {
+                                    let record = self.hold(RecordRef {
                                         seq: *seq,
                                         len: consumed as u32,
-                                    };
-                                    self.incref_file(*seq, consumed);
+                                    });
                                     if let Some((_, old)) =
                                         schedules.stamps.insert((owner, name), (last_fire, record))
                                     {
