@@ -592,7 +592,7 @@ tuber put [OPTIONS] [BODY]
 | Option | Default | Description |
 |---|---|---|
 | `-t`, `--tube` | `default` | Tube name |
-| `-p`, `--pri` | `0` | Priority (0 is most urgent) |
+| `-p`, `--pri` | `65536` | Priority (0 is most urgent) |
 | `-d`, `--delay` | `0` | Delay in seconds before job becomes ready |
 | `--ttr` | `120` | Time-to-run in seconds |
 | `-i`, `--idp` | — | Idempotency key — `key` or `key:ttl` (TTL seconds keeps deduping after delete) |

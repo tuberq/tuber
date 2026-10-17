@@ -79,7 +79,7 @@ envelope:
 The CRC32 (`crc32fast`) covers everything from the type byte through the end
 of the payload — the CRC itself is excluded.
 
-### 0x01 — FullJob (v6)
+### 0x01 — FullJob (v6+)
 
 Written on `put`. Contains the complete job metadata plus a body section
 that is either inline bytes or a `BodyId` reference into the TOAST store.

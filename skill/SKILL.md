@@ -97,8 +97,8 @@ when the process exits.
 # Put a job into the default tube
 tuber-cli put "hello world"
 
-# Put into a specific tube with options (defaults: priority 0, delay 0, ttr 120)
-tuber-cli put --tube emails --priority 0 --delay 0 --ttr 120 "send user@example.com"
+# Put into a specific tube with options (defaults: priority 65536, delay 0, ttr 120)
+tuber-cli put --tube emails --priority 65536 --delay 0 --ttr 120 "send user@example.com"
 
 # Put from stdin -- ALL of stdin becomes ONE job body
 echo '{"user": "alice"}' | tuber-cli put --tube notifications
@@ -108,8 +108,8 @@ printf 'resize 1.jpg\nresize 2.jpg\n' | tuber put -t thumbs
 cat jobs.txt | tuber put -t batch
 ```
 
-`tuber put` takes `-t` tube, `-p`/`--pri`, `-d`/`--delay`, `--ttr` (default
-120), the tag flags below, and `-a`. It prints the raw protocol
+`tuber put` takes `-t` tube, `-p`/`--pri` (default 65536), `-d`/`--delay`,
+`--ttr` (default 120), the tag flags below, and `-a`. It prints the raw protocol
 reply per job (`INSERTED 7`, or `INSERTED 4 READY` for a dedup). A rejected
 put prints its error reply (`JOB_TOO_BIG`, `DRAINING`, `OUT_OF_MEMORY`, …) in
 that line's place; the rest of stdin is still put, and the run then exits 1
@@ -299,9 +299,9 @@ Each entry takes `name`, `tube`, `body` (a string is put verbatim; a JSON
 object or array is put as written, less whitespace), and exactly one of
 `cron` (with an optional `zone`), `every` (seconds, or `"10m"`, with an
 optional `offset`) or `spec` (as tuber reads it). Optional: `pri`, `delay`,
-`ttr` (defaults 65536, 0, 120, as tuber-gem has them; not `put`'s urgent
-priority 0), `idp`, `con`, `grp`, `aft` (the tag's value, e.g.
-`"con": "maintenance:2"`), and `catchup` (`"once"`, the default; `"never"` or
+`ttr` (defaults 65536, 0, 120, as tuber-gem and `put` have them), `idp`,
+`con`, `grp`, `aft` (the tag's value, e.g. `"con": "maintenance:2"`), and
+`catchup` (`"once"`, the default; `"never"` or
 `false`; or seconds). An unknown key is an error, so a misspelled `zone` can't
 silently mean UTC.
 
