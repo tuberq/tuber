@@ -33,7 +33,7 @@
 //! checksummed file of another version stops startup rather than being
 //! thrown away.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,10 @@ pub struct ScheduleRefs {
     sets: HashMap<String, RecordRef>,
     /// Last fires written since their owner's set, by owner then name.
     stamps: HashMap<String, HashMap<String, RecordRef>>,
+    /// Owners whose stored set holds entries restore dropped. Their next
+    /// commit writes the set even if it changes nothing in memory, or an
+    /// entry the app removed would come back once it parses again.
+    stale: HashSet<String>,
 }
 
 impl ScheduleRefs {
@@ -72,6 +76,7 @@ impl ScheduleRefs {
             for r in records {
                 let Some(mut entry) = stored_entry(&owner, &r.line, r.body, r.synced_at, r.last_fire)
                 else {
+                    refs.stale.insert(owner.clone());
                     continue;
                 };
                 if let Some((last_fire, stamp)) =
@@ -97,16 +102,17 @@ impl ScheduleRefs {
     /// Journal `owner`'s entries as `schedules` holds them now, releasing
     /// the records that supersedes.
     pub fn write_set(&mut self, wal: &mut Wal, schedules: &Schedules, owner: &str) -> io::Result<()> {
-        let records: Vec<ScheduleRecord> = schedules
+        let records: Vec<ScheduleRecord<&[u8]>> = schedules
             .owner_entries(owner)
             .map(|e| ScheduleRecord {
                 line: wire_line(&e.line, e.body.len()),
-                body: e.body.clone(),
+                body: e.body.as_slice(),
                 synced_at: e.synced_at,
                 last_fire: e.last_fire,
             })
             .collect();
         let set = wal.write_schedule_set(owner, &records)?;
+        self.stale.remove(owner);
         if let Some(old) = self.sets.remove(owner) {
             wal.release_record(old);
         }
@@ -139,8 +145,16 @@ impl ScheduleRefs {
         Ok(())
     }
 
+    /// Whether `owner`'s stored set holds entries memory doesn't.
+    pub fn is_stale(&self, owner: &str) -> bool {
+        self.stale.contains(owner)
+    }
+
     /// Owners with a record in segment `seq`, whose sets compaction must
-    /// rewrite for it to be collected.
+    /// rewrite for it to be collected. Compaction takes the oldest segment,
+    /// and a last fire is never older than its owner's set (writing a set
+    /// releases them), so an owner found by a last fire has its set there
+    /// too: rewriting just the last fires wouldn't free the segment.
     pub fn owners_in(&self, seq: u64) -> BTreeSet<String> {
         let sets = self.sets.iter().filter(|(_, r)| r.seq == seq);
         let stamps = self
@@ -281,6 +295,11 @@ pub fn set_aside_corrupt(dir: &Path) -> io::Result<PathBuf> {
         .expect("an unbounded range has a free name");
     fs::rename(&path, &aside)?;
     Ok(aside)
+}
+
+/// What an entry adds to its owner's schedule set record, at most.
+pub fn stored_size(line: &Line, body_len: usize) -> u64 {
+    crate::wal::schedule_entry_size(&wire_line(line, body_len), body_len) as u64
 }
 
 /// `line` as the `schedule-put` arguments that would recreate it.

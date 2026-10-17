@@ -4085,6 +4085,112 @@ fn a_schedule_commit_the_wal_cannot_take_is_an_internal_error() {
     assert!(s.schedules.get("app", "ping").is_some());
 }
 
+/// Sync `app` with an entry per body size, returning the first refusal or
+/// the commit's reply.
+fn sync_sized(s: &mut ServerState, c: u64, sizes: &[usize]) -> Response {
+    let resp = s.handle_command(c, Command::ScheduleBegin { owner: "app".into() }, None);
+    assert_eq!(resp, Response::Syncing("app".into()));
+    for (i, &len) in sizes.iter().enumerate() {
+        let line = format!("schedule-put e{i} jobs 0 0 60 {len} @yearly");
+        let cmd = protocol::parse_line(line.as_bytes()).unwrap();
+        let resp = s.handle_command(c, cmd, Some(vec![b'x'; len]));
+        if resp != Response::Staged {
+            s.handle_command(c, Command::ScheduleAbort, None);
+            return resp;
+        }
+    }
+    s.handle_command(c, Command::ScheduleCommit, None)
+}
+
+#[test]
+fn a_schedule_set_over_its_size_cap_is_refused() {
+    // An owner's set is one WAL record, written whole on every change. With
+    // or without a WAL, so a set that works without -b works with it.
+    let mut s = make_state();
+    let c = register(&mut s);
+    assert_eq!(sync_sized(&mut s, c, &[60_000; 140]), Response::OutOfMemory);
+    assert!(s.schedules.is_empty());
+    let resp = sync_sized(&mut s, c, &[60_000; 130]);
+    assert!(matches!(resp, Response::Synced(_)), "got {resp:?}");
+}
+
+#[test]
+fn a_schedule_commit_that_grows_its_set_needs_room_for_all_of_it() {
+    // The commit writes the whole set again, not just the entry it adds.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
+    let resp = sync_sized(&mut s, c, &[50_000; 40]);
+    assert!(matches!(resp, Response::Synced(_)), "got {resp:?}");
+    let wal = s.wal.as_ref().unwrap();
+    let (wal_bytes, reserve) = (wal.total_disk_bytes(), wal.max_file_size() as u64);
+    let used = wal_bytes + s.body_store.as_ref().unwrap().total_bytes();
+    // Room for the new entry, not for another copy of the set.
+    s.max_storage_bytes = Some(used + reserve + 1_000_000);
+    let mut grown = vec![50_000; 40];
+    grown.push(2);
+    assert_eq!(sync_sized(&mut s, c, &grown), Response::OutOfStorage);
+    // One that shrinks it still goes through, as a delete does.
+    let resp = sync_sized(&mut s, c, &[50_000; 39]);
+    assert!(matches!(resp, Response::Synced(_)), "got {resp:?}");
+}
+
+#[test]
+fn an_entry_dropped_at_startup_is_gone_from_the_wal_after_its_owner_s_next_sync() {
+    // An entry whose line no longer parses (its zone gone from tzdata, say)
+    // is dropped from memory but stays in the stored set. The app's next
+    // sync, without it, changes nothing in memory; it must still rewrite
+    // the set, or the removed entry comes back once it parses again.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let record = |line: &str| crate::wal::ScheduleRecord {
+        line: line.into(),
+        body: b"{}".to_vec(),
+        synced_at: jiff::Timestamp::now(),
+        last_fire: None,
+    };
+    let set = [record("ping jobs 0 0 60 2 every 60s"), record("gone jobs 0 0 60 2 never")];
+    s.wal.as_mut().unwrap().write_schedule_set("app", &set).unwrap();
+    assert!(s.sync_wal());
+    drop(s);
+
+    let mut s = reopen(dir.path());
+    assert!(s.schedules.get("app", "gone").is_none());
+    let c = register(&mut s);
+    s.handle_command(c, Command::ScheduleBegin { owner: "app".into() }, None);
+    let cmd = protocol::parse_line(b"schedule-put ping jobs 0 0 60 2 every 60s").unwrap();
+    s.handle_command(c, cmd, Some(b"{}".to_vec()));
+    let resp = s.handle_command(c, Command::ScheduleCommit, None);
+    let unchanged = crate::schedule::SyncCounts {
+        unchanged: 1,
+        ..Default::default()
+    };
+    assert_eq!(resp, Response::Synced(unchanged));
+    drop(s);
+
+    let mut wal = crate::wal::Wal::open(dir.path(), Default::default()).unwrap();
+    wal.replay().unwrap();
+    let lines: Vec<String> = wal.take_replayed_schedules().sets["app"]
+        .0
+        .iter()
+        .map(|r| r.line.clone())
+        .collect();
+    assert_eq!(lines, ["ping jobs 0 0 60 2 every 60s"]);
+}
+
+#[test]
+fn a_schedule_file_that_cannot_be_removed_does_not_stop_startup() {
+    // The WAL holds the schedules; removing the old files only tidies up.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("schedules.tmp")).unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "every 60s")]);
+    drop(s);
+    let s = reopen(dir.path());
+    assert!(s.schedules.get("app", "ping").is_some());
+}
+
 #[test]
 fn a_schedule_sync_that_only_respells_a_spec_reaches_the_wal() {
     let dir = tempfile::tempdir().unwrap();

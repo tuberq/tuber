@@ -240,9 +240,10 @@ pub struct IdpTombstone {
 /// `schedule-put` arguments, parsed back through the protocol parser on
 /// restore, so a restored entry passes exactly the checks a synced one did.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScheduleRecord {
+pub struct ScheduleRecord<B = Vec<u8>> {
     pub line: String,
-    pub body: Vec<u8>,
+    /// Owned when replayed; borrowed from the entry when written.
+    pub body: B,
     /// When its definition took effect.
     pub synced_at: Timestamp,
     pub last_fire: Option<Timestamp>,
@@ -477,38 +478,67 @@ pub fn serialize_toast_mark(point: DurablePoint) -> Vec<u8> {
 }
 
 /// A v9 schedule set record: `owner`'s entries, replacing its earlier set.
-pub fn serialize_schedule_set(owner: &str, entries: &[ScheduleRecord]) -> Vec<u8> {
-    let size = entries
-        .iter()
-        .map(|e| 4 + e.line.len() + 4 + e.body.len() + 12 + 13)
-        .sum::<usize>();
-    let mut p = Payload(Vec::with_capacity(4 + owner.len() + 4 + size));
+pub fn serialize_schedule_set<B: AsRef<[u8]>>(owner: &str, entries: &[ScheduleRecord<B>]) -> Vec<u8> {
+    let mut p = Payload::with_capacity(schedule_set_size(owner, entries));
     p.bytes(owner.as_bytes());
     p.0.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
         p.bytes(e.line.as_bytes());
-        p.bytes(&e.body);
+        p.bytes(e.body.as_ref());
         p.time(e.synced_at);
         p.opt_time(e.last_fire);
     }
-    frame_record(RECORD_TYPE_SCHEDULE_SET, 0, &p.0)
+    p.frame(RECORD_TYPE_SCHEDULE_SET)
+}
+
+/// The payload size of a schedule set record, at most.
+fn schedule_set_size<B: AsRef<[u8]>>(owner: &str, entries: &[ScheduleRecord<B>]) -> usize {
+    let entries: usize = entries
+        .iter()
+        .map(|e| schedule_entry_size(&e.line, e.body.as_ref().len()))
+        .sum();
+    4 + owner.len() + 4 + entries
+}
+
+/// What one entry adds to a schedule set record, at most: its line, its
+/// body, its sync time and its last fire.
+pub fn schedule_entry_size(line: &str, body_len: usize) -> usize {
+    4 + line.len() + 4 + body_len + 12 + 13
 }
 
 /// A v9 schedule fired record: the last fire of `owner`'s entry `name`.
 pub fn serialize_schedule_fired(owner: &str, name: &str, last_fire: Option<Timestamp>) -> Vec<u8> {
-    let mut p = Payload(Vec::with_capacity(4 + owner.len() + 4 + name.len() + 13));
+    let mut p = Payload::with_capacity(4 + owner.len() + 4 + name.len() + 13);
     p.bytes(owner.as_bytes());
     p.bytes(name.as_bytes());
     p.opt_time(last_fire);
-    frame_record(RECORD_TYPE_SCHEDULE_FIRED, 0, &p.0)
+    p.frame(RECORD_TYPE_SCHEDULE_FIRED)
 }
 
-/// Builds a schedule record's payload. Little-endian; bytes are
-/// `len:u32 + bytes`, a time `seconds:i64 nanos:i32`, an optional time a
-/// flag byte and then the time if the flag is 1.
+/// Builds a schedule record, its payload written after room for the
+/// header [`Payload::frame`] fills in, so a set's bodies are copied once.
+/// Little-endian; bytes are `len:u32 + bytes`, a time `seconds:i64
+/// nanos:i32`, an optional time a flag byte and then the time if the flag
+/// is 1.
 struct Payload(Vec<u8>);
 
 impl Payload {
+    fn with_capacity(payload_len: usize) -> Payload {
+        let mut record = Vec::with_capacity(13 + payload_len + 4);
+        record.resize(13, 0);
+        Payload(record)
+    }
+
+    /// The record, framed as [`frame_record`] frames one, with job id 0.
+    fn frame(mut self, record_type: u8) -> Vec<u8> {
+        let payload_len = (self.0.len() - 13) as u32;
+        self.0[0] = record_type;
+        self.0[9..13].copy_from_slice(&payload_len.to_le_bytes());
+        let crc = crc32fast::hash(&self.0);
+        self.0.extend_from_slice(&crc.to_le_bytes());
+        self.0
+    }
+
     fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(&(b.len() as u32).to_le_bytes());
         self.0.extend_from_slice(b);
@@ -1833,11 +1863,19 @@ impl Wal {
     /// carries it forward. An empty one, the owner's removal, holds none:
     /// it is only needed while an earlier set survives, and GC collects
     /// segments oldest first.
-    pub fn write_schedule_set(
+    pub fn write_schedule_set<B: AsRef<[u8]>>(
         &mut self,
         owner: &str,
-        entries: &[ScheduleRecord],
+        entries: &[ScheduleRecord<B>],
     ) -> io::Result<Option<RecordRef>> {
+        // A commit is capped far below this (`schedule::MAX_SET_BYTES`), but
+        // the files an earlier tuber left weren't.
+        if schedule_set_size(owner, entries) > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("schedules: {owner}'s set is too large for a WAL record"),
+            ));
+        }
         let record = self.append(&serialize_schedule_set(owner, entries))?;
         if entries.is_empty() {
             return Ok(None);
@@ -3380,7 +3418,7 @@ mod tests {
             wal.write_schedule_fired("splat", "a", Some(ts("2026-10-11T05:00:00Z")))
                 .unwrap();
             wal.write_schedule_set("booko", &[b]).unwrap();
-            wal.write_schedule_set("booko", &[]).unwrap();
+            wal.write_schedule_set::<Vec<u8>>("booko", &[]).unwrap();
             wal.sync().unwrap();
         }
         let mut wal = Wal::open(dir.path(), WalConfig::default()).unwrap();
@@ -3439,7 +3477,7 @@ mod tests {
         wal.release_record(set);
         wal.release_record(stamp);
         assert!(
-            wal.write_schedule_set("splat", &[]).unwrap().is_none(),
+            wal.write_schedule_set::<Vec<u8>>("splat", &[]).unwrap().is_none(),
             "an owner's removal holds none"
         );
         wal.write_put(&mut make_test_job(3, b"y")).unwrap();

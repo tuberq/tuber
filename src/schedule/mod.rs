@@ -24,6 +24,13 @@ use spec::Spec;
 /// per-tick scan bounded.
 pub const MAX_ENTRIES: usize = 10_000;
 
+/// Largest set one owner can sync, as stored. A set is one WAL record,
+/// written whole by each commit that changes it and by compaction, so this
+/// bounds those writes. Under the default WAL segment, the reserve
+/// `--max-storage-bytes` keeps for writes that always go through, such as
+/// a commit that shrinks a set.
+pub const MAX_SET_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Memory charged per entry against `--max-jobs-size`, beside its body and
 /// strings. Same order as a job's `JOB_OVERHEAD_BYTES`.
 const ENTRY_OVERHEAD_BYTES: u64 = 512;
@@ -144,6 +151,8 @@ pub struct Staging {
     /// `memory_cost` of the owner's entries when the sync began: what a
     /// commit will free, so staging up to it needs no new room.
     pub held_bytes: u64,
+    /// `store::stored_size` of everything staged: what the commit writes.
+    pub stored: u64,
 }
 
 impl Staging {
@@ -154,6 +163,7 @@ impl Staging {
             poisoned: false,
             bytes: 0,
             held_bytes,
+            stored: 0,
         }
     }
 
@@ -178,10 +188,13 @@ impl Staging {
         let growth = (self.bytes + cost).saturating_sub(self.held_bytes);
         let over_budget =
             limit.is_some_and(|limit| in_use.saturating_sub(self.bytes) + growth > limit);
-        if self.entries.len() >= MAX_ENTRIES || over_budget {
+        let stored = store::stored_size(&line, body.len());
+        if self.entries.len() >= MAX_ENTRIES || over_budget || self.stored + stored > MAX_SET_BYTES
+        {
             return Err(Response::OutOfMemory);
         }
         self.bytes += cost;
+        self.stored += stored;
         self.entries.insert(line.name.clone(), (line, body));
         Ok(cost)
     }

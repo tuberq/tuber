@@ -70,13 +70,13 @@ impl ServerState {
         // Only a commit that grows the owner's set needs room. One that keeps
         // or shrinks it always goes through, as a delete does on a full
         // queue — otherwise a full disk would stop an app removing an entry.
-        // (An entry's memory cost over-estimates its share of the file.)
+        // On disk it needs room for the whole set, which it writes again.
         let growth = sync.bytes.saturating_sub(held_bytes);
         if growth > 0 {
             if self.memory_limit_exceeded(growth) {
                 return Response::OutOfMemory;
             }
-            if self.storage_limit_exceeded(growth) {
+            if self.storage_limit_exceeded(sync.stored) {
                 return Response::OutOfStorage;
             }
         }
@@ -85,9 +85,10 @@ impl ServerState {
         // Durable before the reply. On failure the new set stands in memory
         // and the client hears INTERNAL_ERROR, as a put whose WAL write
         // fails does; the WAL is dropped, so a restart restores the set last
-        // written. A commit that changes nothing writes nothing, but once
-        // the WAL has failed none can be kept.
-        let unsaved = self.schedules.take_unsaved();
+        // written. A commit that changes nothing writes nothing, unless the
+        // stored set holds entries startup dropped; and once the WAL has
+        // failed none can be kept.
+        let unsaved = self.schedules.take_unsaved() || self.schedule_refs.is_stale(&owner);
         if (unsaved || self.wal_failed) && !(self.journal_schedule_set(&owner) && self.sync_wal())
         {
             tracing::error!(owner, "schedule sync not persisted");
@@ -147,8 +148,6 @@ impl ServerState {
             let (refs, schedules) = schedule::store::ScheduleRefs::restore(wal, replayed);
             self.schedule_refs = refs;
             self.schedules = schedules;
-            // Left by a crash before a move into the WAL removed them.
-            schedule::store::remove_files(dir)?;
         } else {
             let files = match schedule::store::read_files(dir) {
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -179,7 +178,12 @@ impl ServerState {
                     self.schedules.len()
                 );
             }
-            schedule::store::remove_files(dir)?;
+        }
+        // Moved, or left by a crash before a move removed them. The WAL
+        // holds the schedules now, so one that won't go only needs a word;
+        // the next start tries again.
+        if let Err(e) = schedule::store::remove_files(dir) {
+            tracing::warn!("schedules: could not remove the old schedule files: {e}");
         }
         if !self.schedules.is_empty() {
             tracing::info!("schedules: restored {} entries from {:?}", self.schedules.len(), dir);
