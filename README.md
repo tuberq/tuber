@@ -223,6 +223,8 @@ put 0 0 30 5 idp:report:300
 
 After the cooldown expires, the key is freed and a new job will be created. `idp:key` (no TTL) keeps the original behaviour — key removed immediately on delete.
 
+Deleting a buried job, or clearing it with `flush-buried`, starts no cooldown. A buried job failed, and deleting it gives up on it rather than finishing it, so a `put` that sends it again queues a new job. A buried job that is kicked and then deleted after running starts one as usual.
+
 ### Job Groups (Fan-out / Fan-in)
 
 Group related jobs together with `grp:` and chain dependent work with `aft:`. After-jobs are held until every job in the group they depend on has been deleted:

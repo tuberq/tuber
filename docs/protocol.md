@@ -13,7 +13,7 @@ Optional extension tags (space-separated, after `<bytes>`):
 
 | Tag | Description |
 |---|---|
-| `idp:<key>` or `idp:<key>:<ttl>` | Idempotency key. Deduplicates within the tube — if a live job with the same key exists, returns the original ID and state. Optional TTL (seconds) keeps deduplicating after the job is deleted. |
+| `idp:<key>` or `idp:<key>:<ttl>` | Idempotency key. Deduplicates within the tube — if a live job with the same key exists, returns the original ID and state. Optional TTL (seconds) keeps deduplicating after the job is deleted, unless it was buried when deleted (by `delete` or `flush-buried`). |
 | `grp:<name>` | Assign the job to a named group for fan-out/fan-in. |
 | `aft:<name>` | Hold the job until all jobs in the named group are deleted. The group is checked when the job is put, or when its delay is up; once released, the job isn't held again. |
 | `con:<key>` or `con:<key>:<N>` | Concurrency key. Limits parallel reservations sharing this key, in any tube. Default limit is 1. Jobs with different limits for one key get the smallest declared by any of them that is ready or reserved. |
@@ -337,7 +337,8 @@ Response: `FLUSHED <count>\r\n`
 ### flush-buried \<tube\>\r\n
 
 Delete all buried jobs from a tube. Ready, delayed, and reserved jobs are left
-untouched. Like `flush-tube`, an absent tube yields `FLUSHED 0`.
+untouched. Like `flush-tube`, an absent tube yields `FLUSHED 0`. Like `delete`
+of a buried job, it starts no `idp:` cooldown.
 
 Response: `FLUSHED <count>\r\n`
 

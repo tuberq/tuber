@@ -1583,6 +1583,83 @@ fn cooldowns_restored_from_the_wal_still_end_on_time() {
     assert_cooldown_index_matches(&s);
 }
 
+fn put_idp(s: &mut ServerState, c: u64, key: &str, ttl: u32) -> Response {
+    s.handle_command(
+        c,
+        Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 1,
+            idempotency_key: Some((key.into(), ttl)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        },
+        Some(b"x".to_vec()),
+    )
+}
+
+/// Put an `idp:<key>:3600` job, then reserve and bury it.
+fn bury_idp(s: &mut ServerState, c: u64, key: &str) -> u64 {
+    let Response::Inserted(id) = put_idp(s, c, key, 3600) else {
+        panic!("put {key}")
+    };
+    s.handle_command(c, Command::ReserveJob { id }, None);
+    let resp = s.handle_command(c, Command::Bury { id, pri: 0 }, None);
+    assert_eq!(resp, Response::Buried);
+    id
+}
+
+#[test]
+fn deleting_a_buried_job_starts_no_cooldown() {
+    // A buried job failed, and deleting it gives up on it. A cooldown made
+    // a put sending it again a duplicate of a job that never succeeded:
+    // answered INSERTED <id> DELETED, with nothing queued.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let id = bury_idp(&mut s, c, "k");
+    let resp = s.handle_command(c, Command::Delete { id }, None);
+    assert_eq!(resp, Response::Deleted);
+    assert!(s.tubes["default"].idempotency_cooldowns.is_empty());
+    let again = put_idp(&mut s, c, "k", 3600);
+    assert_ne!(again, Response::InsertedDup(id, "DELETED", None));
+    assert!(matches!(again, Response::Inserted(_)), "{again:?}");
+}
+
+#[test]
+fn flush_buried_starts_no_cooldowns() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    bury_idp(&mut s, c, "k0");
+    bury_idp(&mut s, c, "k1");
+    let tube = "default".to_string();
+    assert_eq!(
+        s.handle_command(c, Command::FlushBuried { tube }, None),
+        Response::Flushed(2)
+    );
+    assert!(s.tubes["default"].idempotency_cooldowns.is_empty());
+    let again = put_idp(&mut s, c, "k0", 3600);
+    assert!(matches!(again, Response::Inserted(_)), "{again:?}");
+}
+
+#[test]
+fn a_buried_job_kicked_and_finished_starts_a_cooldown() {
+    // Only giving up on a failure skips the cooldown. A job kicked back
+    // and run to completion is deleted while reserved, as any other.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let id = bury_idp(&mut s, c, "k");
+    s.handle_command(c, Command::KickJob { id }, None);
+    s.handle_command(c, Command::ReserveJob { id }, None);
+    let resp = s.handle_command(c, Command::Delete { id }, None);
+    assert_eq!(resp, Response::Deleted);
+    assert_eq!(
+        put_idp(&mut s, c, "k", 3600),
+        Response::InsertedDup(id, "DELETED", None)
+    );
+}
+
 #[test]
 fn the_cooldown_index_matches_the_cooldowns_under_random_ops() {
     // Puts that start, dedup against or replace cooldowns, flushes, expiry

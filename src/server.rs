@@ -2093,12 +2093,14 @@ impl ServerState {
         }
         self.stats.total_delete_ct += 1;
 
-        // Remove idempotency key from tube index (with optional cooldown)
+        // Remove idempotency key from tube index (with optional cooldown).
+        // A buried job failed, and deleting it gives up on it rather than
+        // finishing it, so a put sending it again should queue it.
         if let Some(ref key_tuple) = idempotency_key {
             if let Some(tube) = self.tubes.get_mut(&*tube_name) {
                 tube.idempotency_keys.remove(&key_tuple.0);
             }
-            if key_tuple.1 > 0 {
+            if key_tuple.1 > 0 && state != JobState::Buried {
                 let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
                 self.record_tombstone(&tube_name, key_tuple.0.as_str().into(), id, expires_at);
             }
@@ -2346,16 +2348,12 @@ impl ServerState {
             };
             deleted += 1;
 
-            // Idempotency key: drop the index entry, optionally leave a cooldown
-            // tombstone (mirror cmd_delete:1452-1466).
-            if let Some(ref key_tuple) = idempotency_key {
-                if let Some(tube) = self.tubes.get_mut(tube_name) {
-                    tube.idempotency_keys.remove(&key_tuple.0);
-                }
-                if key_tuple.1 > 0 {
-                    let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
-                    self.record_tombstone(tube_name, key_tuple.0.as_str().into(), id, expires_at);
-                }
+            // Idempotency key: drop the index entry. No cooldown, as for
+            // `delete` of a buried job: these failed and are given up on.
+            if let Some(ref key_tuple) = idempotency_key
+                && let Some(tube) = self.tubes.get_mut(tube_name)
+            {
+                tube.idempotency_keys.remove(&key_tuple.0);
             }
 
             // Group tracking (mirror cmd_delete:1467-1479).
