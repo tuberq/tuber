@@ -1442,6 +1442,213 @@ fn test_idempotency_ttl_flush_clears_cooldowns() {
     assert!(matches!(resp, Response::Inserted(2)));
 }
 
+/// Put a job with `idp:<key>:<ttl>` on `tube`, then reserve and delete it,
+/// starting the key's cooldown there.
+fn start_cooldown(s: &mut ServerState, c: u64, tube: &str, key: &str, ttl: u32) {
+    s.handle_command(c, Command::Use { tube: tube.into() }, None);
+    let resp = s.handle_command(
+        c,
+        Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 10,
+            bytes: 1,
+            idempotency_key: Some((key.into(), ttl)),
+            group: None,
+            after_group: None,
+            concurrency_key: None,
+        },
+        Some(b"x".to_vec()),
+    );
+    let Response::Inserted(id) = resp else {
+        panic!("put {key}: {resp:?}")
+    };
+    s.handle_command(c, Command::ReserveJob { id }, None);
+    let resp = s.handle_command(c, Command::Delete { id }, None);
+    assert_eq!(resp, Response::Deleted);
+}
+
+fn cooldowns_looked_at(f: impl FnOnce()) -> u64 {
+    let before = COOLDOWNS_LOOKED_AT.with(|n| n.get());
+    f();
+    COOLDOWNS_LOOKED_AT.with(|n| n.get()) - before
+}
+
+#[test]
+fn a_tick_doesnt_look_at_cooldowns_still_running() {
+    // Each 100 ms tick checked every idp: cooldown for expiry: with a
+    // million, several percent of a core while idle, and commands waited
+    // behind it.
+    let mut s = make_state();
+    let c = register(&mut s);
+    for i in 0..10_000 {
+        start_cooldown(&mut s, c, "default", &format!("k{i}"), 3600);
+    }
+    let n = cooldowns_looked_at(|| s.tick());
+    assert!(n < 10, "a tick looked at {n} cooldowns");
+    assert_eq!(s.tubes["default"].idempotency_cooldowns.len(), 10_000);
+}
+
+/// Move `key`'s cooldown in `tube` to have ended a second ago. The copy has
+/// no WAL record, since replacing the cooldown releases the original's.
+fn expire_cooldown(s: &mut ServerState, tube: &str, key: &str) {
+    let cooldown = s.tubes[tube].idempotency_cooldowns[key];
+    let expires_at = SystemTime::now() - Duration::from_secs(1);
+    let ended = Cooldown {
+        expires_at,
+        record: None,
+        ..cooldown
+    };
+    s.insert_tombstone(tube, key.into(), ended);
+}
+
+fn cooldown_keys(s: &ServerState, tube: &str) -> Vec<String> {
+    let mut keys: Vec<String> = s.tubes[tube]
+        .idempotency_cooldowns
+        .keys()
+        .map(|k| k.to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn a_tick_ends_the_cooldowns_that_have_expired_and_no_others() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    for key in ["k0", "k1", "k2", "k3"] {
+        start_cooldown(&mut s, c, "default", key, 3600);
+    }
+    for key in ["j0", "j1"] {
+        start_cooldown(&mut s, c, "other", key, 3600);
+    }
+    expire_cooldown(&mut s, "default", "k1");
+    expire_cooldown(&mut s, "default", "k3");
+    expire_cooldown(&mut s, "other", "j0");
+
+    s.tick();
+    assert_eq!(cooldown_keys(&s, "default"), ["k0", "k2"]);
+    assert_eq!(cooldown_keys(&s, "other"), ["j1"]);
+    assert_eq!(s.total_job_bytes, recompute_total_job_bytes(&s));
+    assert_cooldown_index_matches(&s);
+}
+
+/// The tick finds expired cooldowns only through `cooldown_expiry`, so it
+/// must hold exactly the tubes' cooldowns.
+fn assert_cooldown_index_matches(s: &ServerState) {
+    let mut want: Vec<_> = s
+        .tubes
+        .values()
+        .flat_map(|t| {
+            t.idempotency_cooldowns
+                .iter()
+                .map(|(k, c)| (c.expires_at, t.name.clone(), k.clone()))
+        })
+        .collect();
+    want.sort();
+    let got: Vec<_> = s.cooldown_expiry.iter().cloned().collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn cooldowns_restored_from_the_wal_still_end_on_time() {
+    // A restart rebuilds the cooldowns from their WAL records; the tick can
+    // only end the ones it finds in the index.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = make_wal_state(dir.path(), Duration::ZERO);
+    let c = register(&mut s);
+    for key in ["k0", "k1"] {
+        start_cooldown(&mut s, c, "default", key, 3600);
+    }
+    s.wal.as_mut().unwrap().sync().unwrap();
+    drop(s);
+
+    let mut s = build_state(StateConfig {
+        max_job_size: 65535,
+        max_job_bytes: None,
+        max_storage_bytes: Some(1 << 30),
+        wal_dir: Some(dir.path()),
+        sync_interval: Duration::ZERO,
+        migrate_wal: false,
+        wal_skip_corrupt: false,
+        name: None,
+        fd_budget: Arc::new(FdBudget::new(Some(0))),
+    })
+    .unwrap();
+    assert_eq!(cooldown_keys(&s, "default"), ["k0", "k1"]);
+    assert_cooldown_index_matches(&s);
+    expire_cooldown(&mut s, "default", "k1");
+    s.tick();
+    assert_eq!(cooldown_keys(&s, "default"), ["k0"]);
+    assert_cooldown_index_matches(&s);
+}
+
+#[test]
+fn the_cooldown_index_matches_the_cooldowns_under_random_ops() {
+    // Puts that start, dedup against or replace cooldowns, flushes, expiry
+    // and ticks, across two tubes sharing keys. After every step the index
+    // holds exactly the tubes' cooldowns, and the memory count matches.
+    const TUBES: [&str; 2] = ["default", "other"];
+    for seed in 1..=8u64 {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut s = make_state();
+        let c = register(&mut s);
+        for step in 0..1000 {
+            let tube = TUBES[next(2) as usize];
+            let key = format!("k{}", next(6));
+            match next(10) {
+                0..=4 => {
+                    // A put with a running cooldown dedups; one whose cooldown
+                    // has ended replaces it. Either way the job, if any, is
+                    // deleted, starting a cooldown unless the ttl is 0.
+                    s.handle_command(c, Command::Use { tube: tube.into() }, None);
+                    let ttl = [0, 60, 3600][next(3) as usize];
+                    let resp = s.handle_command(
+                        c,
+                        Command::Put {
+                            pri: 0,
+                            delay: 0,
+                            ttr: 10,
+                            bytes: 1,
+                            idempotency_key: Some((key, ttl)),
+                            group: None,
+                            after_group: None,
+                            concurrency_key: None,
+                        },
+                        Some(b"x".to_vec()),
+                    );
+                    if let Response::Inserted(id) = resp {
+                        s.handle_command(c, Command::ReserveJob { id }, None);
+                        s.handle_command(c, Command::Delete { id }, None);
+                    }
+                }
+                5..=6 => {
+                    let cooldowns = s.tubes.get(tube).map(|t| &t.idempotency_cooldowns);
+                    if cooldowns.is_some_and(|m| m.contains_key(key.as_str())) {
+                        expire_cooldown(&mut s, tube, &key);
+                    }
+                }
+                7..=8 => s.tick(),
+                _ => {
+                    s.handle_command(c, Command::FlushTube { tube: tube.into() }, None);
+                }
+            }
+            assert_cooldown_index_matches(&s);
+            assert_eq!(
+                s.total_job_bytes,
+                recompute_total_job_bytes(&s),
+                "seed {seed} step {step}"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_idempotency_dedup_returns_ready_state() {
     let mut s = make_state();
@@ -2320,11 +2527,11 @@ fn test_memory_limit_allows_reserve_at_capacity() {
 
 #[test]
 fn test_memory_limit_put_with_idp_accounts_for_tombstone() {
-    // A 5-byte body + 512 job overhead + "k1" tombstone (2 + 128 = 130)
-    // = 647. Allow exactly that, put once. Then put a second fresh idp:
-    // 5 + 512 = 517 of job + "k2" 2 + 128 = 130 of tombstone = 647 more.
-    // Budget of 647 fits exactly one such put, second must fail.
-    let mut s = make_state_with_limit(Some(647));
+    // A 5-byte body + 512 job overhead + "k1" tombstone (2 + 256 = 258)
+    // = 775. Allow exactly that, put once. Then put a second fresh idp:
+    // 5 + 512 = 517 of job + "k2" 2 + 256 = 258 of tombstone = 775 more.
+    // Budget of 775 fits exactly one such put, second must fail.
+    let mut s = make_state_with_limit(Some(775));
     let c = register(&mut s);
 
     let cmd_idp1 = Command::Put {

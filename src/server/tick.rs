@@ -200,21 +200,19 @@ impl ServerState {
         // Try to fulfill remaining waiters with newly ready jobs
         self.process_queue();
 
-        // Clean up expired idempotency cooldowns (with memory accounting).
+        // End expired idempotency cooldowns (with memory accounting), soonest
+        // first, stopping at the first still running.
         let sys_now = SystemTime::now();
-        let expired: Vec<(String, String)> = self
-            .tubes
-            .iter()
-            .flat_map(|(tube_name, tube)| {
-                tube.idempotency_cooldowns
-                    .iter()
-                    .filter(|(_, cooldown)| cooldown.expires_at <= sys_now)
-                    .map(|(k, _)| (tube_name.clone(), k.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for (tube_name, key) in expired {
-            self.remove_tombstone(&tube_name, &key);
+        while let Some((expires_at, ..)) = self.cooldown_expiry.first() {
+            #[cfg(test)]
+            COOLDOWNS_LOOKED_AT.with(|n| n.set(n.get() + 1));
+            if *expires_at > sys_now {
+                break;
+            }
+            // Off the index first, so the loop ends whatever the tube holds.
+            if let Some((_, tube_name, key)) = self.cooldown_expiry.pop_first() {
+                self.remove_tombstone(&tube_name, &key);
+            }
         }
 
         // Memory-accounting drift detector.
@@ -226,13 +224,7 @@ impl ServerState {
         // (so they can alert on `rate(tuber_accounting_drift_events_total
         // [5m]) > 0`), and self-heal by resetting — a permanent leak is
         // worse than a one-off warning.
-        if self.total_job_bytes != 0
-            && self.jobs.is_empty()
-            && self
-                .tubes
-                .values()
-                .all(|t| t.idempotency_cooldowns.is_empty())
-        {
+        if self.total_job_bytes != 0 && self.jobs.is_empty() && self.cooldown_expiry.is_empty() {
             tracing::warn!(
                 "memory accounting drift: total_job_bytes={} with no live \
                  jobs or tombstones — resetting to 0. This is a tuber bug; \
@@ -294,7 +286,7 @@ impl ServerState {
             // Live cooldowns in the target segment hold references on it
             // too. Rewrite each into the current segment, then release the
             // old record, so the segment can be collected.
-            let migrate_cooldowns: Vec<(String, String, Cooldown)> = self
+            let migrate_cooldowns: Vec<(String, Arc<str>, Cooldown)> = self
                 .tubes
                 .iter()
                 .flat_map(|(tube_name, tube)| {
@@ -482,7 +474,7 @@ impl ServerState {
             self.ensure_tube(&tombstone.tube_name);
             self.insert_tombstone(
                 &tombstone.tube_name,
-                tombstone.key,
+                tombstone.key.into(),
                 Cooldown {
                     job_id: tombstone.job_id,
                     expires_at: tombstone.expires_at,

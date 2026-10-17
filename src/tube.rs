@@ -368,7 +368,8 @@ pub struct Tube {
     pub buried: VecDeque<u64>,
     pub stat: TubeStats,
     pub idempotency_keys: HashMap<String, u64>,
-    pub idempotency_cooldowns: HashMap<String, Cooldown>,
+    /// Keyed by the same `Arc` as the key's entry in `ServerState::cooldown_expiry`.
+    pub idempotency_cooldowns: HashMap<Arc<str>, Cooldown>,
     pub using_ct: u32,
     pub watching_ct: u32,
     pub pause: Duration,

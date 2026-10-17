@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,8 +34,11 @@ const FAIR_EWMA_FLOOR: f64 = 0.01;
 /// If `struct Job` in src/job.rs grows significantly, revisit this constant.
 const JOB_OVERHEAD_BYTES: u64 = 512;
 
-/// Fixed memory overhead per idempotency-cooldown tombstone.
-const TOMBSTONE_OVERHEAD_BYTES: u64 = 128;
+/// Fixed memory overhead per idempotency-cooldown tombstone, beyond its key:
+/// its entry in the tube's cooldown map and in `cooldown_expiry`, and the
+/// key's shared allocation. Measured at ~265 B each with a million 7-byte
+/// keys, about 105 of it the expiry index.
+const TOMBSTONE_OVERHEAD_BYTES: u64 = 256;
 
 /// Minimum number of processing time samples before weighted-fair uses EWMA.
 /// Below this threshold, raw weights are used.
@@ -397,6 +400,13 @@ thread_local! {
     static TUBES_LOOKED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// How many `idp:` cooldowns the tick checked for expiry, so tests can tell
+// work proportional to the expired ones from work proportional to all.
+#[cfg(test)]
+thread_local! {
+    static COOLDOWNS_LOOKED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// All server state, owned by the engine task.
 struct ServerState {
     // Box<Job> keeps table slots at 16 bytes: empty-slot slack and the
@@ -452,6 +462,10 @@ struct ServerState {
     hostname: String,
     os: String,
     platform: String,
+    /// Every `idp:` cooldown as (expires_at, tube, key), soonest first, so
+    /// the tick ends the expired ones without looking at the rest. Kept in
+    /// step with the tubes' `idempotency_cooldowns` by the tombstone helpers.
+    cooldown_expiry: BTreeSet<(SystemTime, Arc<str>, Arc<str>)>,
     /// Job group tracking for grp:/aft: features.
     groups: HashMap<String, GroupState>,
     /// Active reservation count per concurrency key.
@@ -587,6 +601,7 @@ impl ServerState {
             hostname,
             os,
             platform,
+            cooldown_expiry: BTreeSet::new(),
             groups: HashMap::new(),
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
@@ -836,19 +851,24 @@ impl ServerState {
 
     /// Put a cooldown in memory. `cooldown.record` is its WAL record, if it
     /// has one; see [`ServerState::record_tombstone`] to write one.
-    fn insert_tombstone(&mut self, tube_name: &str, key: String, cooldown: Cooldown) {
+    fn insert_tombstone(&mut self, tube_name: &str, key: Arc<str>, cooldown: Cooldown) {
+        let Some(tube) = self.tubes.get_mut(tube_name) else {
+            return;
+        };
         let cost = Self::tombstone_memory_cost(&key);
         self.total_job_bytes = self.total_job_bytes.saturating_add(cost);
-        let replaced = self
-            .tubes
-            .get_mut(tube_name)
-            .and_then(|tube| tube.idempotency_cooldowns.insert(key, cooldown));
+        let replaced = tube.idempotency_cooldowns.insert(key.clone(), cooldown);
+        let tube_name = tube.name.clone();
         // Replacing an existing tombstone is net-zero on memory; its record
         // is superseded by the new one.
         if let Some(old) = replaced {
             self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            self.cooldown_expiry
+                .remove(&(old.expires_at, tube_name.clone(), key.clone()));
             self.release_wal_record(old.record);
         }
+        self.cooldown_expiry
+            .insert((cooldown.expires_at, tube_name, key));
     }
 
     /// Start a cooldown for `key` and persist it as a WAL tombstone record,
@@ -857,7 +877,7 @@ impl ServerState {
     fn record_tombstone(
         &mut self,
         tube_name: &str,
-        key: String,
+        key: Arc<str>,
         job_id: u64,
         expires_at: SystemTime,
     ) {
@@ -894,13 +914,14 @@ impl ServerState {
     /// End a cooldown that has expired. Its WAL record needs no successor:
     /// replay ignores an expired tombstone.
     fn remove_tombstone(&mut self, tube_name: &str, key: &str) {
-        let removed = self
-            .tubes
-            .get_mut(tube_name)
-            .and_then(|tube| tube.idempotency_cooldowns.remove(key));
-        if let Some(cooldown) = removed {
-            let cost = Self::tombstone_memory_cost(key);
+        let Some(tube) = self.tubes.get_mut(tube_name) else {
+            return;
+        };
+        if let Some((key, cooldown)) = tube.idempotency_cooldowns.remove_entry(key) {
+            let cost = Self::tombstone_memory_cost(&key);
             self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            self.cooldown_expiry
+                .remove(&(cooldown.expires_at, tube.name.clone(), key));
             self.release_wal_record(cooldown.record);
         }
     }
@@ -909,13 +930,16 @@ impl ServerState {
     /// updating accounting. Each one gets a WAL record clearing it, or
     /// replay would bring it back from the record that started it.
     fn drain_tombstones_in_tube(&mut self, tube_name: &str) {
-        let drained: Vec<(String, Cooldown)> = match self.tubes.get_mut(tube_name) {
-            Some(tube) => tube.idempotency_cooldowns.drain().collect(),
-            None => return,
+        let Some(tube) = self.tubes.get_mut(tube_name) else {
+            return;
         };
+        let tube_arc = tube.name.clone();
+        let drained: Vec<(Arc<str>, Cooldown)> = tube.idempotency_cooldowns.drain().collect();
         for (key, cooldown) in drained {
             let cost = Self::tombstone_memory_cost(&key);
             self.total_job_bytes = self.total_job_bytes.saturating_sub(cost);
+            self.cooldown_expiry
+                .remove(&(cooldown.expires_at, tube_arc.clone(), key.clone()));
             if let Some(wal) = self.wal.as_mut()
                 && let Err(e) = wal.write_tombstone(tube_name, &key, cooldown.job_id, 0)
             {
@@ -929,7 +953,7 @@ impl ServerState {
     /// record of its own, and sync it. Until then it depends on the old
     /// segment holding its job's put record, which GC may collect at once.
     fn persist_legacy_cooldowns(&mut self) {
-        let legacy: Vec<(String, String, Cooldown)> = self
+        let legacy: Vec<(String, Arc<str>, Cooldown)> = self
             .tubes
             .iter()
             .flat_map(|(tube_name, tube)| {
@@ -1474,7 +1498,7 @@ impl ServerState {
             let cooldown = self
                 .tubes
                 .get(&tube_name)
-                .and_then(|t| t.idempotency_cooldowns.get(&key_tuple.0).copied());
+                .and_then(|t| t.idempotency_cooldowns.get(key_tuple.0.as_str()).copied());
             if let Some(Cooldown {
                 job_id: original_id,
                 expires_at: expiry,
@@ -2076,7 +2100,7 @@ impl ServerState {
             }
             if key_tuple.1 > 0 {
                 let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
-                self.record_tombstone(&tube_name, key_tuple.0.clone(), id, expires_at);
+                self.record_tombstone(&tube_name, key_tuple.0.as_str().into(), id, expires_at);
             }
         }
         if let Some(ref grp) = group_name
@@ -2330,7 +2354,7 @@ impl ServerState {
                 }
                 if key_tuple.1 > 0 {
                     let expires_at = SystemTime::now() + Duration::from_secs(key_tuple.1 as u64);
-                    self.record_tombstone(tube_name, key_tuple.0.clone(), id, expires_at);
+                    self.record_tombstone(tube_name, key_tuple.0.as_str().into(), id, expires_at);
                 }
             }
 
