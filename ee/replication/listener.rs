@@ -1,6 +1,9 @@
 //! The primary's replication listener, and the `server` flag that starts
 //! it.
 //!
+//! Replication is experimental: the flag is hidden from `--help`, and the
+//! server warns as much at startup and on every replica connection.
+//!
 //! With `--replication-listen ADDR`, a replica connects, sends the position
 //! it last applied (`0:0` to bootstrap), receives a catch-up scan from the
 //! primary's WAL and then the live tee — one seamless stream, overlap
@@ -25,14 +28,16 @@ use super::ship::{ServeEnd, ServeError, Shipper};
 /// for a shipping hiccup, not sustained slowness.
 const TEE_CAPACITY: usize = 4096;
 
-/// `server` with the replication flags added.
+/// `server` with the replication flags added, hidden from `--help` while
+/// replication is experimental. The flag and its env var still work.
 pub fn with_flags(server: Command) -> Command {
     server.arg(
         Arg::new("replication_listen")
             .long("replication-listen")
             .env("TUBER_REPLICATION_LISTEN")
             .value_name("ADDR")
-            .help("Serve WAL replication to a replica on ADDR (host:port); needs --binlog-dir"),
+            .help("Serve WAL replication to a replica on ADDR (host:port); needs --binlog-dir")
+            .hide(true),
     )
 }
 
@@ -51,6 +56,10 @@ pub fn configure(server: &ArgMatches, config: &mut ServerConfig) -> Result<(), H
         .map_err(|e| format!("replication listener can't bind {addr}: {e}"))?;
     listener.set_nonblocking(true)?;
     tracing::info!("replication listener on {addr}");
+    tracing::warn!(
+        "replication is EXPERIMENTAL: it may lose or duplicate data, it is not for \
+         production use, and its wire format may change between versions"
+    );
 
     let (sender, receiver) = stream_channel(TEE_CAPACITY);
     config.wal_observer = Some(Box::new(sender));
@@ -77,6 +86,10 @@ fn serve_replicas(listener: TcpListener, rx: StreamReceiver) {
             match listener.accept() {
                 Ok((conn, peer)) => {
                     tracing::info!(%peer, "replica connected");
+                    tracing::warn!(
+                        %peer,
+                        "replica connected to EXPERIMENTAL replication: not for production use"
+                    );
                     // BSD/macOS accepted sockets inherit the listener's
                     // non-blocking flag; the serve loop wants blocking IO.
                     conn.set_nonblocking(false)
