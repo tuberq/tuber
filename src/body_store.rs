@@ -658,21 +658,25 @@ impl BodyStore {
         }
     }
 
-    /// `delete_many` that also reports which segments lost bodies.
+    /// `delete_many` that also reports how many of `ids` it found, and so
+    /// dropped, and which segments lost them. Ids not in the index don't
+    /// count: compaction has already removed their bodies.
     /// Startup-only: the returned set feeds [`BodyStore::reclaim_stranded`]
     /// so bytes dropped here are considered by the same compaction step,
     /// instead of lingering until the segment happens to seal. The hot
     /// `delete_many` path stays allocation-free.
-    pub fn delete_many_tracking_segments(&self, ids: &[BodyId]) -> HashSet<u64> {
+    pub fn delete_many_tracking_segments(&self, ids: &[BodyId]) -> (u64, HashSet<u64>) {
+        let mut dropped = 0;
         let mut segs = HashSet::new();
         if ids.is_empty() {
-            return segs;
+            return (dropped, segs);
         }
         let mut total_freed: u64 = 0;
         {
             let mut inner = self.inner.lock().unwrap();
             for id in ids {
                 if let Some(seq) = inner.index.get(id).map(|loc| loc.seq) {
+                    dropped += 1;
                     segs.insert(seq);
                 }
                 total_freed += Self::delete_locked(&mut inner, *id);
@@ -681,7 +685,7 @@ impl BodyStore {
         if total_freed > 0 {
             self.live_bytes.fetch_sub(total_freed, Ordering::Relaxed);
         }
-        segs
+        (dropped, segs)
     }
 
     fn delete_locked(inner: &mut Inner, id: BodyId) -> u64 {
@@ -1741,7 +1745,8 @@ mod tests {
 
         // Stand in for the startup orphan pass: index-only delete, but
         // remember which segment lost the body.
-        let orphan_segs = bs.delete_many_tracking_segments(&[id_a]);
+        let (dropped, orphan_segs) = bs.delete_many_tracking_segments(&[id_a]);
+        assert_eq!(dropped, 1);
         assert_eq!(orphan_segs, HashSet::from([0]));
         assert!(segment_path(tmp.path(), 0).exists());
 

@@ -4441,15 +4441,20 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         // pass re-kills the ones the retained WAL still names; the rest
         // fall to the stranded sweep below. Only the counters differ —
         // both are unreferenced bodies, so `orphan_segs` is handed to
-        // that sweep and the two share one compaction step.
+        // that sweep and the two share one compaction step. It counts
+        // the bodies it finds, not the deletes: a WAL segment outlives
+        // the TOAST segments its jobs' bodies were in, so many of the
+        // deletes it names are of bodies compaction already removed.
         let mut orphan_segs = std::collections::HashSet::new();
         if !orphan_bodies.is_empty() {
-            state.stats.reclaimed_orphan_bodies = orphan_bodies.len() as u64;
-            orphan_segs = body_store.delete_many_tracking_segments(&orphan_bodies);
-            tracing::info!(
-                "TOAST: dropped {} bodies of jobs the WAL replay saw deleted",
-                orphan_bodies.len()
-            );
+            let dropped;
+            (dropped, orphan_segs) = body_store.delete_many_tracking_segments(&orphan_bodies);
+            state.stats.reclaimed_orphan_bodies = dropped;
+            if dropped > 0 {
+                tracing::info!(
+                    "TOAST: dropped {dropped} bodies of jobs the WAL replay saw deleted"
+                );
+            }
         }
 
         // Migrate inline bodies recovered from pre-v5 WAL records into
@@ -4559,12 +4564,17 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         let stranded_count = body_store.reclaim_stranded(&live_body_ids, &orphan_segs);
         state.stats.reclaimed_stranded_bodies = stranded_count;
         let bytes_freed = bytes_before.saturating_sub(body_store.total_bytes());
-        if stranded_count > 0 || bytes_freed > 0 {
+        if stranded_count > 0 {
             tracing::info!(
-                "TOAST: reclaimed {} unreferenced bodies, {} freed on disk \
-                 (deleted jobs whose segment hadn't been compacted, plus any \
-                 put whose WAL write failed)",
-                stranded_count,
+                "TOAST: dropped {stranded_count} bodies no job points at (of jobs \
+                 deleted since the WAL dropped their records, plus any put whose \
+                 WAL write failed)"
+            );
+        }
+        // Separate from the counts: it covers both passes' bodies.
+        if bytes_freed > 0 {
+            tracing::info!(
+                "TOAST: compacting the segments that held dropped bodies freed {} on disk",
                 crate::wal::format_bytes(bytes_freed),
             );
         }

@@ -1383,6 +1383,68 @@ async fn test_startup_reclaims_stranded_toast_bodies() {
     );
 }
 
+/// The startup orphan pass counts the bodies it drops, not the deleted
+/// jobs the WAL names: a body TOAST compaction has already removed isn't
+/// there to drop. A WAL segment outlives the TOAST segments its jobs'
+/// bodies were in, so on a busy queue most of the deletes it names are
+/// long gone; booko's first 0.17 start reported 29,333 bodies dropped
+/// against 13,156 indexed. Removing the TOAST segment after run 1 stands
+/// in for compaction having taken job 1's body.
+#[tokio::test]
+async fn test_startup_counts_only_orphan_bodies_still_in_toast() {
+    let dir = tempfile::tempdir().unwrap();
+    // Past HEAP_INLINE_MAX (256 B), so the body goes to TOAST.
+    let big = "a".repeat(300);
+
+    // Run 1: job 1, put and deleted.
+    {
+        let srv = TestServer::start_with_wal(dir.path()).await;
+        let mut c = srv.connect().await;
+        c.mustsend(&format!("put 0 0 60 {}\r\n{big}\r\n", big.len()))
+            .await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("delete 1\r\n").await;
+        c.ckresp("DELETED\r\n").await;
+        drop(c);
+        let _ = srv.shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    std::fs::remove_file(dir.path().join("toast").join("body.000000")).expect("rm toast segment");
+
+    // Run 2: the WAL names job 1's delete, but its body is gone, so
+    // nothing is dropped. Job 2 is put and deleted; a delete is
+    // index-only, so its bytes stay in TOAST.
+    {
+        let srv = TestServer::start_with_wal(dir.path()).await;
+        let mut c = srv.connect().await;
+        c.mustsend("stats\r\n").await;
+        let body = c.read_ok_body().await;
+        assert!(
+            body.contains("reclaimed-orphan-bodies: 0\n"),
+            "job 1's body was already gone: {body}",
+        );
+        c.mustsend(&format!("put 0 0 60 {}\r\n{big}\r\n", big.len()))
+            .await;
+        c.ckresp("INSERTED 2\r\n").await;
+        c.mustsend("delete 2\r\n").await;
+        c.ckresp("DELETED\r\n").await;
+        drop(c);
+        let _ = srv.shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Run 3: job 2's body is still in TOAST and is dropped; job 1's,
+    // if the WAL still names it, isn't there.
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("reclaimed-orphan-bodies: 1\n"),
+        "only job 2's body was there to drop: {body}",
+    );
+}
+
 /// `--max-storage-bytes`: once the combined WAL+TOAST footprint plus a
 /// one-segment WAL reserve (≈10 MB) would exceed the budget, new puts
 /// are refused with `OUT_OF_STORAGE`. State changes (delete) always

@@ -734,6 +734,11 @@ synchronisation point.
   segments — without the hand-off those bytes would wait for the
   segment to seal on its own. One compaction step covers both passes;
   the counters stay separate.
+  The orphan pass counts the bodies it finds in the index, not the
+  deletes the WAL names: a WAL segment is kept while any job in it is
+  live, so many of the deletes it names are of bodies compaction has
+  already removed. The space compaction frees is logged on a line of
+  its own, since it covers both passes.
 
   **This is normally routine, not a failure signal.** TOAST has no
   on-disk deletion tombstone: `BodyStore::delete` drops the index
