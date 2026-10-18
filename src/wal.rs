@@ -614,12 +614,12 @@ pub struct ObserverContext {
 }
 
 /// Tap into the WAL write path. `on_record` fires synchronously for every
-/// record appended — puts, state changes, tombstones, and the marks a
-/// segment opens with or a sync appends — after the record's bytes have
-/// been appended to the segment buffer and its position assigned — but
-/// before any fsync, so an observed record is *not yet durable*. A consumer that
-/// must not run ahead of durability should buffer until `on_sync` reports
-/// a covering position.
+/// record appended — puts, state changes, tombstones, schedule records,
+/// and the marks a segment opens with or a sync appends — after the
+/// record's bytes have been appended to the segment buffer and its
+/// position assigned — but before any fsync, so an observed record is *not
+/// yet durable*. A consumer that must not run ahead of durability should
+/// buffer until `on_sync` reports a covering position.
 ///
 /// Implementations must be fast and infallible: this runs on the engine's
 /// hot path, and there is no way to fail the write from here. Anything
@@ -2150,7 +2150,7 @@ impl Wal {
 
     pub fn write_put(&mut self, job: &mut Job) -> io::Result<()> {
         self.max_job_id = self.max_job_id.max(job.id);
-        let (pos, record) = self.append(&serialize_full_job(job))?;
+        let record = self.append(&serialize_full_job(job), WalEvent::Put { job: &*job })?;
 
         // Update job's WAL tracking
         let old_seq = job.wal_seq();
@@ -2172,10 +2172,6 @@ impl Wal {
         if old_seq.is_none() {
             self.reserved_bytes += STATE_CHANGE_RECORD_SIZE as u64;
         }
-
-        if let Some(obs) = self.observer.as_mut() {
-            obs.on_record(pos, WalEvent::Put { job: &*job });
-        }
         Ok(())
     }
 
@@ -2196,15 +2192,26 @@ impl Wal {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let (pos, _) = self.append(&serialize_state_change(
-            job.id,
-            new_state,
-            new_priority,
-            delay_nanos,
-            expiry_epoch_secs,
-            reason,
-            change_epoch_secs,
-        ))?;
+        self.append(
+            &serialize_state_change(
+                job.id,
+                new_state,
+                new_priority,
+                delay_nanos,
+                expiry_epoch_secs,
+                reason,
+                change_epoch_secs,
+            ),
+            WalEvent::StateChange {
+                job_id: job.id,
+                new_state,
+                new_priority,
+                new_delay_nanos: delay_nanos,
+                expiry_epoch_secs,
+                reason,
+                change_epoch_secs,
+            },
+        )?;
 
         // Release reservation
         self.reserved_bytes = self
@@ -2224,21 +2231,6 @@ impl Wal {
             // carry the full job body. Moving the ref would allow GC to delete
             // the FullJob's file, causing silent data loss on replay.
         }
-
-        if let Some(obs) = self.observer.as_mut() {
-            obs.on_record(
-                pos,
-                WalEvent::StateChange {
-                    job_id: job.id,
-                    new_state,
-                    new_priority,
-                    new_delay_nanos: delay_nanos,
-                    expiry_epoch_secs,
-                    reason,
-                    change_epoch_secs,
-                },
-            );
-        }
         Ok(())
     }
 
@@ -2257,19 +2249,15 @@ impl Wal {
         expires_epoch_secs: u64,
     ) -> io::Result<Option<RecordRef>> {
         self.max_job_id = self.max_job_id.max(job_id);
-        let (pos, record) =
-            self.append(&serialize_tombstone(job_id, tube, key, expires_epoch_secs))?;
-        if let Some(obs) = self.observer.as_mut() {
-            obs.on_record(
-                pos,
-                WalEvent::Tombstone {
-                    job_id,
-                    tube,
-                    key,
-                    expires_epoch_secs,
-                },
-            );
-        }
+        let record = self.append(
+            &serialize_tombstone(job_id, tube, key, expires_epoch_secs),
+            WalEvent::Tombstone {
+                job_id,
+                tube,
+                key,
+                expires_epoch_secs,
+            },
+        )?;
         Ok((expires_epoch_secs != 0).then(|| self.hold(record)))
     }
 
@@ -2292,7 +2280,13 @@ impl Wal {
                 format!("schedules: {owner}'s set is too large for a WAL record"),
             ));
         }
-        let (_, record) = self.append(&serialize_schedule_set(owner, entries))?;
+        let record = self.append(
+            &serialize_schedule_set(owner, entries),
+            WalEvent::ScheduleSet {
+                owner,
+                entries: ScheduleEntries(&entries),
+            },
+        )?;
         Ok((!entries.is_empty()).then(|| self.hold(record)))
     }
 
@@ -2305,18 +2299,27 @@ impl Wal {
         name: &str,
         last_fire: Option<Timestamp>,
     ) -> io::Result<RecordRef> {
-        let (_, record) = self.append(&serialize_schedule_fired(owner, name, last_fire))?;
+        let record = self.append(
+            &serialize_schedule_fired(owner, name, last_fire),
+            WalEvent::ScheduleFired {
+                owner,
+                name,
+                last_fire,
+            },
+        )?;
         Ok(self.hold(record))
     }
 
-    /// Append `record` to the current segment, taking no reference, and
-    /// return where it landed. Every record goes through here. Group
-    /// commit: the bytes go into the BufWriter and `dirty` is set, but
-    /// nothing is fsynced until the engine drains its channel and calls
+    /// Append `record` to the current segment, taking no reference, and tee
+    /// it to the observer as `event`. Every record goes through here, so a
+    /// new kind can't miss the tee; only the marks a segment opens with and
+    /// the one a sync appends are written, and teed, where they're made.
+    /// Group commit: the bytes go into the BufWriter and `dirty` is set,
+    /// but nothing is fsynced until the engine drains its channel and calls
     /// [`Wal::sync`]. The op is counted before a caller decrefs what the
     /// record supersedes: that segment's zero-refs stamp must include this
     /// record.
-    fn append(&mut self, record: &[u8]) -> io::Result<(Position, RecordRef)> {
+    fn append(&mut self, record: &[u8], event: WalEvent<'_>) -> io::Result<RecordRef> {
         #[cfg(test)]
         self.injected_failure()?;
         self.rotate_if_needed()?;
@@ -2335,13 +2338,13 @@ impl Wal {
         self.total_disk_bytes += record.len() as u64;
         self.ops_written += 1;
         self.dirty = true;
-        Ok((
-            pos,
-            RecordRef {
-                seq,
-                len: record.len() as u32,
-            },
-        ))
+        if let Some(obs) = self.observer.as_mut() {
+            obs.on_record(pos, event);
+        }
+        Ok(RecordRef {
+            seq,
+            len: record.len() as u32,
+        })
     }
 
     /// The schedules the last [`Wal::replay`] found. Empty if taken already.
@@ -6134,9 +6137,10 @@ mod tests {
     }
 
     /// The tee reports every record the segment files hold, at the position
-    /// it holds it — not just puts and state changes, but tombstones and the
-    /// marks a segment opens with or a sync appends. A record the tee missed
-    /// would be invisible to a consumer that follows it past the attach.
+    /// it holds it — not just puts and state changes, but tombstones,
+    /// schedule records, and the marks a segment opens with or a sync
+    /// appends. A record the tee missed would be invisible to a consumer
+    /// that follows it past the attach.
     #[test]
     fn test_observer_tees_every_record_in_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -6152,8 +6156,22 @@ mod tests {
             wal.write_state_change(&mut job, None, 0, Duration::ZERO, 0, StateChangeReason::None)
                 .unwrap();
             wal.write_tombstone("test-tube", &format!("k{id}"), id, 0).unwrap();
+            // A set as the server writes one, its bodies borrowed.
+            let body = format!("{{\"n\":{id}}}");
+            let set = [ScheduleRecord {
+                line: format!("s{id} jobs 0 0 60 {} @hourly", body.len()),
+                body: body.as_bytes(),
+                synced_at: ts("2026-10-11T03:00:30Z"),
+                last_fire: None,
+            }];
+            wal.write_schedule_set("app", &set).unwrap();
+            wal.write_schedule_fired("app", &format!("s{id}"), Some(ts("2026-10-11T04:00:00Z")))
+                .unwrap();
             wal.sync().unwrap();
         }
+        // The owner's removal: a set with no entries.
+        wal.write_schedule_set::<&[u8]>("app", &[]).unwrap();
+        wal.sync().unwrap();
         assert!(wal.file_count() > 1, "the test needs a rotation");
 
         let mut in_files = Vec::new();
@@ -6169,12 +6187,28 @@ mod tests {
             }
         }
         let teed = events.lock().unwrap().clone();
-        for kind in ["Tombstone", "IdMark", "ToastMark"] {
+        for kind in [
+            "Tombstone",
+            "IdMark",
+            "ToastMark",
+            "ScheduleSet",
+            "ScheduleFired",
+        ] {
             assert!(
-                in_files.iter().any(|(_, r)| format!("{r:?}").starts_with(kind)),
+                in_files
+                    .iter()
+                    .any(|(_, r)| format!("{r:?}").starts_with(kind)),
                 "the test should write a {kind}"
             );
         }
+        let removal = SeenRecord::ScheduleSet {
+            owner: "app".into(),
+            entries: vec![],
+        };
+        assert!(
+            in_files.iter().any(|(_, r)| *r == removal),
+            "the test should write an empty set"
+        );
         assert_eq!(teed, in_files);
     }
 
