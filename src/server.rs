@@ -1814,7 +1814,7 @@ impl ServerState {
             }
             JobState::Buried => {
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.buried.retain(|&jid| jid != id);
+                    tube.remove_buried(id);
                     self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
@@ -2146,7 +2146,7 @@ impl ServerState {
             }
             JobState::Buried => {
                 if let Some(tube) = self.tubes.get_mut(&*d.tube_name) {
-                    tube.buried.retain(|&jid| jid != id);
+                    tube.remove_buried(id);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
                 self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);
@@ -2924,7 +2924,7 @@ impl ServerState {
         match state {
             JobState::Buried => {
                 if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    tube.buried.retain(|&jid| jid != id);
+                    tube.remove_buried(id);
                     tube.stat.buried_ct = tube.stat.buried_ct.saturating_sub(1);
                 }
                 self.stats.buried_ct = self.stats.buried_ct.saturating_sub(1);

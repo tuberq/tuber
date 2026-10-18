@@ -4567,8 +4567,8 @@ fn a_burst_of_jobs_does_not_leave_its_bookkeeping_behind() {
         };
         s.handle_command(c, Command::Bury { id, pri: 0 }, None);
     }
-    // Kick them back rather than delete them from the buried list, since
-    // each delete there scans the whole list.
+    // Kick them back rather than delete them in the job table's order: a
+    // delete searches the buried list for its job, from the front.
     assert_eq!(s.handle_command(c, Command::Kick { bound: N as u32 }, None), Response::Kicked(N as u32));
     let ids: Vec<u64> = s.jobs.keys().copied().collect();
     for id in ids {
@@ -4658,4 +4658,67 @@ fn a_burst_of_groups_con_keys_and_tubes_does_not_leave_its_bookkeeping_behind() 
         assert!(len <= 1, "the {what} still holds {len}");
         assert!(capacity < N / 2, "the {what} has room for {capacity} after {N} drained");
     }
+}
+
+/// Bury `N` jobs, then take each off the front of the buried list with
+/// `remove`, as a cleanup loop of `peek-buried` and a command on its id does.
+/// Each removal should cost the same whatever is buried behind it.
+fn clear_buried_from_the_front(what: &str, remove: impl Fn(&mut ServerState, u64, u64) -> Response) {
+    const N: usize = 40_000;
+    let mut s = make_state();
+    let c = register(&mut s);
+    let put = Command::Put {
+        pri: 0,
+        delay: 0,
+        ttr: 60,
+        bytes: 1,
+        idempotency_key: None,
+        group: None,
+        after_group: None,
+        concurrency_key: None,
+    };
+    for _ in 0..N {
+        s.handle_command(c, put.clone(), Some(b"x".to_vec()));
+        let Response::Reserved { id, .. } = s.handle_command(c, Command::Reserve, None) else {
+            panic!("expected a reserve");
+        };
+        s.handle_command(c, Command::Bury { id, pri: 0 }, None);
+    }
+    let start = Instant::now();
+    while let Response::Found { id, .. } = s.handle_command(c, Command::PeekBuried, None) {
+        remove(&mut s, c, id);
+    }
+    let took = start.elapsed();
+    assert!(s.tubes["default"].buried.is_empty());
+    assert!(
+        took < Duration::from_secs(3),
+        "{what} of {N} buried jobs, oldest first, took {took:?}"
+    );
+}
+
+#[test]
+fn deleting_buried_jobs_oldest_first_does_not_scan_the_buried_list() {
+    clear_buried_from_the_front("delete", |s, c, id| {
+        let resp = s.handle_command(c, Command::Delete { id }, None);
+        assert_eq!(resp, Response::Deleted);
+        resp
+    });
+}
+
+#[test]
+fn kicking_buried_jobs_oldest_first_does_not_scan_the_buried_list() {
+    clear_buried_from_the_front("kick-job", |s, c, id| {
+        let resp = s.handle_command(c, Command::KickJob { id }, None);
+        assert_eq!(resp, Response::KickedOne);
+        resp
+    });
+}
+
+#[test]
+fn reserving_buried_jobs_oldest_first_does_not_scan_the_buried_list() {
+    clear_buried_from_the_front("reserve-job", |s, c, id| {
+        let resp = s.handle_command(c, Command::ReserveJob { id }, None);
+        assert!(matches!(resp, Response::Reserved { .. }), "reserve-job {id} got {resp:?}");
+        resp
+    });
 }

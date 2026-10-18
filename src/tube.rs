@@ -433,6 +433,16 @@ impl Tube {
         !self.buried.is_empty()
     }
 
+    /// Take `id` off the buried list. The search stops at the job and the
+    /// removal shifts whichever side of the gap is shorter, so a cleanup loop
+    /// (`peek-buried`, then a command on the id), which takes jobs from the
+    /// front, costs the same each step however many are buried.
+    pub fn remove_buried(&mut self, id: u64) {
+        if let Some(i) = self.buried.iter().position(|&jid| jid == id) {
+            self.buried.remove(i);
+        }
+    }
+
     /// Give back the room a burst of jobs left behind ([`crate::shrink`]).
     pub fn shrink_if_sparse(&mut self) {
         self.ready.shrink_if_sparse();
