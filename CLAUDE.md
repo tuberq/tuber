@@ -30,6 +30,7 @@ The codebase mirrors the original C beanstalkd structure:
 - **`src/tube.rs`** - Named queues ("tubes"). Each tube has a ready queue (`ReadyQueue`: a priority heap, with `con:` jobs grouped by key so a reserve steps past a blocked key in one move), delay heap, buried list, and waiting connections list. Default tube is "default".
 - **`src/conn.rs`** - Per-connection state: current tube (`use`), watched tubes (`watch`), reserved jobs list, reserve mode (FIFO or weighted), and read/write buffers.
 - **`src/heap.rs`** - Binary min-heap used for ready queue (priority ordering), delay queue (deadline ordering), and connection timeouts.
+- **`src/shrink.rs`** - Gives back what a burst of jobs grew: once a second the tick shrinks the job table, each tube's queues and `idp:` indexes, and the TOAST index when one is less than a quarter full (`ServerState::shrink_sparse_collections`).
 - **`src/wal.rs`** - Write-ahead log for persistence (optional, enabled with `-b`).
 - **`src/client.rs`** - TCP client for connecting to a tuber server. Used by CLI subcommands.
 - **`src/cmd_put.rs`** - CLI `put` command: submits jobs to a tube, supports stdin piping.
