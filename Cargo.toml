@@ -2,6 +2,8 @@
 name = "tuber"
 version = "0.16.0"
 edition = "2024"
+# ee/ is BUSL-1.1 (ee/LICENSE); everything else is MIT (LICENSE).
+license = "MIT AND BUSL-1.1"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -26,3 +28,22 @@ tempfile = "3"
 [[bench]]
 name = "throughput"
 harness = false
+
+# ee/'s tests live beside it, outside tests/, so the BUSL code stays in one
+# directory.
+[[test]]
+name = "ee_stream"
+path = "ee/tests/stream_test.rs"
+
+[[test]]
+name = "ee_catchup"
+path = "ee/tests/catchup_test.rs"
+
+[[test]]
+name = "ee_binary"
+path = "ee/tests/binary_test.rs"
+
+# Compiles ee/ as a separate crate would see tuber; see the file.
+[[test]]
+name = "ee_boundary"
+path = "ee/tests/boundary.rs"
