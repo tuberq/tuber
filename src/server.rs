@@ -4615,9 +4615,10 @@ fn build_state(cfg: StateConfig<'_>) -> io::Result<ServerState> {
         );
     } else if wal_observer.is_some() {
         // Same reflex as the other knobs that can't take effect (see the
-        // --max-storage-bytes check above and main.rs's warnings): an
-        // embedder who wires a replication observer and forgets the WAL
-        // directory gets a quietly non-replicating server otherwise.
+        // --max-storage-bytes check above and `cli::server_config`'s
+        // warnings): a hook that wires a replication observer without a WAL
+        // directory gets a quietly non-replicating server otherwise. `ee/`'s
+        // own hook refuses that before it gets here.
         tracing::warn!("wal_observer ignored: no WAL directory configured");
     }
 
@@ -4633,12 +4634,13 @@ pub const DEFAULT_PORT: u16 = 11300;
 
 /// Everything [`run`] needs, one field per server knob. Mirrors the
 /// `server` flags (`cli::server_config` builds one from them), but exists as
-/// an owned value so an embedding binary can start the server
-/// programmatically: build one with [`Default::default`], override what you
-/// need, and hand it to [`run`].
+/// an owned value so code can change it before the server starts, as the
+/// hook `cli::run` takes does, or build one with [`Default::default`] and
+/// hand it to [`run`].
 ///
 /// The one field with no flag is `wal_observer`: a hook, not a knob. Only
-/// an embedder can build an observer, so a command line has nothing to say.
+/// code can build an observer (`ee/`'s replication does), so a command line
+/// has nothing to say.
 pub struct ServerConfig {
     /// Listen address; see [`DEFAULT_LISTEN_ADDR`].
     pub addr: String,

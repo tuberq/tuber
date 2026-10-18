@@ -21,8 +21,9 @@ cargo run -- -l 0.0.0.0 -p 11300  # Run server
 
 The codebase mirrors the original C beanstalkd structure:
 
-- **`src/main.rs`** - The `tuber` binary: the jemalloc `#[global_allocator]` and a call to `cli::run`.
-- **`src/cli.rs`** - The command line, using clap subcommands (`server`, `put`, `stats`, `tubes`, `schedules`, `work`). Parses args and dispatches. In the library so an embedding binary (tuber-pro) can run it: `cli::command()` to add its own `server` flags and set its name and version, `cli::run(cmd, configure)` with a hook that gets the `server` matches and can change the `server::ServerConfig` before the server starts. `run` creates the tokio runtime itself, after the `TUBER_WAL_SYNC_INTERVAL` alias.
+- **`src/main.rs`** - The `tuber` binary: the jemalloc `#[global_allocator]`, and `cli::run` with `ee/`'s replication flags and hook. The one place MIT code and `ee/` meet.
+- **`src/cli.rs`** - The command line, using clap subcommands (`server`, `put`, `stats`, `tubes`, `schedules`, `work`). Parses args and dispatches. `cli::command()` lets `main` add `ee/`'s `server` flags; `cli::run(cmd, configure)` takes a hook that gets the `server` matches and can change the `server::ServerConfig` before the server starts. Never names `ee/`, so it builds without it. `run` creates the tokio runtime itself, after the `TUBER_WAL_SYNC_INTERVAL` alias.
+- **`ee/`** - Paid features, BUSL-1.1 (`ee/LICENSE`); everything else is MIT. A module of the tuber crate (`lib.rs` mounts it with `#[path]`), written as an outside crate would be: it reaches tuber only through `tuber::` paths to `pub` items, which `ee/tests/boundary.rs` enforces. Holds WAL streaming replication (`ee/replication/`, design in `ee/docs/replication.md`): experimental, `--replication-listen` hidden from `--help`, warns at startup and on each replica connection. Its tests are the `ee_*` targets in `Cargo.toml`.
 - **`src/lib.rs`** - Library root, exports all modules.
 - **`src/server.rs`** - Tokio TCP server, accepts connections and dispatches to protocol handler.
 - **`src/protocol.rs`** - Beanstalkd text protocol parser and command dispatch. The protocol is line-based (`\r\n` terminated). See `tmp/prot.c` for the full C implementation. Includes tuber extensions: `idp:`, `grp:`, `aft:`, `con:` tags on `put`, `reserve-mode`, `flush-tube`, `flush-buried`, and `touch-all`.

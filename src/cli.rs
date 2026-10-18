@@ -1,9 +1,8 @@
-//! tuber's command line, in the library so a binary that embeds tuber can run
-//! it: `tuber`'s own `main` is [`run`] with [`command`] and a hook that changes
-//! nothing. An embedder (tuber-pro) adds its own `server` flags to the
-//! command, sets its name and version, and uses the hook to adjust the
-//! [`ServerConfig`] before the server starts. The `#[global_allocator]` stays
-//! in each binary.
+//! tuber's command line. `main` takes [`command`], lets `ee/` add its
+//! `server` flags, and hands it to [`run`] with `ee/`'s hook, which can
+//! change the [`ServerConfig`] before the server starts. Nothing here names
+//! `ee/` (BUSL-1.1), so this MIT file builds without it: `src/main.rs` is the
+//! one place the two meet. The `#[global_allocator]` stays in `main`.
 
 use std::time::Duration;
 
@@ -62,9 +61,9 @@ struct Cli {
     command: Commands,
 }
 
-/// The `server` subcommand's flags. An embedder adds its own beside them
-/// with [`command`] and `mut_subcommand("server", ..)`, and reads them back
-/// from the matches [`run`] hands its hook.
+/// The `server` subcommand's flags. `ee/` adds its own beside them with
+/// [`command`] and `mut_subcommand("server", ..)`, and reads them back from
+/// the matches [`run`] hands its hook.
 #[derive(Args, Debug)]
 pub struct ServerArgs {
     /// Listen address
@@ -340,18 +339,17 @@ enum Commands {
 /// logged, and the process exits 1, as for any other startup failure.
 pub type HookError = Box<dyn std::error::Error + Send + Sync>;
 
-/// tuber's command line. An embedding binary can add flags to `server` with
-/// `mut_subcommand("server", ..)`, and set its own `name` and `version`, before
-/// handing it to [`run`].
+/// tuber's command line. `main` adds `ee/`'s flags to `server` with
+/// `mut_subcommand("server", ..)` before handing it to [`run`].
 pub fn command() -> Command {
     Cli::command()
 }
 
-/// Parse the process arguments with `cmd`, [`command`] or one an embedder
-/// built from it, and do what they say, as the `tuber` binary does.
+/// Parse the process arguments with `cmd`, [`command`] with any flags added
+/// to it, and do what they say.
 ///
-/// For `server`, `configure` gets the subcommand's matches, which hold any
-/// flags the embedder added, and the [`ServerConfig`] tuber's own flags
+/// For `server`, `configure` gets the subcommand's matches, which hold the
+/// flags `ee/` added, and the [`ServerConfig`] tuber's own flags
 /// describe, and can change it before the server starts. It runs inside the
 /// tokio runtime, so it can spawn tasks. An error from it stops startup.
 ///
@@ -574,21 +572,19 @@ mod tests {
     use clap::Arg;
     use std::path::Path;
 
-    /// tuber's command as tuber-pro builds it: renamed, with a flag of its
-    /// own on `server`.
-    fn embedder_command() -> Command {
-        command()
-            .name("tuber-pro")
-            .version("0.17.0 (pro)")
-            .mut_subcommand("server", |s| {
-                s.arg(Arg::new("replication_listen").long("replication-listen"))
-            })
+    /// tuber's command with a flag added to `server`, as `main` adds `ee/`'s.
+    fn command_with_a_server_flag() -> Command {
+        command().mut_subcommand("server", |s| {
+            s.arg(Arg::new("replication_listen").long("replication-listen"))
+        })
     }
 
-    /// Parse `args` with [`embedder_command`] as [`run`] does, and return
-    /// the `server` subcommand's typed flags and matches.
+    /// Parse `args` with [`command_with_a_server_flag`] as [`run`] does, and
+    /// return the `server` subcommand's typed flags and matches.
     fn parse_server(args: &[&str]) -> (ServerArgs, ArgMatches) {
-        let matches = embedder_command().try_get_matches_from(args).unwrap();
+        let matches = command_with_a_server_flag()
+            .try_get_matches_from(args)
+            .unwrap();
         let Commands::Server(server_args) = Cli::from_arg_matches(&matches).unwrap().command else {
             panic!("not parsed as server")
         };
@@ -597,9 +593,9 @@ mod tests {
     }
 
     #[test]
-    fn an_embedders_server_flag_reaches_its_hook_with_tubers_config() {
+    fn an_added_server_flag_reaches_the_hook_with_tubers_config() {
         let (args, server) = parse_server(&[
-            "tuber-pro",
+            "tuber",
             "server",
             "-b",
             "/var/lib/tuber",
@@ -630,16 +626,8 @@ mod tests {
 
     #[test]
     fn a_hook_error_stops_the_server_starting() {
-        let (args, server) = parse_server(&["tuber-pro", "server"]);
+        let (args, server) = parse_server(&["tuber", "server"]);
         let result = start_config(args, &server, |_, _| Err("no replication listener".into()));
         assert_eq!(result.err().unwrap().to_string(), "no replication listener");
-    }
-
-    #[test]
-    fn an_embedder_names_itself_in_version() {
-        assert_eq!(
-            embedder_command().render_version(),
-            "tuber-pro 0.17.0 (pro)\n"
-        );
     }
 }
