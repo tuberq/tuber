@@ -49,6 +49,10 @@ const FAIR_MIN_SAMPLES: u64 = 10;
 /// realistic delete bursts without burning cycles on idle queues.
 const TOAST_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the tick looks for collections a burst of jobs left mostly
+/// empty ([`crate::shrink`]).
+const SHRINK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Pause after an `accept()` that failed with EMFILE/ENFILE. The pending
 /// connection leaves the listener readable, so retrying immediately would spin
 /// on the CPU until a descriptor frees up. Short enough that recovery is
@@ -507,6 +511,8 @@ struct ServerState {
     /// directory: schedules live in memory, and the next app to boot syncs
     /// them back.
     schedule_refs: crate::schedule::store::ScheduleRefs,
+    /// When the tick next looks for collections to shrink.
+    shrink_check_at: Instant,
 }
 
 impl ServerState {
@@ -622,6 +628,7 @@ impl ServerState {
             schedules: crate::schedule::Schedules::default(),
             staged_schedule_bytes: 0,
             schedule_refs: Default::default(),
+            shrink_check_at: Instant::now(),
         }
     }
 
@@ -679,6 +686,19 @@ impl ServerState {
 
     fn tombstone_memory_cost(key: &str) -> u64 {
         key.len() as u64 + TOMBSTONE_OVERHEAD_BYTES
+    }
+
+    /// Give back the room a burst of jobs left in the collections that grow
+    /// with them ([`crate::shrink`]): the job table, each tube's queues and
+    /// indexes, and the TOAST index.
+    fn shrink_sparse_collections(&mut self) {
+        crate::shrink::shrink_if_sparse(&mut self.jobs);
+        for tube in self.tubes.values_mut() {
+            tube.shrink_if_sparse();
+        }
+        if let Some(bs) = &self.body_store {
+            bs.shrink_index_if_sparse();
+        }
     }
 
     /// Everything counted against `--max-jobs-size`: jobs, and schedule
@@ -5416,6 +5436,9 @@ const MAX_U64_DIGITS: usize = 20;
 /// For reference, put with all extensions is 891 bytes (well under this limit).
 const MAX_LINE_LEN: u64 = (13 + MAX_DELETE_BATCH * (MAX_U64_DIGITS + 1) + 2) as u64;
 
+/// Most of its line buffer a connection keeps between commands.
+const LINE_BUF_KEEP_BYTES: usize = 4096;
+
 /// Outcome of reading one command line from a client.
 enum LineRead {
     /// A complete, newline-terminated line is in `line_buf`.
@@ -5462,6 +5485,9 @@ async fn engine_approves_prune(
 }
 
 /// Read one command line, enforcing the idle deadline if one is configured.
+/// A buffer an earlier line grew past [`LINE_BUF_KEEP_BYTES`], a full
+/// `delete-batch` say, is shrunk first, rather than held at that size until
+/// the connection closes.
 ///
 /// Retries around a fired-but-refused deadline rather than returning, so a busy
 /// connection resumes the same read. That is safe because `read_until` appends
@@ -5478,6 +5504,7 @@ async fn read_command_line(
     idle_timeout: Option<Duration>,
     last_activity: &mut Instant,
 ) -> LineRead {
+    line_buf.shrink_to(LINE_BUF_KEEP_BYTES);
     loop {
         // Limit the read to prevent unbounded memory growth from clients that
         // send data without a newline. Matches beanstalkd behavior.
@@ -5688,6 +5715,26 @@ async fn await_parked_reply(
     reply_rx.await
 }
 
+/// Most of its response buffer a connection keeps between responses.
+const RESP_BUF_KEEP_BYTES: usize = 64 * 1024;
+
+/// Write `resp` to the client, serialized in the connection's reusable
+/// buffer `buf`. A buffer grown past [`RESP_BUF_KEEP_BYTES`], by a large
+/// body say, is shrunk once sent, rather than held at that size until the
+/// connection closes.
+async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    buf: &mut Vec<u8>,
+    resp: &Response,
+) -> io::Result<()> {
+    buf.clear();
+    resp.serialize_into(buf);
+    let sent = writer.write_all(buf).await;
+    buf.clear();
+    buf.shrink_to(RESP_BUF_KEEP_BYTES);
+    sent
+}
+
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     engine_tx: mpsc::Sender<EngineMsg>,
@@ -5754,9 +5801,7 @@ async fn handle_connection(
         let mut cmd = match protocol::parse_line(line) {
             Ok(cmd) => cmd,
             Err(resp) => {
-                resp_buf.clear();
-                resp.serialize_into(&mut resp_buf);
-                let _ = writer.write_all(&resp_buf).await;
+                let _ = send_response(&mut writer, &mut resp_buf, &resp).await;
                 // If the rejected line was a `put` with a known declared body
                 // length, the body is still inbound — drain it (plus the
                 // trailing CRLF) so the client's payload isn't parsed as
@@ -5901,9 +5946,7 @@ async fn handle_connection(
         };
         match reply {
             Ok(resp) => {
-                resp_buf.clear();
-                resp.serialize_into(&mut resp_buf);
-                if writer.write_all(&resp_buf).await.is_err() {
+                if send_response(&mut writer, &mut resp_buf, &resp).await.is_err() {
                     break;
                 }
             }

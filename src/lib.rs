@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod protocol;
 pub mod schedule;
 pub mod server;
+pub mod shrink;
 pub mod telemetry;
 pub mod tube;
 pub mod wal;

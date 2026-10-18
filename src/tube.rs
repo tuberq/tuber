@@ -192,6 +192,23 @@ impl ReadyQueue {
         self.free.is_empty() && self.key_of.is_empty()
     }
 
+    /// Give back the room a burst left behind ([`crate::shrink`]).
+    pub fn shrink_if_sparse(&mut self) {
+        self.free.shrink_if_sparse();
+        self.heads.shrink_if_sparse();
+        crate::shrink::shrink_if_sparse(&mut self.key_of);
+        crate::shrink::shrink_if_sparse(&mut self.keys);
+    }
+
+    /// Entries the queue's largest part has room for without growing.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        [self.free.capacity(), self.heads.capacity(), self.key_of.capacity(), self.keys.capacity()]
+            .into_iter()
+            .max()
+            .unwrap()
+    }
+
     /// Every job in the queue, in no particular order.
     pub fn ids(&self) -> Vec<u64> {
         let mut ids = self.free.ids();
@@ -433,6 +450,15 @@ impl Tube {
     /// which frees the tube on its refcount without consulting the pause.
     /// Checked last so the clock read only happens for a tube that is
     /// otherwise idle.
+    /// Give back the room a burst of jobs left behind ([`crate::shrink`]).
+    pub fn shrink_if_sparse(&mut self) {
+        self.ready.shrink_if_sparse();
+        self.delay.shrink_if_sparse();
+        crate::shrink::shrink_if_sparse(&mut self.buried);
+        crate::shrink::shrink_if_sparse(&mut self.idempotency_keys);
+        crate::shrink::shrink_if_sparse(&mut self.idempotency_cooldowns);
+    }
+
     pub fn is_idle(&self) -> bool {
         self.ready.is_empty()
             && self.delay.is_empty()

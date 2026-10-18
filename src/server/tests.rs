@@ -4478,3 +4478,113 @@ fn test_wal_observer_attaches_after_replay() {
         "post-attach writes must reach the observer"
     );
 }
+
+#[test]
+fn a_large_response_does_not_leave_its_buffer_behind() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let mut buf = Vec::with_capacity(256);
+    let mut wire = Vec::new();
+    let body = vec![b'x'; 1024 * 1024];
+    let resp = Response::Reserved { id: 1, body: body.clone() };
+    rt.block_on(send_response(&mut wire, &mut buf, &resp)).unwrap();
+
+    assert_eq!(&wire[wire.len() - body.len() - 2..wire.len() - 2], &body[..]);
+    assert!(
+        buf.capacity() < body.len(),
+        "the connection keeps a {} byte buffer after sending a {} byte body",
+        buf.capacity(),
+        body.len(),
+    );
+}
+
+#[test]
+fn a_long_command_line_does_not_leave_its_buffer_behind() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (reader, _writer) = server.into_split();
+        let mut reader = BufReader::new(reader);
+        // The longest line there is: a full delete-batch of 20-digit ids.
+        let ids = vec![u64::MAX.to_string(); MAX_DELETE_BATCH].join(" ");
+        let long = format!("delete-batch {ids}\r\n");
+        client.write_all(long.as_bytes()).await.unwrap();
+        client.write_all(b"stats\r\n").await.unwrap();
+
+        let (engine_tx, _engine_rx) = mpsc::channel(1);
+        let mut line_buf = Vec::new();
+        let mut last_activity = Instant::now();
+        for expected in [long.as_bytes(), &b"stats\r\n"[..]] {
+            line_buf.clear();
+            let read =
+                read_command_line(&mut reader, &mut line_buf, 1, &engine_tx, None, &mut last_activity)
+                    .await;
+            assert!(matches!(read, LineRead::Line));
+            assert_eq!(line_buf, expected);
+        }
+        assert!(
+            line_buf.capacity() < long.len(),
+            "the connection keeps a {} byte line buffer after a {} byte line",
+            line_buf.capacity(),
+            long.len(),
+        );
+    });
+}
+
+#[test]
+fn a_burst_of_jobs_does_not_leave_its_bookkeeping_behind() {
+    // Hash maps, heaps and deques keep their capacity when emptied, so a
+    // burst that has drained would otherwise hold its peak until restart.
+    const N: usize = 30_000;
+    let toast = tempfile::tempdir().unwrap();
+    let mut s = make_state();
+    s.body_store = Some(Arc::new(
+        BodyStore::open(toast.path(), crate::body_store::DEFAULT_SEGMENT_SIZE).unwrap(),
+    ));
+    let c = register(&mut s);
+    let body = vec![b'x'; crate::job::HEAP_INLINE_MAX + 1];
+    let put = |delay, key: Option<String>| Command::Put {
+        pri: 0,
+        delay,
+        ttr: 60,
+        bytes: body.len() as u32,
+        idempotency_key: key.map(|k| (k, 0)),
+        group: None,
+        after_group: None,
+        concurrency_key: None,
+    };
+    for i in 0..N {
+        s.handle_command(c, put(0, None), Some(body.clone()));
+        s.handle_command(c, put(3600, Some(format!("k{i}"))), Some(body.clone()));
+    }
+    // Reserve and bury the ready ones, so the buried list peaks too.
+    for _ in 0..N {
+        let Response::Reserved { id, .. } = s.handle_command(c, Command::Reserve, None) else {
+            panic!("expected a reserve");
+        };
+        s.handle_command(c, Command::Bury { id, pri: 0 }, None);
+    }
+    // Kick them back rather than delete them from the buried list, since
+    // each delete there scans the whole list.
+    assert_eq!(s.handle_command(c, Command::Kick { bound: N as u32 }, None), Response::Kicked(N as u32));
+    let ids: Vec<u64> = s.jobs.keys().copied().collect();
+    for id in ids {
+        assert_eq!(s.handle_command(c, Command::Delete { id }, None), Response::Deleted);
+    }
+    s.tick();
+
+    let tube = &s.tubes["default"];
+    for (what, capacity) in [
+        ("job table", s.jobs.capacity()),
+        ("ready queue", tube.ready.capacity()),
+        ("delay heap", tube.delay.capacity()),
+        ("buried list", tube.buried.capacity()),
+        ("idp: key index", tube.idempotency_keys.capacity()),
+        ("TOAST index", s.body_store.as_ref().unwrap().index_capacity()),
+    ] {
+        assert!(capacity < N / 2, "the {what} has room for {capacity} after {N} drained");
+    }
+}

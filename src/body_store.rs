@@ -726,6 +726,18 @@ impl BodyStore {
         Ok(inner.synced)
     }
 
+    /// Give back the index room a burst of bodies left behind
+    /// ([`crate::shrink`]).
+    pub fn shrink_index_if_sparse(&self) {
+        crate::shrink::shrink_if_sparse(&mut self.inner.lock().unwrap().index);
+    }
+
+    /// Bodies the index has room for without growing.
+    #[cfg(test)]
+    pub fn index_capacity(&self) -> usize {
+        self.inner.lock().unwrap().index.capacity()
+    }
+
     /// The furthest point a completed fsync covered: the end of the store
     /// at open, then advanced by every [`BodyStore::fsync`], compaction's
     /// included.

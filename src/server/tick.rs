@@ -327,6 +327,11 @@ impl ServerState {
         self.tubes.retain(|name, tube| {
             name == "default" || !tube.is_idle() || held_tubes.contains(name.as_str())
         });
+
+        if now >= self.shrink_check_at {
+            self.shrink_check_at = now + SHRINK_CHECK_INTERVAL;
+            self.shrink_sparse_collections();
+        }
     }
 
     /// Restore jobs from WAL replay into server state. `buried_order` is

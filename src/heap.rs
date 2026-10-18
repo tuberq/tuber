@@ -30,6 +30,18 @@ impl<K: Ord + Copy> IndexHeap<K> {
         self.data.is_empty()
     }
 
+    /// Give back the room a burst left behind ([`crate::shrink`]).
+    pub fn shrink_if_sparse(&mut self) {
+        crate::shrink::shrink_if_sparse(&mut self.data);
+        crate::shrink::shrink_if_sparse(&mut self.positions);
+    }
+
+    /// Entries the heap has room for without growing.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.data.capacity().max(self.positions.capacity())
+    }
+
     /// Returns the (key, id) of the minimum element without removing it.
     pub fn peek(&self) -> Option<&(K, u64)> {
         self.data.first()
