@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "tuber"
-version = "0.16.0"
+version = "0.17.0-dev.1"
 dependencies = [
  "bytes",
  "clap",
