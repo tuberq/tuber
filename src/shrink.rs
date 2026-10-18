@@ -15,6 +15,10 @@ pub const MIN_CAPACITY: usize = 4096;
 /// Shrink `c` to twice its length, or [`MIN_CAPACITY`], once it's less than a
 /// quarter full. The gap between the two keeps a collection whose size
 /// hovers around a threshold from shrinking and regrowing in turn.
+///
+/// A shrink moves what's left, a quarter of the capacity at most, while the
+/// engine waits. Growing to that capacity moved up to seven-eighths of it, so
+/// shrinking pauses the engine less than the burst already did.
 pub fn shrink_if_sparse(c: &mut impl Shrink) {
     let capacity = c.capacity();
     if capacity > MIN_CAPACITY && c.len() < capacity / 4 {

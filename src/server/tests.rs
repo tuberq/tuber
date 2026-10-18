@@ -4485,7 +4485,7 @@ fn a_large_response_does_not_leave_its_buffer_behind() {
     let mut buf = Vec::with_capacity(256);
     let mut wire = Vec::new();
     let body = vec![b'x'; 1024 * 1024];
-    let resp = Response::Reserved { id: 1, body: body.clone() };
+    let resp = Response::ReservedBatch(vec![(1, body.clone())]);
     rt.block_on(send_response(&mut wire, &mut buf, &resp)).unwrap();
 
     assert_eq!(&wire[wire.len() - body.len() - 2..wire.len() - 2], &body[..]);
@@ -4585,6 +4585,77 @@ fn a_burst_of_jobs_does_not_leave_its_bookkeeping_behind() {
         ("idp: key index", tube.idempotency_keys.capacity()),
         ("TOAST index", s.body_store.as_ref().unwrap().index_capacity()),
     ] {
+        assert!(capacity < N / 2, "the {what} has room for {capacity} after {N} drained");
+    }
+}
+
+#[test]
+fn a_reserved_body_is_written_without_being_copied_into_the_response_buffer() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let mut buf = Vec::with_capacity(256);
+    let mut wire = Vec::new();
+    let body = vec![b'x'; 1024 * 1024];
+    for (what, resp) in [
+        ("RESERVED", Response::Reserved { id: 1, body: body.clone() }),
+        ("FOUND", Response::Found { id: 1, body: body.clone() }),
+    ] {
+        wire.clear();
+        rt.block_on(send_response(&mut wire, &mut buf, &resp)).unwrap();
+        let mut expected = Vec::new();
+        resp.serialize_into(&mut expected);
+        assert!(wire == expected, "{what} went out differently");
+        assert_eq!(buf.capacity(), 256, "{what}'s body was copied into the buffer");
+    }
+}
+
+#[test]
+fn a_burst_of_groups_con_keys_and_tubes_does_not_leave_its_bookkeeping_behind() {
+    const N: usize = 20_000;
+    let mut s = make_state();
+    let producer = register(&mut s);
+    let worker = register(&mut s);
+    for i in 0..N {
+        let tube = format!("t{i}");
+        s.handle_command(producer, Command::Use { tube: tube.clone() }, None);
+        let put = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 1,
+            idempotency_key: None,
+            group: Some(format!("g{i}")),
+            after_group: None,
+            concurrency_key: Some((format!("k{i}"), 1)),
+        };
+        s.handle_command(producer, put, Some(b"x".to_vec()));
+        s.handle_command(worker, Command::Watch { tube, weight: 1 }, None);
+    }
+    // Reserving the jobs holds their con: keys; deleting them ends their
+    // groups.
+    let ids: Vec<u64> = s.jobs.keys().copied().collect();
+    for &id in &ids {
+        let reserved = s.handle_command(worker, Command::ReserveJob { id }, None);
+        assert!(matches!(reserved, Response::Reserved { .. }), "{reserved:?}");
+    }
+    for id in ids {
+        assert_eq!(s.handle_command(worker, Command::Delete { id }, None), Response::Deleted);
+    }
+    // A reserve parked on every tube, then gone with its connection.
+    let (tx, _rx) = oneshot::channel();
+    s.add_waiter(worker, tx, None, None);
+    assert!(s.waited_tubes.len() > N);
+    s.unregister_conn(worker);
+    s.unregister_conn(producer);
+    s.tick();
+
+    for (what, len, capacity) in [
+        ("tube table", s.tubes.len(), s.tubes.capacity()),
+        ("parked tube set", s.waited_tubes.len(), s.waited_tubes.capacity()),
+        ("group table", s.groups.len(), s.groups.capacity()),
+        ("con: key counts", s.concurrency_keys.len(), s.concurrency_keys.capacity()),
+        ("con: key limits", s.concurrency_limits.len(), s.concurrency_limits.capacity()),
+    ] {
+        assert!(len <= 1, "the {what} still holds {len}");
         assert!(capacity < N / 2, "the {what} has room for {capacity} after {N} drained");
     }
 }

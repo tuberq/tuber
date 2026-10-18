@@ -176,21 +176,37 @@ pub enum Response {
 }
 
 impl Response {
+    /// For a response carrying one job body, `RESERVED` or `FOUND`: writes
+    /// the line before the body into `head` and returns the body, so it can
+    /// go out without being copied in behind the line. The body is followed
+    /// by `\r\n`.
+    pub fn split_body(&self, head: &mut Vec<u8>) -> Option<&[u8]> {
+        use std::io::Write;
+        let (word, id, body) = match self {
+            Response::Reserved { id, body } => ("RESERVED", id, body),
+            Response::Found { id, body } => ("FOUND", id, body),
+            _ => return None,
+        };
+        let _ = write!(head, "{word} {id} {}\r\n", body.len());
+        Some(body)
+    }
+
     /// Serialize the response into a reusable buffer, avoiding per-call allocation.
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
         use std::io::Write;
+        if let Some(body) = self.split_body(buf) {
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\r\n");
+            return;
+        }
         match self {
+            Response::Reserved { .. } | Response::Found { .. } => unreachable!("split_body wrote it"),
             Response::Inserted(id) => { let _ = write!(buf, "INSERTED {id}\r\n"); }
             Response::InsertedDup(id, state, None) => { let _ = write!(buf, "INSERTED {id} {state}\r\n"); }
             Response::InsertedDup(id, state, Some(pri)) => { let _ = write!(buf, "INSERTED {id} {state} {pri}\r\n"); }
             Response::BuriedId(id) => { let _ = write!(buf, "BURIED {id}\r\n"); }
             Response::Buried => buf.extend_from_slice(b"BURIED\r\n"),
             Response::Using(name) => { let _ = write!(buf, "USING {name}\r\n"); }
-            Response::Reserved { id, body } => {
-                let _ = write!(buf, "RESERVED {id} {}\r\n", body.len());
-                buf.extend_from_slice(body);
-                buf.extend_from_slice(b"\r\n");
-            }
             Response::DeadlineSoon => buf.extend_from_slice(b"DEADLINE_SOON\r\n"),
             Response::TimedOut => buf.extend_from_slice(b"TIMED_OUT\r\n"),
             Response::Deleted => buf.extend_from_slice(b"DELETED\r\n"),
@@ -199,11 +215,6 @@ impl Response {
             Response::TouchedAll(n) => { let _ = write!(buf, "TOUCHED_ALL {n}\r\n"); }
             Response::Kicked(n) => { let _ = write!(buf, "KICKED {n}\r\n"); }
             Response::KickedOne => buf.extend_from_slice(b"KICKED\r\n"),
-            Response::Found { id, body } => {
-                let _ = write!(buf, "FOUND {id} {}\r\n", body.len());
-                buf.extend_from_slice(body);
-                buf.extend_from_slice(b"\r\n");
-            }
             Response::NotFound => buf.extend_from_slice(b"NOT_FOUND\r\n"),
             Response::Watching(n) => { let _ = write!(buf, "WATCHING {n}\r\n"); }
             Response::NotIgnored => buf.extend_from_slice(b"NOT_IGNORED\r\n"),

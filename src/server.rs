@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io;
+use std::io::{self, IoSlice};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -688,11 +688,18 @@ impl ServerState {
         key.len() as u64 + TOMBSTONE_OVERHEAD_BYTES
     }
 
-    /// Give back the room a burst of jobs left in the collections that grow
-    /// with them ([`crate::shrink`]): the job table, each tube's queues and
-    /// indexes, and the TOAST index.
+    /// Give back the room a burst left in the collections that grow with
+    /// jobs, tubes, groups and `con:` keys ([`crate::shrink`]): the job, tube
+    /// and group tables, the `con:` key maps, the set of tubes reserves are
+    /// parked on, each tube's queues and indexes, and the TOAST index.
     fn shrink_sparse_collections(&mut self) {
-        crate::shrink::shrink_if_sparse(&mut self.jobs);
+        use crate::shrink::shrink_if_sparse;
+        shrink_if_sparse(&mut self.jobs);
+        shrink_if_sparse(&mut self.tubes);
+        shrink_if_sparse(&mut self.groups);
+        shrink_if_sparse(&mut self.concurrency_keys);
+        shrink_if_sparse(&mut self.concurrency_limits);
+        shrink_if_sparse(&mut self.waited_tubes);
         for tube in self.tubes.values_mut() {
             tube.shrink_if_sparse();
         }
@@ -899,9 +906,10 @@ impl ServerState {
 
     /// Start a cooldown for `key` and persist it as a WAL tombstone record,
     /// which carries the key itself: the job's put record may be collected
-    /// long before the cooldown ends.
+    /// long before the cooldown ends. `op` names the write if it fails.
     fn record_tombstone(
         &mut self,
+        op: &str,
         tube_name: &str,
         key: Arc<str>,
         job_id: u64,
@@ -916,7 +924,7 @@ impl ServerState {
         if let Some(wal) = self.wal.as_mut() {
             match wal.write_tombstone(tube_name, &key, job_id, expires_epoch_secs) {
                 Ok(r) => record = r,
-                Err(e) => self.fail_wal("write_tombstone", e),
+                Err(e) => self.fail_wal(op, e),
             }
         }
         self.insert_tombstone(
@@ -993,7 +1001,8 @@ impl ServerState {
             return;
         }
         for (tube_name, key, cooldown) in legacy {
-            self.record_tombstone(&tube_name, key, cooldown.job_id, cooldown.expires_at);
+            let op = "write_tombstone";
+            self.record_tombstone(op, &tube_name, key, cooldown.job_id, cooldown.expires_at);
         }
         if !self.sync_wal() {
             tracing::error!("WAL: failed to persist cooldowns replayed from a pre-v8 WAL");
@@ -2024,15 +2033,7 @@ impl ServerState {
     }
 
     fn cmd_delete(&mut self, conn_id: u64, id: u64) -> Response {
-        match self.jobs.get(&id) {
-            None => return Response::NotFound,
-            // Must be reserved by this connection
-            Some(job) if job.state == JobState::Reserved && job.reserver_id != Some(conn_id) => {
-                return Response::NotFound;
-            }
-            Some(_) => {}
-        }
-        let Some(d) = self.detach_job(id) else {
+        let Some(d) = self.detach_job(id, Some(conn_id)) else {
             return Response::NotFound;
         };
 
@@ -2083,7 +2084,8 @@ impl ServerState {
             }
             if *ttl > 0 && d.state != JobState::Buried {
                 let expires_at = SystemTime::now() + Duration::from_secs(*ttl as u64);
-                self.record_tombstone(&d.tube_name, key.as_str().into(), id, expires_at);
+                let key = key.as_str().into();
+                self.record_tombstone("write_tombstone", &d.tube_name, key, id, expires_at);
             }
         }
 
@@ -2096,8 +2098,16 @@ impl ServerState {
 
     /// Take job `id` out of its queue, its reserver's hold and its groups'
     /// counts, ahead of removing it: the part a delete and an `unput` share.
-    fn detach_job(&mut self, id: u64) -> Option<Detached> {
+    /// `None` if there's no such job, or, given the connection asking (`by`),
+    /// if another connection has it reserved.
+    fn detach_job(&mut self, id: u64, by: Option<u64>) -> Option<Detached> {
         let job = self.jobs.get(&id)?;
+        if let Some(conn_id) = by
+            && job.state == JobState::Reserved
+            && job.reserver_id != Some(conn_id)
+        {
+            return None;
+        }
         let d = Detached {
             state: job.state,
             tube_name: job.tube_name.clone(),
@@ -3827,17 +3837,17 @@ impl ServerState {
     /// them, and the tube that named it. That reserve came before every
     /// other one able to take a job, so it is served next.
     fn oldest_servable_waiter(&self, only: Option<&str>) -> Option<(Arc<str>, u64)> {
-        let (mut one, mut all);
-        let names: &mut dyn Iterator<Item = &Arc<str>> = match only {
-            Some(name) => {
-                one = self.waited_tubes.get(name).into_iter();
-                &mut one
-            }
-            None => {
-                all = self.waited_tubes.iter();
-                &mut all
-            }
-        };
+        match only {
+            Some(name) => self.oldest_servable_waiter_in(self.waited_tubes.get(name)),
+            None => self.oldest_servable_waiter_in(&self.waited_tubes),
+        }
+    }
+
+    /// [`ServerState::oldest_servable_waiter`] over the tubes `names`.
+    fn oldest_servable_waiter_in<'a>(
+        &'a self,
+        names: impl IntoIterator<Item = &'a Arc<str>>,
+    ) -> Option<(Arc<str>, u64)> {
         let mut oldest: Option<(&Arc<str>, u64)> = None;
         for name in names {
             let Some(tube) = self.tubes.get(&**name) else {
@@ -4130,7 +4140,7 @@ impl ServerState {
     /// and a restart may bring the job back, which is why a client should
     /// retry such a put with an `idp:` key.
     fn unput(&mut self, id: u64) {
-        let Some(d) = self.detach_job(id) else {
+        let Some(d) = self.detach_job(id, None) else {
             return;
         };
         self.stats.total_jobs_ct = self.stats.total_jobs_ct.saturating_sub(1);
@@ -5719,20 +5729,44 @@ async fn await_parked_reply(
 const RESP_BUF_KEEP_BYTES: usize = 64 * 1024;
 
 /// Write `resp` to the client, serialized in the connection's reusable
-/// buffer `buf`. A buffer grown past [`RESP_BUF_KEEP_BYTES`], by a large
-/// body say, is shrunk once sent, rather than held at that size until the
-/// connection closes.
+/// buffer `buf`. A job body, from `reserve` or a `peek`, goes out as it is
+/// rather than copied in behind its line. A buffer grown past
+/// [`RESP_BUF_KEEP_BYTES`] anyway, by a `reserve-batch` say, is shrunk once
+/// sent, rather than held at that size until the connection closes.
 async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     buf: &mut Vec<u8>,
     resp: &Response,
 ) -> io::Result<()> {
     buf.clear();
-    resp.serialize_into(buf);
-    let sent = writer.write_all(buf).await;
+    let sent = match resp.split_body(buf) {
+        Some(body) => {
+            let mut parts = [IoSlice::new(buf), IoSlice::new(body), IoSlice::new(b"\r\n")];
+            write_all_vectored(writer, &mut parts).await
+        }
+        None => {
+            resp.serialize_into(buf);
+            writer.write_all(buf).await
+        }
+    };
     buf.clear();
     buf.shrink_to(RESP_BUF_KEEP_BYTES);
     sent
+}
+
+/// Write all of `parts`, in as many writes as it takes.
+async fn write_all_vectored<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut parts: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    while !parts.is_empty() {
+        let n = writer.write_vectored(parts).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut parts, n);
+    }
+    Ok(())
 }
 
 async fn handle_connection(

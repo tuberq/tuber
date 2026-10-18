@@ -293,7 +293,8 @@ impl ServerState {
                 .take(count)
                 .collect();
             for (tube_name, key, cooldown) in migrate_cooldowns {
-                self.record_tombstone(&tube_name, key, cooldown.job_id, cooldown.expires_at);
+                let op = "compaction tombstone write";
+            self.record_tombstone(op, &tube_name, key, cooldown.job_id, cooldown.expires_at);
                 let Some(wal) = self.wal.as_mut() else { break };
                 wal.record_migration();
             }

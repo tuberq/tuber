@@ -433,6 +433,15 @@ impl Tube {
         !self.buried.is_empty()
     }
 
+    /// Give back the room a burst of jobs left behind ([`crate::shrink`]).
+    pub fn shrink_if_sparse(&mut self) {
+        self.ready.shrink_if_sparse();
+        self.delay.shrink_if_sparse();
+        crate::shrink::shrink_if_sparse(&mut self.buried);
+        crate::shrink::shrink_if_sparse(&mut self.idempotency_keys);
+        crate::shrink::shrink_if_sparse(&mut self.idempotency_cooldowns);
+    }
+
     /// Returns true if the tube is completely empty and unused.
     ///
     /// Reserved jobs live in `conn.reserved_jobs`, not in any tube
@@ -450,15 +459,6 @@ impl Tube {
     /// which frees the tube on its refcount without consulting the pause.
     /// Checked last so the clock read only happens for a tube that is
     /// otherwise idle.
-    /// Give back the room a burst of jobs left behind ([`crate::shrink`]).
-    pub fn shrink_if_sparse(&mut self) {
-        self.ready.shrink_if_sparse();
-        self.delay.shrink_if_sparse();
-        crate::shrink::shrink_if_sparse(&mut self.buried);
-        crate::shrink::shrink_if_sparse(&mut self.idempotency_keys);
-        crate::shrink::shrink_if_sparse(&mut self.idempotency_cooldowns);
-    }
-
     pub fn is_idle(&self) -> bool {
         self.ready.is_empty()
             && self.delay.is_empty()

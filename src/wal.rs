@@ -647,8 +647,7 @@ pub trait WalObserver: Send {
 // --- Serialization ---
 
 pub fn serialize_full_job(job: &Job) -> Vec<u8> {
-    let inline_len = job.body.as_inline_bytes().map_or(0, <[u8]>::len);
-    let mut p = Payload::with_capacity(128 + job.tube_name.len() + inline_len);
+    let mut p = Payload::with_capacity(estimate_full_job_size(job) - Payload::HEADER - 4);
     let payload = &mut p.0;
 
     // priority, delay_nanos, ttr_nanos, created_at_epoch_secs
@@ -730,28 +729,20 @@ pub fn serialize_state_change(
     reason: StateChangeReason,
     change_epoch_secs: u64,
 ) -> Vec<u8> {
-    let mut record = Vec::with_capacity(STATE_CHANGE_RECORD_SIZE);
-    record.push(RECORD_TYPE_STATE_CHANGE);
-    record.extend_from_slice(&job_id.to_le_bytes());
-    record.extend_from_slice(&STATE_CHANGE_PAYLOAD_LEN.to_le_bytes());
-
     // payload (v7): state + priority + delay_nanos + expiry_epoch_secs + reason
     //             + change_epoch_secs
+    let mut p = Payload::with_capacity(STATE_CHANGE_PAYLOAD_LEN as usize);
     let state_byte = match state {
         Some(s) => state_to_u8(s),
         None => STATE_DELETED,
     };
-    record.push(state_byte);
-    record.extend_from_slice(&priority.to_le_bytes());
-    record.extend_from_slice(&delay_nanos.to_le_bytes());
-    record.extend_from_slice(&expiry_epoch_secs.to_le_bytes());
-    record.push(reason_to_u8(reason));
-    record.extend_from_slice(&change_epoch_secs.to_le_bytes());
-
-    let crc = crc32fast::hash(&record);
-    record.extend_from_slice(&crc.to_le_bytes());
-
-    record
+    p.0.push(state_byte);
+    p.0.extend_from_slice(&priority.to_le_bytes());
+    p.0.extend_from_slice(&delay_nanos.to_le_bytes());
+    p.0.extend_from_slice(&expiry_epoch_secs.to_le_bytes());
+    p.0.push(reason_to_u8(reason));
+    p.0.extend_from_slice(&change_epoch_secs.to_le_bytes());
+    p.frame(RECORD_TYPE_STATE_CHANGE, job_id)
 }
 
 /// A v8 tombstone record. `expires_epoch_secs == 0` clears the cooldown.
@@ -881,6 +872,10 @@ impl<'a> PayloadReader<'a> {
         let (head, rest) = self.0.split_at(n);
         self.0 = rest;
         Ok(head)
+    }
+
+    fn u8(&mut self) -> Result<u8, WalError> {
+        Ok(self.take(1)?[0])
     }
 
     fn u32(&mut self) -> Result<u32, WalError> {
@@ -1285,58 +1280,33 @@ fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize),
 }
 
 fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
-    // Determine record size from payload_len to support v3 (21), v4-v6 (22),
-    // and v7 (30). The record is self-describing via payload_len, so a newer
-    // reader can still decode older, shorter records.
-    if data.len() < 13 {
-        return Err(WalError::Truncated);
-    }
-    let payload_len = u32::from_le_bytes(data[9..13].try_into().map_err(|_| WalError::Truncated)?);
-    let record_size = (1 + 8 + 4 + payload_len + 4) as usize; // type + id + len + payload + crc
-
-    if data.len() < record_size {
-        return Err(WalError::Truncated);
-    }
+    // The payload's length gives its version: v3 (21), v4-v6 (22) or v7
+    // (30), so a newer reader can still decode older, shorter records.
+    let (job_id, payload, total_len) = unframe_record(data)?;
+    let payload_len = payload.len() as u32;
     if payload_len != STATE_CHANGE_PAYLOAD_LEN_V3
         && payload_len != STATE_CHANGE_PAYLOAD_LEN_V4
         && payload_len != STATE_CHANGE_PAYLOAD_LEN_V7
     {
         return Err(WalError::InvalidData);
     }
-
-    let job_id = u64::from_le_bytes(data[1..9].try_into().map_err(|_| WalError::Truncated)?);
-
-    // Verify CRC
-    let stored_crc = u32::from_le_bytes(
-        data[record_size - 4..record_size]
-            .try_into()
-            .map_err(|_| WalError::Truncated)?,
-    );
-    let computed_crc = crc32fast::hash(&data[..record_size - 4]);
-    if stored_crc != computed_crc {
-        return Err(WalError::BadCrc);
-    }
-
-    let state_byte = data[13];
+    let mut r = PayloadReader(payload);
+    let state_byte = r.u8()?;
     let new_state = if state_byte == STATE_DELETED {
         None
     } else {
         Some(u8_to_state(state_byte).ok_or(WalError::InvalidData)?)
     };
-    let new_priority =
-        u32::from_le_bytes(data[14..18].try_into().map_err(|_| WalError::Truncated)?);
-    let new_delay_nanos =
-        u64::from_le_bytes(data[18..26].try_into().map_err(|_| WalError::Truncated)?);
-    let expiry_epoch_secs =
-        u64::from_le_bytes(data[26..34].try_into().map_err(|_| WalError::Truncated)?);
-
+    let new_priority = r.u32()?;
+    let new_delay_nanos = r.u64()?;
+    let expiry_epoch_secs = r.u64()?;
     let reason = if payload_len >= STATE_CHANGE_PAYLOAD_LEN_V4 {
-        u8_to_reason(data[34])
+        u8_to_reason(r.u8()?)
     } else {
         StateChangeReason::None
     };
     let change_epoch_secs = if payload_len >= STATE_CHANGE_PAYLOAD_LEN_V7 {
-        u64::from_le_bytes(data[35..43].try_into().map_err(|_| WalError::Truncated)?)
+        r.u64()?
     } else {
         0
     };
@@ -1351,7 +1321,7 @@ fn deserialize_state_change(data: &[u8]) -> Result<(WalRecord, usize), WalError>
             reason,
             change_epoch_secs,
         },
-        record_size,
+        total_len,
     ))
 }
 
@@ -3470,6 +3440,45 @@ mod tests {
         let estimated = estimate_full_job_size(&job);
         let actual = serialize_full_job(&job).len();
         assert_eq!(estimated, actual);
+    }
+
+    #[test]
+    fn the_size_estimate_counts_a_job_s_tags() {
+        let mut job = make_test_job(1, b"data");
+        job.set_ext(crate::job::JobExt {
+            idempotency_key: Some(("order-1234".into(), 60)),
+            group: Some("batch-7".into()),
+            after_group: Some("batch-6".into()),
+            concurrency_key: Some(("customer-42".into(), 2)),
+        });
+        assert_eq!(estimate_full_job_size(&job), serialize_full_job(&job).len());
+    }
+
+    #[test]
+    fn a_state_change_record_has_its_v7_layout() {
+        let (id, pri, delay, expiry, epoch) = (7u64, 1024u32, 5_000_000_000u64, 0u64, 1_700_000_000u64);
+        let mut expected = vec![RECORD_TYPE_STATE_CHANGE];
+        expected.extend_from_slice(&id.to_le_bytes());
+        expected.extend_from_slice(&30u32.to_le_bytes());
+        expected.push(state_to_u8(JobState::Delayed));
+        expected.extend_from_slice(&pri.to_le_bytes());
+        expected.extend_from_slice(&delay.to_le_bytes());
+        expected.extend_from_slice(&expiry.to_le_bytes());
+        expected.push(reason_to_u8(StateChangeReason::Release));
+        expected.extend_from_slice(&epoch.to_le_bytes());
+        let crc = crc32fast::hash(&expected);
+        expected.extend_from_slice(&crc.to_le_bytes());
+
+        let record = serialize_state_change(
+            id,
+            Some(JobState::Delayed),
+            pri,
+            delay,
+            expiry,
+            StateChangeReason::Release,
+            epoch,
+        );
+        assert_eq!(record, expected);
     }
 
     // --- Corruption / edge-case tests ---
