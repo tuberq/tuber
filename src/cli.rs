@@ -1,8 +1,9 @@
-//! tuber's command line. `main` takes [`command`], lets `ee/` add its
-//! `server` flags, and hands it to [`run`] with `ee/`'s hook, which can
-//! change the [`ServerConfig`] before the server starts. Nothing here names
-//! `ee/` (BUSL-1.1), so this MIT file builds without it: `src/main.rs` is the
-//! one place the two meet. The `#[global_allocator]` stays in `main`.
+//! tuber's command line. `main` calls [`run`] with two of `ee/`'s
+//! functions: one adds its `server` flags to the command line, the other is
+//! a hook that can change the [`ServerConfig`] before the server starts.
+//! Nothing here names `ee/` (BUSL-1.1), so this MIT file builds without it:
+//! `src/main.rs` is the one place the two meet. The `#[global_allocator]`
+//! stays in `main`.
 
 use std::time::Duration;
 
@@ -61,9 +62,9 @@ struct Cli {
     command: Commands,
 }
 
-/// The `server` subcommand's flags. `ee/` adds its own beside them with
-/// [`command`] and `mut_subcommand("server", ..)`, and reads them back from
-/// the matches [`run`] hands its hook.
+/// The `server` subcommand's flags. `ee/` adds its own beside them through
+/// [`run`]'s `customize`, and reads them back from the matches `run` hands
+/// its hook.
 #[derive(Args, Debug)]
 pub struct ServerArgs {
     /// Listen address
@@ -339,14 +340,16 @@ enum Commands {
 /// logged, and the process exits 1, as for any other startup failure.
 pub type HookError = Box<dyn std::error::Error + Send + Sync>;
 
-/// tuber's command line. `main` adds `ee/`'s flags to `server` with
-/// `mut_subcommand("server", ..)` before handing it to [`run`].
-pub fn command() -> Command {
+/// tuber's command line, before `customize` changes it. Only [`run`]
+/// builds it, after the env alias: clap reads an arg's env var when the arg
+/// is built, so a command built before the alias never sees it.
+fn command() -> Command {
     Cli::command()
 }
 
-/// Parse the process arguments with `cmd`, [`command`] with any flags added
-/// to it, and do what they say.
+/// Parse the process arguments with tuber's command line, as `customize`
+/// changes it, and do what they say. `main` passes one that adds `ee/`'s
+/// flags to `server` with `mut_subcommand("server", ..)`.
 ///
 /// For `server`, `configure` gets the subcommand's matches, which hold the
 /// flags `ee/` added, and the [`ServerConfig`] tuber's own flags
@@ -357,12 +360,13 @@ pub fn command() -> Command {
 /// It creates the tokio runtime itself, after applying the deprecated
 /// `TUBER_WAL_SYNC_INTERVAL` alias to the environment, which is only sound
 /// while the process has one thread: call it before starting any of yours.
-pub fn run<F>(cmd: Command, configure: F)
+pub fn run<C, F>(customize: C, configure: F)
 where
+    C: FnOnce(Command) -> Command,
     F: FnOnce(&ArgMatches, &mut ServerConfig) -> Result<(), HookError>,
 {
     alias_deprecated_env();
-    let matches = cmd.get_matches();
+    let matches = customize(command()).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -377,6 +381,7 @@ where
 ///
 /// This MUST run before the tokio runtime starts: the runtime spawns worker
 /// threads, and `set_var` is only sound while the process is single-threaded.
+/// And before [`command`] is built, which reads `TUBER_SYNC_INTERVAL`.
 fn alias_deprecated_env() {
     if std::env::var_os("TUBER_SYNC_INTERVAL").is_none()
         && let Some(old) = std::env::var_os("TUBER_WAL_SYNC_INTERVAL")

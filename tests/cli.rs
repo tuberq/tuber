@@ -87,6 +87,28 @@ fn legacy_wal_sync_interval_env_does_not_block_in_memory_start() {
 }
 
 #[test]
+fn legacy_wal_sync_interval_env_sets_the_sync_interval() {
+    // The bug: clap read TUBER_SYNC_INTERVAL when `main` built the command,
+    // before the shim copied the old var in, so this warned and then ran at
+    // the 100ms default: strict mode silently relaxed.
+    let dir = tempfile::tempdir().unwrap();
+    let child = spawn_server(
+        &[("TUBER_WAL_SYNC_INTERVAL", "0")],
+        &["-V", "-b", dir.path().to_str().unwrap(), "-s", "1g"],
+    );
+    let (early, out) = settle(child);
+
+    assert!(
+        early.is_none(),
+        "server exited early ({early:?})\nstdout:\n{out}"
+    );
+    assert!(
+        out.contains(" sync=every-write"),
+        "TUBER_WAL_SYNC_INTERVAL=0 must mean fsync on every write; stdout:\n{out}"
+    );
+}
+
+#[test]
 fn plain_in_memory_start_emits_no_ignore_warning() {
     // No persistence flags set: clean startup, no spurious warning.
     let child = spawn_server(&[], &[]);
