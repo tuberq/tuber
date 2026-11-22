@@ -115,6 +115,11 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
+          # An SPDX list of every package in the image, attached to it in the
+          # registry, so an advisory can be checked against what runs. It lists the
+          # base image's packages; the crates appear only once the binary is built
+          # with `cargo auditable`.
+          sbom: true
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
