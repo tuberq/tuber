@@ -855,6 +855,7 @@ Read more about it [on my blog](https://da.nmilne.com/shipping-a-job-queue-syste
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, except `ee/`, which is BUSL-1.1 — see [LICENSE](LICENSE) and
+[ee/LICENSE](ee/LICENSE).
 
 Originally created by Keith Rarick and contributors. The original beanstalkd is licensed under the [MIT License](https://github.com/beanstalkd/beanstalkd/blob/master/LICENSE).

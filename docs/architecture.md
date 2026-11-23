@@ -68,10 +68,19 @@ simplicity with a single **engine task** that owns all server state:
 For blocking `reserve`: the engine stores the `oneshot::Sender` and fires it
 when a matching job becomes available (or on timeout).
 
-The engine also runs a tick timer to:
+The engine also runs a tick timer (`ServerState::tick`, src/server/tick.rs,
+every 100 ms or the sync interval if shorter) to:
 - Promote delayed jobs to ready when their deadline passes
-- Expire reserved jobs past their TTR back to ready
 - Unpause paused tubes
+- Expire reserved jobs past their TTR back to ready
+- Answer parked reserves: `DEADLINE_SOON` within the TTR safety margin,
+  `TIMED_OUT` past their timeout, and a job if one is now ready
+- Fire due recurring schedules, on the wall clock
+- End expired `idp:` cooldowns
+- Maintain the WAL (GC, sync, compaction), migrating live records out of
+  the segment being compacted
+- Reap idle tubes, and once a second shrink sparse collections
+  (src/shrink.rs)
 
 ### Job Ownership
 
