@@ -273,7 +273,7 @@ waiting-jobs: 1
 A buried job blocks group completion (`complete: false`). Kick it to let the group finish.
 
 - **Group names are global** — jobs in the same group can span multiple tubes.
-- **No cycle detection** — if two groups depend on each other, the waiting jobs will be held indefinitely. Cycle avoidance is the client's responsibility. The one cycle tuber catches is a job naming the same group in `grp:` and `aft:`, which would wait on itself: that put gets `BAD_FORMAT`.
+- **Cycles are refused** — a job with `grp:x aft:y` keeps x from completing until y does, so if y already waits on x, directly or through other groups, neither ever could. The put that would close such a cycle gets `BAD_FORMAT CYCLE`, and nothing is stored. A job naming the same group in both tags gets it too. An `aft:` job counts from its put until it's released, kicked, reserved or deleted; one with a delay counts from the start, since it's held if its group is incomplete when it comes due.
 
 ### Concurrency Keys
 

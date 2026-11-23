@@ -363,6 +363,10 @@ impl ServerState {
             let delay = job.delay;
             let idempotency_key = job.idempotency_key().cloned();
             let group = job.group().cloned();
+            let waits_on = job
+                .after_group()
+                .filter(|_| super::still_waits(&self.jobs, id))
+                .cloned();
 
             self.ensure_tube(&tube_name);
 
@@ -432,6 +436,9 @@ impl ServerState {
                 if state == JobState::Buried {
                     gs.buried += 1;
                 }
+            }
+            if let (Some(grp), Some(after)) = (&group, &waits_on) {
+                self.add_group_wait(grp, after, id);
             }
         }
 

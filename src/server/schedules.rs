@@ -412,12 +412,16 @@ impl ServerState {
             self.record_fire(&owner, &name, &resp);
             // Refused before anything was queued: the tick is lost, as for
             // any refused put, but it wasn't a fire, so last-fire keeps its
-            // age. That includes INTERNAL_ERROR from a failed TOAST write, or
-            // after an earlier fire failed the WAL, but not from the put
-            // that failed it: its record may be on disk, and a restart bring
-            // the job back.
+            // age. That includes a cycle, which the entry's tags can make
+            // whenever the groups they name come to wait on each other, and
+            // INTERNAL_ERROR from a failed TOAST write, or after an earlier
+            // fire failed the WAL, but not from the put that failed it: its
+            // record may be on disk, and a restart bring the job back.
             let queued_nothing = match resp {
-                Response::OutOfMemory | Response::OutOfStorage | Response::JobTooBig => true,
+                Response::OutOfMemory
+                | Response::OutOfStorage
+                | Response::JobTooBig
+                | Response::Cycle => true,
                 Response::InternalError => wal_was_failed || !self.wal_failed,
                 _ => false,
             };

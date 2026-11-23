@@ -164,6 +164,11 @@ pub enum Response {
     Draining,
     NotDraining,
     BadFormat,
+    /// `BAD_FORMAT CYCLE`: a `put` whose `aft:` group already waits on the
+    /// job's own `grp:` group, directly or through others, so neither group
+    /// could ever complete. `BAD_FORMAT` first, so a client that reads only
+    /// the first word raises the error it already knows.
+    Cycle,
     UnknownCommand,
     ExpectedCrlf,
     JobTooBig,
@@ -242,6 +247,7 @@ impl Response {
             Response::Draining => buf.extend_from_slice(b"DRAINING\r\n"),
             Response::NotDraining => buf.extend_from_slice(b"NOT_DRAINING\r\n"),
             Response::BadFormat => buf.extend_from_slice(b"BAD_FORMAT\r\n"),
+            Response::Cycle => buf.extend_from_slice(b"BAD_FORMAT CYCLE\r\n"),
             Response::UnknownCommand => buf.extend_from_slice(b"UNKNOWN_COMMAND\r\n"),
             Response::ExpectedCrlf => buf.extend_from_slice(b"EXPECTED_CRLF\r\n"),
             Response::JobTooBig => buf.extend_from_slice(b"JOB_TOO_BIG\r\n"),
@@ -493,10 +499,11 @@ fn parse_tag(tags: &mut JobExt, part: &str) -> Result<bool, Response> {
 }
 
 /// Reject tag combinations that can never run: a job in group X that waits
-/// for X counts itself as pending, so it would be held forever.
+/// for X counts itself as pending, so it would be held forever. The shortest
+/// cycle; `ServerState::put_job` finds the longer ones.
 fn check_tags(tags: &JobExt) -> Result<(), Response> {
     if tags.group.is_some() && tags.group == tags.after_group {
-        return Err(Response::BadFormat);
+        return Err(Response::Cycle);
     }
     Ok(())
 }
@@ -1500,16 +1507,16 @@ mod tests {
         // it would wait forever.
         assert_eq!(
             parse_command("put 0 0 60 1 grp:x aft:x").unwrap_err(),
-            Response::BadFormat
+            Response::Cycle
         );
         assert_eq!(
             parse_command("put 0 0 60 1 aft:x grp:x").unwrap_err(),
-            Response::BadFormat
+            Response::Cycle
         );
         assert!(parse_command("put 0 0 60 1 grp:x aft:y").is_ok());
         let (bytes, line) = schedule_line("schedule-put a t 0 0 1 2 grp:x aft:x @daily");
         assert_eq!(bytes, Some(2));
-        assert_eq!(line.unwrap_err(), Response::BadFormat);
+        assert_eq!(line.unwrap_err(), Response::Cycle);
     }
 
     #[test]

@@ -15,7 +15,7 @@ Optional extension tags (space-separated, after `<bytes>`):
 |---|---|
 | `idp:<key>` or `idp:<key>:<ttl>` | Idempotency key. Deduplicates within the tube — if a live job with the same key exists, returns the original ID and state. Optional TTL (seconds) keeps deduplicating after the job is deleted, unless it was buried when deleted (by `delete` or `flush-buried`). |
 | `grp:<name>` | Assign the job to a named group for fan-out/fan-in. |
-| `aft:<name>` | Hold the job until all jobs in the named group are deleted. The group is checked when the job is put, or when its delay is up; once released, the job isn't held again. |
+| `aft:<name>` | Hold the job until all jobs in the named group are deleted. The group is checked when the job is put, or when its delay is up; once released, the job isn't held again. A put that would make groups wait on each other is refused (`BAD_FORMAT CYCLE`, below). |
 | `con:<key>` or `con:<key>:<N>` | Concurrency key. Limits parallel reservations sharing this key, in any tube. Default limit is 1. Jobs with different limits for one key get the smallest declared by any of them that is ready or reserved. |
 
 Responses:
@@ -26,6 +26,14 @@ Responses:
 - `OUT_OF_STORAGE\r\n` — the disk budget (`--max-storage-bytes`, with `-b`) is full. Nothing is stored.
 - `EXPECTED_CRLF\r\n` (body not terminated correctly — **closes the connection**, see below)
 - `JOB_TOO_BIG\r\n`
+- `BAD_FORMAT CYCLE\r\n` — the job's `aft:` group already waits on its
+  `grp:` group, directly or through other groups, or is the same group, so
+  neither could ever complete. Nothing is stored. A group waits on another
+  while it has an `aft:` job its group may still hold: from the job's put
+  until it is released, kicked, reserved or deleted. With a delay that is
+  from the put, whatever the group holds then, since the job is held if its
+  group is incomplete when the delay is up. The reply starts with
+  `BAD_FORMAT`, so a client that reads only the first word raises that.
 - `DRAINING\r\n`
 - `NOT_DRAINING\r\n`
 - `INTERNAL_ERROR\r\n` — the job couldn't be persisted (`-b`). It won't run

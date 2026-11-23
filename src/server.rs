@@ -379,6 +379,13 @@ struct GroupState {
     buried: u64,
     /// Job IDs with `aft:<id>` that are held waiting for group completion.
     waiting_jobs: Vec<u64>,
+    /// This group's own `aft:` jobs, by the group each waits on: what a put
+    /// checks for a cycle (`ServerState::closes_cycle`). Its keys are kept in
+    /// step with `ServerState::group_waiters`.
+    waits_on: HashMap<String, GroupWaits>,
+    /// Size at which `ServerState::add_group_wait` next drops the stale
+    /// `waits_on` entries, as `GroupWaits::prune_at` does for one entry.
+    waits_prune_at: usize,
 }
 
 impl GroupState {
@@ -387,6 +394,8 @@ impl GroupState {
             pending: 0,
             buried: 0,
             waiting_jobs: Vec::new(),
+            waits_on: HashMap::new(),
+            waits_prune_at: 0,
         }
     }
 
@@ -408,11 +417,63 @@ impl GroupState {
     }
 }
 
+/// One group's jobs that wait on another group and may still be held by it.
+/// A job stops waiting when it leaves the delay heap for good, and that
+/// happens in many places (a release by its group, a kick, `reserve-job`,
+/// a delete, a flush, ...), so ids aren't taken off there. They are checked
+/// when read instead, and the stale ones dropped.
+#[derive(Debug, Default)]
+struct GroupWaits {
+    ids: Vec<u64>,
+    /// Length at which `push` next drops the stale ids, so a long-lived
+    /// group's list grows with its waiting jobs, not with every one it had.
+    prune_at: usize,
+}
+
+impl GroupWaits {
+    fn push(&mut self, id: u64, jobs: &HashMap<u64, Box<Job>>) {
+        if self.ids.len() >= self.prune_at {
+            self.ids.retain(|&id| still_waits(jobs, id));
+            crate::shrink::shrink_if_sparse(&mut self.ids);
+            self.prune_at = (self.ids.len() * 2).max(16);
+        }
+        self.ids.push(id);
+    }
+
+    /// Whether any of the jobs still waits, dropping stale ids until one is
+    /// found. The newest are checked first: the likeliest to still wait.
+    fn any(&mut self, jobs: &HashMap<u64, Box<Job>>) -> bool {
+        while let Some(&id) = self.ids.last() {
+            if still_waits(jobs, id) {
+                return true;
+            }
+            self.ids.pop();
+        }
+        false
+    }
+}
+
+/// Whether `aft:` job `id` may still be held by its group: it is delayed and
+/// has never been reserved (`ServerState::held_by_group`, less the group's
+/// own state). One that has left that state never returns to it.
+fn still_waits(jobs: &HashMap<u64, Box<Job>>, id: u64) -> bool {
+    jobs.get(&id)
+        .is_some_and(|j| j.state == JobState::Delayed && j.reserve_ct == 0)
+}
+
 // How many times a tube was searched for a ready job, so tests can tell
 // work proportional to the tubes involved from work proportional to all.
 #[cfg(test)]
 thread_local! {
     static TUBES_LOOKED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// How many waits between groups a put's cycle check looked at, so tests can
+// tell work proportional to the smaller side of the search from work
+// proportional to everything reachable from the `aft:` group.
+#[cfg(test)]
+thread_local! {
+    static WAITS_LOOKED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 // How many `idp:` cooldowns the tick checked for expiry, so tests can tell
@@ -483,6 +544,10 @@ struct ServerState {
     cooldown_expiry: BTreeSet<(SystemTime, Arc<str>, Arc<str>)>,
     /// Job group tracking for grp:/aft: features.
     groups: HashMap<String, GroupState>,
+    /// The groups with an entry for a group in their `GroupState::waits_on`,
+    /// by that group: the other direction, for the cycle check. Kept in step
+    /// by `add_group_wait`, `unlink_group_wait` and `check_group_completion`.
+    group_waiters: HashMap<String, HashSet<String>>,
     /// Active reservation count per concurrency key.
     concurrency_keys: HashMap<String, u32>,
     /// The limits declared by each key's jobs, as limit → jobs declaring it:
@@ -620,6 +685,7 @@ impl ServerState {
             platform,
             cooldown_expiry: BTreeSet::new(),
             groups: HashMap::new(),
+            group_waiters: HashMap::new(),
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
             deferred_replies: Vec::new(),
@@ -697,6 +763,7 @@ impl ServerState {
         shrink_if_sparse(&mut self.jobs);
         shrink_if_sparse(&mut self.tubes);
         shrink_if_sparse(&mut self.groups);
+        shrink_if_sparse(&mut self.group_waiters);
         shrink_if_sparse(&mut self.concurrency_keys);
         shrink_if_sparse(&mut self.concurrency_limits);
         shrink_if_sparse(&mut self.waited_tubes);
@@ -1115,6 +1182,155 @@ impl ServerState {
                 .is_some_and(|gs| !gs.is_complete())
     }
 
+    /// Whether a job in `group` that waits on `after` would close a cycle:
+    /// whether `after` already waits on `group`, directly or through other
+    /// groups. Each group on such a cycle has a job held until the next one
+    /// completes, so none of them ever would.
+    ///
+    /// Searches from both ends, forward from `after` over the groups it
+    /// waits on and back from `group` over the groups waiting on it, a
+    /// cycle being where they meet; once either side runs out there is
+    /// none. Each step takes the side that would have looked at fewer waits
+    /// by its end, so the cost is bounded by the cheaper side. Building a
+    /// chain or a fan-in adds waits from or to a group nothing else touches
+    /// yet, so it costs a step or two however large the graph is.
+    fn closes_cycle(&mut self, group: &str, after: &str) -> bool {
+        if group == after {
+            return true;
+        }
+        let mut ahead: HashSet<String> = HashSet::from([after.to_owned()]);
+        let mut behind: HashSet<String> = HashSet::from([group.to_owned()]);
+        let mut ahead_next = vec![after.to_owned()];
+        let mut behind_next = vec![group.to_owned()];
+        let (mut ahead_cost, mut behind_cost) = (0, 0);
+        loop {
+            let (Some(a), Some(b)) = (ahead_next.last(), behind_next.last()) else {
+                return false;
+            };
+            // Stale waits are counted too: an upper bound is enough here.
+            let a_cost = ahead_cost + self.groups.get(a).map_or(0, |gs| gs.waits_on.len());
+            let b_cost = behind_cost + self.group_waiters.get(b).map_or(0, |w| w.len());
+            if a_cost <= b_cost {
+                ahead_cost = a_cost;
+                let name = ahead_next.pop().unwrap_or_default();
+                for target in self.groups_waited_on(&name) {
+                    if behind.contains(&target) {
+                        return true;
+                    }
+                    if ahead.insert(target.clone()) {
+                        ahead_next.push(target);
+                    }
+                }
+            } else {
+                behind_cost = b_cost;
+                let name = behind_next.pop().unwrap_or_default();
+                for waiter in self.groups_waiting_on(&name) {
+                    if ahead.contains(&waiter) {
+                        return true;
+                    }
+                    if behind.insert(waiter.clone()) {
+                        behind_next.push(waiter);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Note that `aft:` job `id` in `group` may be held until `after`
+    /// completes, for the cycle check.
+    fn add_group_wait(&mut self, group: &str, after: &str, id: u64) {
+        let Some(gs) = self.groups.get_mut(group) else {
+            return;
+        };
+        if let Some(waits) = gs.waits_on.get_mut(after) {
+            waits.push(id, &self.jobs);
+            return;
+        }
+        // A new entry. A group that never completes may wait on a new group
+        // with each job, so its stale entries are dropped as they mount up.
+        let prune = gs.waits_on.len() >= gs.waits_prune_at;
+        if prune {
+            self.groups_waited_on(group);
+        }
+        let Some(gs) = self.groups.get_mut(group) else {
+            return;
+        };
+        if prune {
+            crate::shrink::shrink_if_sparse(&mut gs.waits_on);
+            gs.waits_prune_at = (gs.waits_on.len() * 2).max(16);
+        }
+        let mut waits = GroupWaits::default();
+        waits.push(id, &self.jobs);
+        gs.waits_on.insert(after.to_owned(), waits);
+        self.group_waiters
+            .entry(after.to_owned())
+            .or_default()
+            .insert(group.to_owned());
+    }
+
+    /// Forget that `group` waits on `after`, both ways.
+    fn unlink_group_wait(&mut self, group: &str, after: &str) {
+        if let Some(gs) = self.groups.get_mut(group) {
+            gs.waits_on.remove(after);
+        }
+        if let Some(waiters) = self.group_waiters.get_mut(after) {
+            waiters.remove(group);
+            if waiters.is_empty() {
+                self.group_waiters.remove(after);
+            } else {
+                crate::shrink::shrink_if_sparse(waiters);
+            }
+        }
+    }
+
+    /// The groups `group` has a job still waiting on. Waits none of whose
+    /// jobs still wait are dropped.
+    fn groups_waited_on(&mut self, group: &str) -> Vec<String> {
+        let Some(gs) = self.groups.get_mut(group) else {
+            return Vec::new();
+        };
+        let (mut live, mut stale) = (Vec::new(), Vec::new());
+        for (after, waits) in gs.waits_on.iter_mut() {
+            #[cfg(test)]
+            WAITS_LOOKED_AT.with(|n| n.set(n.get() + 1));
+            if waits.any(&self.jobs) {
+                live.push(after.clone());
+            } else {
+                stale.push(after.clone());
+            }
+        }
+        for after in stale {
+            self.unlink_group_wait(group, &after);
+        }
+        live
+    }
+
+    /// The groups with a job still waiting on `group`. Waits none of whose
+    /// jobs still wait are dropped.
+    fn groups_waiting_on(&mut self, group: &str) -> Vec<String> {
+        let Some(waiters) = self.group_waiters.get(group) else {
+            return Vec::new();
+        };
+        let (mut live, mut stale) = (Vec::new(), Vec::new());
+        for waiter in waiters {
+            #[cfg(test)]
+            WAITS_LOOKED_AT.with(|n| n.set(n.get() + 1));
+            let waits = self
+                .groups
+                .get_mut(waiter)
+                .and_then(|gs| gs.waits_on.get_mut(group));
+            if waits.is_some_and(|waits| waits.any(&self.jobs)) {
+                live.push(waiter.clone());
+            } else {
+                stale.push(waiter.clone());
+            }
+        }
+        for waiter in stale {
+            self.unlink_group_wait(&waiter, group);
+        }
+        live
+    }
+
     /// Check if a job's concurrency key already has an active reservation.
     /// The answer depends only on the key, never on the job: `ReadyQueue`
     /// relies on that to pass over all of a blocked key's jobs at once.
@@ -1513,6 +1729,20 @@ impl ServerState {
             return dup;
         }
 
+        // A job that would wait on its group is checked for a cycle: one
+        // with a delay may be held when it comes due, whatever its group
+        // holds now, and one waiting on its own group joins it first. The
+        // parser refuses that last already; this doesn't count on it.
+        // Refused before the budgets, since no retry would help.
+        if let (Some(group), Some(after)) = (ext.group.as_deref(), ext.after_group.as_deref())
+            && (delay > 0
+                || group == after
+                || self.groups.get(after).is_some_and(|gs| !gs.is_complete()))
+            && self.closes_cycle(group, after)
+        {
+            return Response::Cycle;
+        }
+
         if self.drain_mode {
             return Response::Draining;
         }
@@ -1666,6 +1896,12 @@ impl ServerState {
             .after_group()
             .and_then(|ag| self.groups.get(ag))
             .is_some_and(|gs| !gs.is_complete());
+
+        if (delay > 0 || hold_for_group)
+            && let (Some(group), Some(after)) = (job.group(), job.after_group())
+        {
+            self.add_group_wait(group, after, id);
+        }
 
         // Enqueue
         if delay > 0 {
@@ -3785,8 +4021,11 @@ impl ServerState {
             .get(group_name)
             .map(|gs| gs.is_idle())
             .unwrap_or(false)
+            && let Some(gs) = self.groups.remove(group_name)
         {
-            self.groups.remove(group_name);
+            for after in gs.waits_on.keys() {
+                self.unlink_group_wait(group_name, after);
+            }
         }
 
         if !waiting_jobs.is_empty() {

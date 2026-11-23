@@ -2632,14 +2632,14 @@ async fn test_delete_held_after_job_cleans_waiting_jobs() {
 }
 
 /// A job can't wait for its own group: it counts itself as pending, so it
-/// would be held forever. The put is refused and its body drained.
+/// would be held forever. The put is refused as a cycle and its body drained.
 #[tokio::test]
 async fn test_put_after_its_own_group_is_bad_format() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
     c.mustsend("put 0 0 60 1 grp:self aft:self\r\na\r\n").await;
-    c.ckresp("BAD_FORMAT\r\n").await;
+    c.ckresp("BAD_FORMAT CYCLE\r\n").await;
     c.mustsend("put 0 0 60 1\r\nb\r\n").await;
     c.ckresp("INSERTED 1\r\n").await;
 }
@@ -3173,66 +3173,143 @@ async fn test_group_cross_tube() {
     c.ckresp("z\r\n").await;
 }
 
-/// Cyclic group dependencies hold jobs indefinitely without crashing.
+/// One field of `stats-group <name>`.
+async fn group_stat(c: &mut TestConn, group: &str, field: &str) -> String {
+    c.mustsend(&format!("stats-group {group}\r\n")).await;
+    let body = c.read_ok_body().await;
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}: ")))
+        .unwrap_or_else(|| panic!("no {field} in {body:?}"))
+        .to_string()
+}
+
+/// A put that would make two groups wait on each other is refused: neither
+/// could ever complete. It takes no id, joins no group and keeps no idp:
+/// key, and the job it would have deadlocked still runs.
 #[tokio::test]
-async fn test_group_cycle_holds_indefinitely() {
+async fn test_put_that_closes_a_group_cycle_is_refused() {
     let srv = TestServer::start().await;
     let mut c = srv.connect().await;
 
-    // Seed both groups so they have pending members before adding the aft: jobs.
-    // Without this, the first aft: would fire immediately (empty group = complete).
-    c.mustsend("put 0 0 60 1 grp:cycleA\r\n").await;
-    c.mustsend("x\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:cycleA\r\nx\r\n").await;
     c.ckresp("INSERTED 1\r\n").await;
-
-    c.mustsend("put 0 0 60 1 grp:cycleB\r\n").await;
-    c.mustsend("y\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:cycleB\r\ny\r\n").await;
     c.ckresp("INSERTED 2\r\n").await;
 
-    // Now create the cycle: each after-job depends on the other group
-    c.mustsend("put 0 0 60 1 grp:cycleA aft:cycleB\r\n").await;
-    c.mustsend("a\r\n").await;
+    // Job 3 waits on cycleB, so cycleA can't complete before cycleB does.
+    c.mustsend("put 0 0 60 1 grp:cycleA aft:cycleB\r\na\r\n")
+        .await;
     c.ckresp("INSERTED 3\r\n").await;
 
-    c.mustsend("put 0 0 60 1 grp:cycleB aft:cycleA\r\n").await;
-    c.mustsend("b\r\n").await;
+    // This one would make cycleB wait on cycleA as well.
+    c.mustsend("put 0 0 60 1 idp:k grp:cycleB aft:cycleA\r\nb\r\n")
+        .await;
+    c.ckresp("BAD_FORMAT CYCLE\r\n").await;
+    assert_eq!(group_stat(&mut c, "cycleB", "delayed").await, "0");
+    c.mustsend("put 0 0 60 1 idp:k\r\nc\r\n").await;
     c.ckresp("INSERTED 4\r\n").await;
 
-    // Reserve and delete the seed jobs — groups still won't complete
-    // because jobs 3 and 4 are also group members (held, but still pending)
+    // cycleB completes, which releases job 3.
     c.mustsend("reserve-with-timeout 0\r\n").await;
     c.ckresp("RESERVED 1 1\r\n").await;
     c.ckresp("x\r\n").await;
-    c.mustsend("delete 1\r\n").await;
-    c.ckresp("DELETED\r\n").await;
-
     c.mustsend("reserve-with-timeout 0\r\n").await;
     c.ckresp("RESERVED 2 1\r\n").await;
     c.ckresp("y\r\n").await;
     c.mustsend("delete 2\r\n").await;
     c.ckresp("DELETED\r\n").await;
+    assert_eq!(job_state(&mut c, 3).await, "ready");
+}
 
-    // Neither cyclic job should be reservable — deadlocked
+/// An aft: job with a delay is held when it comes due if its group is
+/// incomplete then, so it counts toward a cycle from the start, even when
+/// the group it waits on had no jobs at its put.
+#[tokio::test]
+async fn test_a_delayed_aft_job_counts_toward_a_cycle() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 60 60 1 grp:x aft:y\r\na\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:y aft:x\r\nb\r\n").await;
+    c.ckresp("BAD_FORMAT CYCLE\r\n").await;
+    c.mustsend("put 0 5 60 1 grp:y aft:x\r\nb\r\n").await;
+    c.ckresp("BAD_FORMAT CYCLE\r\n").await;
+}
+
+/// x waits on y and y on z, so z can't wait on x.
+#[tokio::test]
+async fn test_a_cycle_through_three_groups_is_refused() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    for (id, g) in [(1, "x"), (2, "y"), (3, "z")] {
+        c.mustsend(&format!("put 0 0 60 1 grp:{g}\r\ns\r\n")).await;
+        c.ckresp(&format!("INSERTED {id}\r\n")).await;
+    }
+    c.mustsend("put 0 0 60 1 grp:x aft:y\r\na\r\n").await;
+    c.ckresp("INSERTED 4\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:y aft:z\r\na\r\n").await;
+    c.ckresp("INSERTED 5\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:z aft:x\r\na\r\n").await;
+    c.ckresp("BAD_FORMAT CYCLE\r\n").await;
+
+    // Waiting on the chain from outside it is fine.
+    c.mustsend("put 0 0 60 1 grp:w aft:x\r\na\r\n").await;
+    c.ckresp("INSERTED 6\r\n").await;
+}
+
+/// Only an aft: job that hasn't been let go yet ties its group to another.
+/// One released by its group, kicked, or reserved no longer does. Two paths
+/// to the same group are not a cycle, though a way back from it is.
+#[tokio::test]
+async fn test_group_waits_that_are_not_cycles_are_accepted() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Released by its group: job 2 waited on y until job 1 was deleted.
+    c.mustsend("put 0 0 60 1 grp:y\r\ns\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+    c.mustsend("put 9 0 60 1 grp:x aft:y\r\na\r\n").await;
+    c.ckresp("INSERTED 2\r\n").await;
     c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("TIMED_OUT\r\n").await;
+    c.ckresp("RESERVED 1 1\r\n").await;
+    c.ckresp("s\r\n").await;
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:y aft:x\r\nb\r\n").await;
+    c.ckresp("INSERTED 3\r\n").await;
 
-    // Server is still functional — put and reserve a normal job
-    c.mustsend("put 0 0 60 1\r\n").await;
-    c.mustsend("c\r\n").await;
+    // Kicked before it came due.
+    c.mustsend("put 0 60 60 1 grp:p aft:q\r\na\r\n").await;
+    c.ckresp("INSERTED 4\r\n").await;
+    c.mustsend("kick-job 4\r\n").await;
+    c.ckresp("KICKED\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:q aft:p\r\nb\r\n").await;
     c.ckresp("INSERTED 5\r\n").await;
 
-    c.mustsend("reserve-with-timeout 0\r\n").await;
-    c.ckresp("RESERVED 5 1\r\n").await;
-    c.ckresp("c\r\n").await;
-
-    // Cyclic jobs are still there (peek confirms they exist)
-    c.mustsend("peek 3\r\n").await;
-    c.ckresp("FOUND 3 1\r\n").await;
+    // Reserved by id before it came due.
+    c.mustsend("put 0 60 60 1 grp:m aft:n\r\na\r\n").await;
+    c.ckresp("INSERTED 6\r\n").await;
+    c.mustsend("reserve-job 6\r\n").await;
+    c.ckresp("RESERVED 6 1\r\n").await;
     c.ckresp("a\r\n").await;
+    c.mustsend("put 0 0 60 1 grp:n aft:m\r\nb\r\n").await;
+    c.ckresp("INSERTED 7\r\n").await;
 
-    c.mustsend("peek 4\r\n").await;
-    c.ckresp("FOUND 4 1\r\n").await;
-    c.ckresp("b\r\n").await;
+    // A diamond: d waits on e and f, which both wait on g.
+    for (id, line) in [
+        (8, "grp:d aft:e"),
+        (9, "grp:d aft:f"),
+        (10, "grp:e aft:g"),
+        (11, "grp:f aft:g"),
+        (12, "grp:h aft:d"),
+    ] {
+        c.mustsend(&format!("put 0 60 60 1 {line}\r\na\r\n")).await;
+        c.ckresp(&format!("INSERTED {id}\r\n")).await;
+    }
+    c.mustsend("put 0 60 60 1 grp:g aft:h\r\na\r\n").await;
+    c.ckresp("BAD_FORMAT CYCLE\r\n").await;
 }
 
 // ---------------------------------------------------------------------------

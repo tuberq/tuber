@@ -4386,6 +4386,42 @@ fn a_fire_refused_for_memory_is_lost_but_not_recorded_as_a_fire() {
 }
 
 #[test]
+fn a_fire_refused_as_a_cycle_is_lost_but_not_recorded_as_a_fire() {
+    // The entry's jobs join y and wait on x, and x already waits on y, so
+    // its fire is refused before anything is queued, as for memory.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("ping", "grp:y aft:x every 60s")]);
+    let put = |s: &mut ServerState, group: &str, after: Option<&str>| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 60,
+            bytes: 1,
+            idempotency_key: None,
+            group: Some(group.into()),
+            after_group: after.map(Into::into),
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"x".to_vec()))
+    };
+    assert_eq!(put(&mut s, "y", None), Response::Inserted(1));
+    assert_eq!(put(&mut s, "x", Some("y")), Response::Inserted(2));
+    let t = next_fire(&s, "ping");
+
+    s.fire_due_schedules(t);
+    let e = s.schedules.get("app", "ping").unwrap();
+    assert_eq!((e.stats.rejected, e.stats.inserted), (1, 0));
+    assert_eq!(e.stats.last_result.as_deref(), Some("BAD_FORMAT CYCLE"));
+    assert_eq!(next_fire(&s, "ping"), t + mins(1));
+    assert_eq!(e.last_fire, None);
+    drop(s);
+    let restored = reopen(dir.path()).schedules;
+    assert_eq!(restored.get("app", "ping").unwrap().last_fire, None);
+}
+
+#[test]
 fn a_fire_whose_body_store_write_fails_is_not_recorded_as_a_fire() {
     // Refused before anything was queued, like a fire refused for memory.
     // The put answers INTERNAL_ERROR, but nothing reached the WAL to come
@@ -4830,4 +4866,462 @@ fn reserving_buried_jobs_oldest_first_does_not_scan_the_buried_list() {
         assert!(matches!(resp, Response::Reserved { .. }), "reserve-job {id} got {resp:?}");
         resp
     });
+}
+
+#[test]
+fn a_long_lived_group_keeps_only_its_waiting_jobs_for_the_cycle_check() {
+    // Group x stays open on job 1 while 1,000 of its aft:y jobs come and go.
+    // Each was kept as a job x waits on y by; those since kicked or deleted
+    // mustn't pile up behind the ones still waiting.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let put = |s: &mut ServerState, delay: u32, group: &str, after: Option<&str>| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay,
+            ttr: 120,
+            bytes: 1,
+            idempotency_key: None,
+            group: Some(group.into()),
+            after_group: after.map(Into::into),
+            concurrency_key: None,
+        };
+        match s.handle_command(c, cmd, Some(b"x".to_vec())) {
+            Response::Inserted(id) => id,
+            other => panic!("put: {other:?}"),
+        }
+    };
+    put(&mut s, 0, "x", None);
+    let mut waiting = Vec::new();
+    for i in 0..1000 {
+        let id = put(&mut s, 60, "x", Some("y"));
+        if i % 100 == 0 {
+            waiting.push(id);
+        } else if i % 2 == 0 {
+            assert_eq!(
+                s.handle_command(c, Command::KickJob { id }, None),
+                Response::KickedOne
+            );
+        } else {
+            assert_eq!(
+                s.handle_command(c, Command::Delete { id }, None),
+                Response::Deleted
+            );
+        }
+    }
+    let kept = s.groups["x"].waits_on["y"].ids.len();
+    assert!(
+        kept <= 64,
+        "kept {kept} ids for {} waiting jobs",
+        waiting.len()
+    );
+
+    // Those still waiting are still found: y can't wait on x.
+    let cmd = Command::Put {
+        pri: 0,
+        delay: 60,
+        ttr: 120,
+        bytes: 1,
+        idempotency_key: None,
+        group: Some("y".into()),
+        after_group: Some("x".into()),
+        concurrency_key: None,
+    };
+    assert_eq!(
+        s.handle_command(c, cmd, Some(b"x".to_vec())),
+        Response::Cycle
+    );
+}
+
+#[test]
+fn building_a_long_group_chain_or_a_wide_fan_in_stays_cheap() {
+    // The cycle check walked everything the aft: group waits on, however
+    // much: each link added to a chain walked the chain so far, and each
+    // job waiting on a group that waits on many looked at all of those.
+    // Neither new group had anything waiting on it, so neither put could
+    // close a cycle.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let put = |s: &mut ServerState, group: &str, after: &str| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 60,
+            ttr: 120,
+            bytes: 1,
+            idempotency_key: None,
+            group: Some(group.into()),
+            after_group: Some(after.into()),
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"x".to_vec()))
+    };
+    let looked_at = |f: &mut dyn FnMut()| {
+        let before = WAITS_LOOKED_AT.with(|n| n.get());
+        f();
+        WAITS_LOOKED_AT.with(|n| n.get()) - before
+    };
+
+    let n = 1000;
+    let chain = looked_at(&mut || {
+        for i in 1..=n {
+            assert!(matches!(
+                put(&mut s, &format!("g{i}"), &format!("g{}", i - 1)),
+                Response::Inserted(_)
+            ));
+        }
+    });
+    assert!(chain <= 4 * n, "a chain of {n} looked at {chain} waits");
+
+    let fan = looked_at(&mut || {
+        for i in 0..n {
+            assert!(matches!(
+                put(&mut s, "reports", &format!("order-{i}")),
+                Response::Inserted(_)
+            ));
+        }
+        for i in 0..100 {
+            assert!(matches!(
+                put(&mut s, &format!("z{i}"), "reports"),
+                Response::Inserted(_)
+            ));
+        }
+    });
+    assert!(fan <= 4 * (n + 100), "the fan-in looked at {fan} waits");
+
+    // Both still close a cycle where they should.
+    assert_eq!(put(&mut s, "g0", &format!("g{n}")), Response::Cycle);
+    assert_eq!(put(&mut s, "order-7", "z3"), Response::Cycle);
+}
+
+#[test]
+fn a_long_lived_group_keeps_only_the_waits_it_still_has() {
+    // Group emails stays open on job 1 while 1,000 of its jobs each wait on
+    // a group of their own and are kicked. The waits they leave mustn't
+    // pile up, in either direction, and a group's waits go when it does.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let put = |s: &mut ServerState, delay: u32, group: &str, after: Option<&str>| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay,
+            ttr: 120,
+            bytes: 1,
+            idempotency_key: None,
+            group: Some(group.into()),
+            after_group: after.map(Into::into),
+            concurrency_key: None,
+        };
+        match s.handle_command(c, cmd, Some(b"x".to_vec())) {
+            Response::Inserted(id) => id,
+            other => panic!("put: {other:?}"),
+        }
+    };
+    put(&mut s, 0, "emails", None);
+    for i in 0..1000 {
+        let id = put(&mut s, 60, "emails", Some(&format!("order-{i}")));
+        assert_eq!(
+            s.handle_command(c, Command::KickJob { id }, None),
+            Response::KickedOne
+        );
+    }
+    let kept = s.groups["emails"].waits_on.len();
+    assert!(kept <= 64, "emails kept {kept} waits");
+    assert!(
+        s.group_waiters.len() <= 64,
+        "{} groups waited on",
+        s.group_waiters.len()
+    );
+
+    let id = put(&mut s, 60, "a", Some("b"));
+    assert_eq!(
+        s.handle_command(c, Command::Delete { id }, None),
+        Response::Deleted
+    );
+    assert!(!s.groups.contains_key("a"));
+    assert!(!s.group_waiters.contains_key("b"));
+}
+
+#[test]
+fn the_cycle_check_matches_a_brute_force_search_and_nothing_deadlocks() {
+    // Random puts across five groups, any with grp: and aft: (its own group
+    // included), mixed with reserves, deletes, releases, kicks, reserve-job
+    // and delays coming due. Each put is refused as a cycle exactly when a
+    // search of the waits rebuilt from the job table says so. Then every
+    // job is let run: with no cycle let in, all of them complete.
+    const GROUPS: [&str; 5] = ["a", "b", "c", "d", "e"];
+    let still_waits = |j: &Job| j.state == JobState::Delayed && j.reserve_ct == 0;
+    let mut refused = 0;
+    for seed in 1..=8u64 {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut s = make_state();
+        let c = register(&mut s);
+
+        for _ in 0..3000 {
+            match next(100) {
+                0..=39 => {
+                    let pick = |next: &mut dyn FnMut(u64) -> u64| {
+                        (next(3) != 0).then(|| GROUPS[next(5) as usize].to_string())
+                    };
+                    let (group, after) = (pick(&mut next), pick(&mut next));
+                    let delay = if next(3) == 0 { 60 } else { 0 };
+
+                    // What the job table says: the waits as they stand, and
+                    // whether this job would add one that closes a cycle.
+                    let waits: HashSet<(String, String)> = s
+                        .jobs
+                        .values()
+                        .filter(|j| still_waits(j))
+                        .filter_map(|j| Some((j.group()?.clone(), j.after_group()?.clone())))
+                        .collect();
+                    let expect_cycle = match (&group, &after) {
+                        (Some(g), Some(a)) => {
+                            let incomplete = s.jobs.values().any(|j| j.group() == Some(a));
+                            let adds_wait = delay > 0 || incomplete || g == a;
+                            let mut seen = HashSet::from([a.clone()]);
+                            let mut todo = vec![a.clone()];
+                            while let Some(n) = todo.pop() {
+                                for (from, to) in &waits {
+                                    if *from == n && seen.insert(to.clone()) {
+                                        todo.push(to.clone());
+                                    }
+                                }
+                            }
+                            adds_wait && seen.contains(g)
+                        }
+                        _ => false,
+                    };
+                    let cmd = Command::Put {
+                        pri: next(4) as u32,
+                        delay,
+                        ttr: 120,
+                        bytes: 1,
+                        idempotency_key: None,
+                        group: group.clone(),
+                        after_group: after.clone(),
+                        concurrency_key: None,
+                    };
+                    let resp = s.handle_command(c, cmd, Some(b"x".to_vec()));
+                    assert_eq!(
+                        resp == Response::Cycle,
+                        expect_cycle,
+                        "seed {seed}: put grp:{group:?} aft:{after:?} delay {delay} got {resp:?}"
+                    );
+                    refused += expect_cycle as u32;
+                }
+                40..=59 => {
+                    if let Some(id) = reserve_now(&mut s, c) {
+                        s.handle_command(c, Command::Delete { id }, None);
+                    }
+                }
+                60..=67 => {
+                    if let Some(id) = reserve_now(&mut s, c) {
+                        let delay = if next(2) == 0 { 60 } else { 0 };
+                        s.handle_command(c, Command::Release { id, pri: 1, delay }, None);
+                    }
+                }
+                68..=73 => {
+                    s.handle_command(
+                        c,
+                        Command::Kick {
+                            bound: 1 + next(3) as u32,
+                        },
+                        None,
+                    );
+                }
+                74..=79 => {
+                    let id = 1 + next(s.next_job_id.max(1));
+                    s.handle_command(c, Command::KickJob { id }, None);
+                }
+                80..=85 => {
+                    let id = 1 + next(s.next_job_id.max(1));
+                    if let Response::Reserved { id, .. } =
+                        s.handle_command(c, Command::ReserveJob { id }, None)
+                    {
+                        s.handle_command(c, Command::Delete { id }, None);
+                    }
+                }
+                86..=91 => {
+                    let id = 1 + next(s.next_job_id.max(1));
+                    s.handle_command(c, Command::Delete { id }, None);
+                }
+                _ => {
+                    let due: Vec<u64> = s
+                        .jobs
+                        .values()
+                        .filter(|j| j.state == JobState::Delayed && j.deadline_at.is_some())
+                        .map(|j| j.id)
+                        .collect();
+                    if !due.is_empty() {
+                        make_due(&mut s, due[next(due.len() as u64) as usize]);
+                        s.tick();
+                    }
+                }
+            }
+        }
+
+        // Let everything run.
+        for _ in 0..10_000 {
+            if s.jobs.is_empty() {
+                break;
+            }
+            let due: Vec<u64> = s
+                .jobs
+                .values()
+                .filter(|j| j.state == JobState::Delayed && j.deadline_at.is_some())
+                .map(|j| j.id)
+                .collect();
+            for id in due {
+                make_due(&mut s, id);
+            }
+            s.tick();
+            while let Some(id) = reserve_now(&mut s, c) {
+                s.handle_command(c, Command::Delete { id }, None);
+            }
+        }
+        let left: Vec<_> = s
+            .jobs
+            .values()
+            .map(|j| (j.id, j.state, j.group().cloned(), j.after_group().cloned()))
+            .collect();
+        assert!(left.is_empty(), "seed {seed}: deadlocked {left:?}");
+    }
+    assert!(refused > 50, "only {refused} puts were refused as cycles");
+}
+
+#[test]
+fn a_cycle_restored_from_the_wal_is_searched_safely_and_freed_by_a_delete() {
+    // Groups x and y wait on each other, and so do p and q, as a WAL
+    // written before cycles were refused can hold. A search with a cycle on
+    // both sides ends, one that would close another cycle through them is
+    // refused, other work goes on, and deleting x's job frees the rest.
+    let mut s = make_state();
+    let mut jobs = HashMap::new();
+    for (id, group, after) in [(1, "x", "y"), (2, "y", "x"), (3, "p", "q"), (4, "q", "p")] {
+        let mut job = Box::new(Job::new(
+            id,
+            0,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            b"j".to_vec(),
+            Arc::from("default"),
+        ));
+        job.set_ext(crate::job::JobExt {
+            group: Some(group.into()),
+            after_group: Some(after.into()),
+            ..Default::default()
+        });
+        job.state = JobState::Delayed;
+        jobs.insert(id, job);
+    }
+    s.restore_jobs(jobs, 5, Vec::new(), Vec::new());
+    s.tick();
+    assert_eq!(s.groups["x"].waiting_jobs, [2]);
+    assert_eq!(s.groups["y"].waiting_jobs, [1]);
+
+    let c = register(&mut s);
+    let put = |s: &mut ServerState, delay: u32, group: Option<&str>, after: Option<&str>| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay,
+            ttr: 60,
+            bytes: 1,
+            idempotency_key: None,
+            group: group.map(Into::into),
+            after_group: after.map(Into::into),
+            concurrency_key: None,
+        };
+        s.handle_command(c, cmd, Some(b"x".to_vec()))
+    };
+    // p waits on z, so the search for z's job goes forward round x and y,
+    // and back round p and q.
+    assert_eq!(put(&mut s, 60, Some("p"), Some("z")), Response::Inserted(5));
+    assert_eq!(put(&mut s, 0, Some("z"), Some("x")), Response::Inserted(6));
+    assert_eq!(put(&mut s, 0, Some("x"), Some("z")), Response::Cycle);
+
+    assert_eq!(put(&mut s, 0, None, None), Response::Inserted(7));
+    assert_eq!(reserve_now(&mut s, c), Some(7));
+    assert_eq!(
+        s.handle_command(c, Command::Delete { id: 7 }, None),
+        Response::Deleted
+    );
+
+    assert_eq!(
+        s.handle_command(c, Command::Delete { id: 1 }, None),
+        Response::Deleted
+    );
+    assert_eq!(s.jobs[&2].state, JobState::Ready);
+    assert_eq!(s.jobs[&6].state, JobState::Ready);
+}
+
+#[test]
+fn a_burst_of_group_waits_gives_its_room_back_once_pruned() {
+    // Group x holds 5,000 waiting jobs on y at once, and emails 20,000 each
+    // on a group of its own, past what a collection keeps however empty.
+    // All are kicked, so stale, and so are the jobs after them until the
+    // stale ones are dropped: the room they took mustn't stay allocated.
+    let mut s = make_state();
+    let c = register(&mut s);
+    let put_and_kick = |s: &mut ServerState, group: &str, after: &str, kick: bool| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 60,
+            ttr: 120,
+            bytes: 1,
+            idempotency_key: None,
+            group: Some(group.into()),
+            after_group: Some(after.into()),
+            concurrency_key: None,
+        };
+        let Response::Inserted(id) = s.handle_command(c, cmd, Some(b"x".to_vec())) else {
+            panic!("put refused");
+        };
+        if kick {
+            assert_eq!(
+                s.handle_command(c, Command::KickJob { id }, None),
+                Response::KickedOne
+            );
+        }
+        id
+    };
+    let n = 20_000;
+    let mut burst = Vec::new();
+    for i in 0..n {
+        if i < 5000 {
+            burst.push(put_and_kick(&mut s, "x", "y", false));
+        }
+        burst.push(put_and_kick(&mut s, "emails", &format!("order-{i}"), false));
+    }
+    for id in burst {
+        assert_eq!(
+            s.handle_command(c, Command::KickJob { id }, None),
+            Response::KickedOne
+        );
+    }
+    let x_ids = |s: &ServerState| s.groups["x"].waits_on["y"].ids.len();
+    let emails_waits = |s: &ServerState| s.groups["emails"].waits_on.len();
+    for i in 0..2 * n {
+        if x_ids(&s) < 100 && emails_waits(&s) < 100 {
+            break;
+        }
+        put_and_kick(&mut s, "x", "y", true);
+        put_and_kick(&mut s, "emails", &format!("later-{i}"), true);
+    }
+    assert!(x_ids(&s) < 100 && emails_waits(&s) < 100, "never pruned");
+    let room = s.groups["x"].waits_on["y"].ids.capacity();
+    assert!(
+        room <= crate::shrink::MIN_CAPACITY,
+        "x's waits on y keep room for {room}"
+    );
+    // A map's capacity is rounded up: room for 4,096 is room for 7,168.
+    let room = s.groups["emails"].waits_on.capacity();
+    assert!(
+        room < 2 * crate::shrink::MIN_CAPACITY,
+        "emails' waits keep room for {room}"
+    );
 }

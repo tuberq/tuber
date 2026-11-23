@@ -100,7 +100,7 @@ Tuber extensions beyond standard beanstalkd:
 - Recurring schedules: `schedule-begin <owner>` → `SYNCING <owner>`; `schedule-put <name> <tube> <pri> <delay> <ttr> <bytes> [tags] <spec>` + body → `STAGED` (tags as on `put`, plus `catchup:<secs>`; any refusal poisons the sync); `schedule-commit` → `SYNCED <added> <changed> <removed> <unchanged>` or `ABORTED`; `schedule-abort` → `ABORTED`; `list-schedules [<owner>]`; `stats-schedule <owner> <name>`. A refused `schedule-put` line is still sent to the engine (as `Err`) so the sync knows. See `docs/protocol.md#schedule-commands`.
 - `watch <tube> [weight]` - optional weight parameter for weighted reserve mode.
 
-Responses are text, e.g. `INSERTED <id>\r\n`, `RESERVED <id> <bytes>\r\n`, `DELETED\r\n`, `NOT_FOUND\r\n`, `BAD_FORMAT\r\n`. Two budget-exhausted responses: `OUT_OF_MEMORY\r\n` (in-RAM cap from `--max-jobs-size`) and `OUT_OF_STORAGE\r\n` (combined disk cap from `--max-storage-bytes`).
+Responses are text, e.g. `INSERTED <id>\r\n`, `RESERVED <id> <bytes>\r\n`, `DELETED\r\n`, `NOT_FOUND\r\n`, `BAD_FORMAT\r\n`. Two budget-exhausted responses: `OUT_OF_MEMORY\r\n` (in-RAM cap from `--max-jobs-size`) and `OUT_OF_STORAGE\r\n` (combined disk cap from `--max-storage-bytes`). A `put` that would close a cycle of groups waiting on each other gets `BAD_FORMAT CYCLE\r\n` (`Response::Cycle`; `ServerState::closes_cycle`, which searches `GroupState::waits_on` and its inverse `group_waiters` from both ends).
 
 ## Testing Strategy
 

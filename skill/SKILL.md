@@ -156,6 +156,13 @@ up). If the group has no pending jobs then, the job is released, and it stays
 released even if the group gets new jobs later or the server restarts. So put
 a group's jobs *before* the `aft:` job that waits on them.
 
+**A put that would make groups wait on each other is refused** with
+`BAD_FORMAT CYCLE`, and nothing is stored. A job with `grp:x aft:y` keeps x
+from completing until y does, so if y already waits on x, directly or through
+other groups, neither could ever complete. An `aft:` job counts until it is
+released, kicked, reserved or deleted, and one with a delay counts from its
+put. Retrying won't help: change which groups wait on which.
+
 A put answered **`INTERNAL_ERROR`** (tuber run with `-b`, when its write-ahead
 log fails) was not queued, but its record may already be on disk, so a tuber
 restart can bring the job back. Retry such a put with an `idp:` key, so the

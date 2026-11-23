@@ -71,7 +71,7 @@ put 100 0 60 14 aft:batch-a grp:batch-b\r\n
 - Buried jobs block group completion (buried = something went wrong, don't run cleanup)
 - Adding more jobs to a group after an `after` job is allowed — counter just increments
 - **Chaining:** combine `aft:` and `grp:` on the same job to build DAG-style orchestration with no extra mechanism
-- **Cycles** are the client's problem — server just holds waiting jobs indefinitely (same as infinite delay). No deadlock risk for the server
+- **Cycles** are refused: the put that would close one gets `BAD_FORMAT CYCLE` (see `docs/protocol.md`). The check searches the waits between groups from both ends and stops at the cheaper side, so building a long chain or a wide fan-in stays cheap
 
 ### `con:` — Concurrency Keys
 

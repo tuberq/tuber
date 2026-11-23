@@ -2803,6 +2803,30 @@ async fn test_restart_does_not_hold_a_released_after_job_again() {
 }
 
 #[tokio::test]
+async fn test_restart_keeps_the_group_waits_a_cycle_is_checked_against() {
+    // Job 1 waits on y, and job 2 on z. A restart must still know both, or
+    // it accepts the puts that would close a cycle through them.
+    let dir = tempfile::tempdir().unwrap();
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 3600 60 1 grp:x aft:y\r\na\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("put 0 0 60 1 grp:z\r\ns\r\n").await;
+        c.ckresp("INSERTED 2\r\n").await;
+        c.mustsend("put 0 0 60 1 grp:y aft:z\r\nb\r\n").await;
+        c.ckresp("INSERTED 3\r\n").await;
+    })
+    .await;
+
+    with_wal_server(dir.path(), |mut c| async move {
+        c.mustsend("put 0 0 60 1 grp:y aft:x\r\nb\r\n").await;
+        c.ckresp("BAD_FORMAT CYCLE\r\n").await;
+        c.mustsend("put 0 0 60 1 grp:z aft:x\r\nb\r\n").await;
+        c.ckresp("BAD_FORMAT CYCLE\r\n").await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_restored_delayed_and_held_jobs_do_not_hold_their_con_key() {
     // Jobs 2 and 3 ask for one at a time, but job 2 isn't due for an hour
     // and job 3 waits on group g. After a restart, neither holds jobs 4 and
