@@ -60,6 +60,8 @@
 
 **`--metrics-listen` sets the address the metrics endpoint listens on.** It listened on the `-l` address, so with the default `-l 0.0.0.0`, or any public address, metrics were public too, with no way to keep them in. `--metrics-listen 127.0.0.1` (env `TUBER_METRICS_LISTEN`) now keeps them local while the queue port stays public. Unset, metrics follow `-l` as before.
 
+**The Docker image's health check follows `TUBER_PORT`.** It ran `tuber stats`, which connects to port 11300 whatever port the server listens on, so a container given another port with `TUBER_PORT` was reported `unhealthy` for as long as it ran. The check now connects to `127.0.0.1:$TUBER_PORT`. A port given with `-p` instead is still out of its sight, so set it with `TUBER_PORT`.
+
 **`pause-tube` needs a space after it, as other commands do.** It was matched by prefix, so `pause-tubefoo 60` paused the tube `foo`. That is now `UNKNOWN_COMMAND`; a bare `pause-tube` is still `BAD_FORMAT`.
 
 **`tuber put` defaults to a TTR of 120 seconds, not 60,** as tuber-gem and tuber-cli do, **and a priority of 65536, not 0,** as tuber-gem does, so a job put by hand queues alongside the gem's jobs rather than ahead of them.

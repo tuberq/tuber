@@ -99,7 +99,7 @@ Tuber has two independent budgets — RAM and disk — and both gate **only `put
 
 When persistence is on (`-b`), tuber binds the beanstalk TCP listener **only after WAL replay completes**. The port being reachable is the readiness signal — connect-refused during replay, accepting once ready. This makes false-healthy windows during a slow restart impossible, which matters when a 20 GB+ WAL can take minutes to replay.
 
-- **Docker:** the published image ships `HEALTHCHECK ["tuber", "stats"]`. The check fails (connection refused) during replay and passes once the listener is up. Docker reports `starting` → `unhealthy` → `healthy` across a slow restart.
+- **Docker:** the published image ships a `HEALTHCHECK` running `tuber stats` against `127.0.0.1:$TUBER_PORT` (default `11300`), so set a non-default port with `TUBER_PORT`, not `-p`. The check fails (connection refused) during replay and passes once the listener is up. Docker reports `starting` → `unhealthy` → `healthy` across a slow restart.
 - **External monitors (Uptime Kuma, etc.):** point them at the beanstalk port (default `11300`) with a TCP-connect probe, or run `tuber stats` via `docker exec`. Don't probe the metrics port (`9100`) with TCP-only — `/metrics` is served by the same process but exists for Prometheus scrapes, not readiness.
 - **What you'll see in the logs during replay:**
 
