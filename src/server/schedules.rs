@@ -342,10 +342,10 @@ impl ServerState {
     /// the clock stepped forward) is caught up with one fire, subject to the
     /// entry's `catchup:`. Called from the tick with the wall clock.
     pub(super) fn fire_due_schedules(&mut self, now: Timestamp) {
-        // Every put would be refused. Leave due ticks due, unstamped: they
-        // are missed, not fired, and `catchup:` decides their fate once the
-        // drain ends or the server restarts. Stamping them would hide them
-        // from both, and from the last-fire staleness alert.
+        // Every put of a new job would be refused. Leave due ticks due,
+        // unstamped: they are missed, not fired, and `catchup:` decides their
+        // fate once the drain ends or the server restarts. Stamping them
+        // would hide them from both, and from the last-fire staleness alert.
         if self.drain_mode || self.wal_failed {
             return;
         }

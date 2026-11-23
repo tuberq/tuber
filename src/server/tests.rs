@@ -2639,6 +2639,79 @@ fn test_memory_limit_put_with_idp_accounts_for_tombstone() {
     assert!(matches!(r2, Response::OutOfMemory), "got {r2:?}");
 }
 
+// A retried put whose idp: key names a job is answered with that job,
+// whatever would refuse a new one: the retry adds no job, and a refusal
+// tells the client it wasn't queued when it was.
+
+#[test]
+fn an_idp_retry_is_answered_at_the_memory_budget() {
+    // put_idp's job costs 1 + 512 and its tombstone 1 + 256: full after one.
+    let mut s = make_state_with_limit(Some(1 + 512 + 1 + 256));
+    let c = register(&mut s);
+    assert_eq!(put_idp(&mut s, c, "k", 3600), Response::Inserted(1));
+    assert_eq!(put_idp(&mut s, c, "other", 3600), Response::OutOfMemory);
+    assert_eq!(
+        put_idp(&mut s, c, "k", 3600),
+        Response::InsertedDup(1, "READY", None)
+    );
+}
+
+#[test]
+fn an_idp_retry_in_cooldown_is_answered_at_the_memory_budget() {
+    // The tombstone holds 257 bytes; a new job would need 770 more.
+    let mut s = make_state_with_limit(Some(1000));
+    let c = register(&mut s);
+    start_cooldown(&mut s, c, "default", "k", 3600);
+    assert_eq!(
+        put_idp(&mut s, c, "k", 3600),
+        Response::InsertedDup(1, "DELETED", None)
+    );
+}
+
+#[test]
+fn an_idp_retry_is_answered_at_the_storage_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
+    assert_eq!(put_idp(&mut s, c, "k", 3600), Response::Inserted(1));
+    s.max_storage_bytes = Some(1);
+    assert_eq!(put_idp(&mut s, c, "other", 3600), Response::OutOfStorage);
+    assert_eq!(
+        put_idp(&mut s, c, "k", 3600),
+        Response::InsertedDup(1, "READY", None)
+    );
+}
+
+#[test]
+fn an_idp_retry_is_answered_while_draining() {
+    let mut s = make_state();
+    let c = register(&mut s);
+    assert_eq!(put_idp(&mut s, c, "k", 3600), Response::Inserted(1));
+    s.drain_mode = true;
+    assert_eq!(put_idp(&mut s, c, "other", 3600), Response::Draining);
+    assert_eq!(
+        put_idp(&mut s, c, "k", 3600),
+        Response::InsertedDup(1, "READY", None)
+    );
+}
+
+#[test]
+fn an_idp_retry_is_answered_after_the_wal_fails() {
+    // A put answered INTERNAL_ERROR was taken back, and this one's job is
+    // still queued.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = reopen(dir.path());
+    let c = register(&mut s);
+    assert_eq!(put_idp(&mut s, c, "k", 3600), Response::Inserted(1));
+    s.wal.as_mut().unwrap().inject_io_failure();
+    assert!(!s.sync_wal());
+    assert_eq!(put_idp(&mut s, c, "other", 3600), Response::InternalError);
+    assert_eq!(
+        put_idp(&mut s, c, "k", 3600),
+        Response::InsertedDup(1, "READY", None)
+    );
+}
+
 #[test]
 fn test_memory_accounting_flush_tube_drains_tombstones() {
     let mut s = make_state();
@@ -3932,6 +4005,42 @@ fn schedule_fire_records_dedups_and_buried_streak() {
     assert_eq!(st.buried_streak, 2);
     assert_eq!(st.last_result.as_deref(), Some("INSERTED 1 BURIED"));
     assert_eq!(s.tubes["jobs"].stat.idp_dedups.buried, 2, "counted on the tube too");
+}
+
+#[test]
+fn a_full_memory_budget_does_not_hide_a_schedule_s_buried_job() {
+    // A fire matching the buried job queues nothing, so no room is needed
+    // for one. Refused anyway, it reset the streak that alerts on this.
+    let mut s = make_state();
+    let c = register(&mut s);
+    sync_schedules(&mut s, c, &[("rollup", "idp:rollup every 60s")]);
+    let t = next_fire(&s, "rollup");
+    s.fire_due_schedules(t);
+    s.handle_command(
+        c,
+        Command::Watch {
+            tube: "jobs".into(),
+            weight: 1,
+        },
+        None,
+    );
+    assert!(matches!(
+        s.handle_command(c, Command::Reserve, None),
+        Response::Reserved { id: 1, .. }
+    ));
+    assert_eq!(
+        s.handle_command(c, Command::Bury { id: 1, pri: 0 }, None),
+        Response::Buried
+    );
+
+    s.max_job_bytes = Some(s.memory_in_use());
+    s.fire_due_schedules(t + mins(1));
+    s.fire_due_schedules(t + mins(2));
+    let st = &s.schedules.get("app", "rollup").unwrap().stats;
+    assert_eq!(
+        (st.rejected, st.deduped.buried, st.buried_streak),
+        (0, 2, 2)
+    );
 }
 
 // --- Recurring schedules: persistence ---

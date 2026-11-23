@@ -1394,6 +1394,100 @@ impl ServerState {
         self.put_job(Some(conn_id), tube_name, pri, delay, ttr, body, ext)
     }
 
+    /// The answer to a put whose `idp:` key names a job in `tube_name`, live
+    /// or in cooldown: `INSERTED <id> <state>`, raising a live job's priority
+    /// to `pri` if that's more urgent. `None` if it names none.
+    fn idempotent_retry(&mut self, tube_name: &str, key: &str, pri: u32) -> Option<Response> {
+        // Idempotency dedup: if key already exists for a live job, return original ID + state.
+        // If the new put has a higher priority (lower number), upgrade the existing job's priority.
+        if let Some(&existing_id) = self
+            .tubes
+            .get(tube_name)
+            .and_then(|t| t.idempotency_keys.get(key))
+        {
+            let upgraded_pri = if let Some(existing_job) = self.jobs.get_mut(&existing_id)
+                && pri < existing_job.priority
+            {
+                let old_pri = existing_job.priority;
+                let state = existing_job.state;
+                // The record is stamped now, and replay counts its delay from
+                // the stamp, so journal what is left of a delay, as
+                // compaction does.
+                let delay = match existing_job.deadline_at {
+                    Some(deadline) if state == JobState::Delayed => {
+                        deadline.saturating_duration_since(Instant::now())
+                    }
+                    _ => existing_job.delay,
+                };
+                existing_job.priority = pri;
+
+                if let Some(tube) = self.tubes.get_mut(tube_name) {
+                    // If job is Ready, re-sort the ready heap
+                    if state == JobState::Ready {
+                        tube.ready.remove_by_id(existing_id);
+                        tube.ready.insert(existing_job);
+                        // Update urgent stats if crossing threshold. Only Ready
+                        // jobs are counted as urgent; bumping the counter for a
+                        // Reserved/Delayed/Buried job would drift it upward and
+                        // double-count once the job later becomes ready.
+                        if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
+                            self.stats.urgent_ct += 1;
+                            tube.stat.urgent_ct += 1;
+                        }
+                    }
+                }
+
+                self.wal_write_state_change(
+                    existing_id,
+                    Some(state),
+                    pri,
+                    delay,
+                    0,
+                    StateChangeReason::None,
+                );
+
+                Some(pri)
+            } else {
+                None
+            };
+
+            let state = self
+                .jobs
+                .get(&existing_id)
+                .expect("job must exist — just looked up by idempotency key")
+                .state;
+            if let Some(tube) = self.tubes.get_mut(tube_name) {
+                tube.stat.idp_dedups.count(Some(state));
+            }
+            return Some(Response::InsertedDup(
+                existing_id,
+                state.as_protocol_str(),
+                upgraded_pri,
+            ));
+        }
+
+        // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
+        let cooldown = self
+            .tubes
+            .get(tube_name)
+            .and_then(|t| t.idempotency_cooldowns.get(key).copied());
+        if let Some(Cooldown {
+            job_id: original_id,
+            expires_at: expiry,
+            ..
+        }) = cooldown
+        {
+            if SystemTime::now() < expiry {
+                if let Some(tube) = self.tubes.get_mut(tube_name) {
+                    tube.stat.idp_dedups.count(None);
+                }
+                return Some(Response::InsertedDup(original_id, "DELETED", None));
+            }
+            self.remove_tombstone(tube_name, key);
+        }
+        None
+    }
+
     /// Put a job into `tube_name`: a client's `put` into its `use` tube
     /// (`producer` is its connection), or a schedule entry firing (`None`).
     /// Both get the same checks, dedup and reply.
@@ -1408,6 +1502,17 @@ impl ServerState {
         body: Option<Vec<u8>>,
         ext: JobExt,
     ) -> Response {
+        // A retry is answered before anything that refuses a new job: it
+        // adds none, and a refusal would say its job wasn't queued.
+        if let Some(key) = ext.idempotency_key.as_ref().map(|(k, _)| k.as_str())
+            && let Some(dup) = self.idempotent_retry(&tube_name, key, pri)
+        {
+            if let Some(conn) = producer.and_then(|id| self.conns.get_mut(&id)) {
+                conn.set_producer();
+            }
+            return dup;
+        }
+
         if self.drain_mode {
             return Response::Draining;
         }
@@ -1466,94 +1571,6 @@ impl ServerState {
         let ttr = ttr.max(1);
 
         self.ensure_tube(&tube_name);
-
-        // Idempotency dedup: if key already exists for a live job, return original ID + state.
-        // If the new put has a higher priority (lower number), upgrade the existing job's priority.
-        if let Some(ref key_tuple) = ext.idempotency_key
-            && let Some(&existing_id) = self
-                .tubes
-                .get(&tube_name)
-                .and_then(|t| t.idempotency_keys.get(&key_tuple.0))
-        {
-            let upgraded_pri = if let Some(existing_job) = self.jobs.get_mut(&existing_id)
-                && pri < existing_job.priority
-            {
-                let old_pri = existing_job.priority;
-                let state = existing_job.state;
-                // The record is stamped now, and replay counts its delay from
-                // the stamp, so journal what is left of a delay, as
-                // compaction does.
-                let delay = match existing_job.deadline_at {
-                    Some(deadline) if state == JobState::Delayed => {
-                        deadline.saturating_duration_since(Instant::now())
-                    }
-                    _ => existing_job.delay,
-                };
-                existing_job.priority = pri;
-
-                if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                    // If job is Ready, re-sort the ready heap
-                    if state == JobState::Ready {
-                        tube.ready.remove_by_id(existing_id);
-                        tube.ready.insert(existing_job);
-                        // Update urgent stats if crossing threshold. Only Ready
-                        // jobs are counted as urgent; bumping the counter for a
-                        // Reserved/Delayed/Buried job would drift it upward and
-                        // double-count once the job later becomes ready.
-                        if pri < URGENT_THRESHOLD && old_pri >= URGENT_THRESHOLD {
-                            self.stats.urgent_ct += 1;
-                            tube.stat.urgent_ct += 1;
-                        }
-                    }
-                }
-
-                self.wal_write_state_change(
-                    existing_id,
-                    Some(state),
-                    pri,
-                    delay,
-                    0,
-                    StateChangeReason::None,
-                );
-
-                Some(pri)
-            } else {
-                None
-            };
-
-            let state = self
-                .jobs
-                .get(&existing_id)
-                .expect("job must exist — just looked up by idempotency key")
-                .state;
-            if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                tube.stat.idp_dedups.count(Some(state));
-            }
-            return Response::InsertedDup(existing_id, state.as_protocol_str(), upgraded_pri);
-        }
-
-        // Idempotency cooldown dedup: if key is in cooldown period, return original ID (job is deleted)
-        if let Some(ref key_tuple) = ext.idempotency_key {
-            let cooldown = self
-                .tubes
-                .get(&tube_name)
-                .and_then(|t| t.idempotency_cooldowns.get(key_tuple.0.as_str()).copied());
-            if let Some(Cooldown {
-                job_id: original_id,
-                expires_at: expiry,
-                ..
-            }) = cooldown
-            {
-                if SystemTime::now() < expiry {
-                    if let Some(tube) = self.tubes.get_mut(&*tube_name) {
-                        tube.stat.idp_dedups.count(None);
-                    }
-                    return Response::InsertedDup(original_id, "DELETED", None);
-                } else {
-                    self.remove_tombstone(&tube_name, &key_tuple.0);
-                }
-            }
-        }
 
         // WAL: check space reservation
         if let Some(wal) = &self.wal {
