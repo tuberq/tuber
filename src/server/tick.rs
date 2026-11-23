@@ -312,22 +312,9 @@ impl ServerState {
             }
         }
 
-        // After-group-held jobs (state Delayed, no deadline) live only in
-        // GroupState::waiting_jobs — their tube looks idle but must survive
-        // GC, or group completion would promote them into a deleted tube.
-        let held_tubes: std::collections::HashSet<&str> = self
-            .groups
-            .values()
-            .flat_map(|gs| gs.waiting_jobs.iter())
-            .filter_map(|id| self.jobs.get(id))
-            .filter(|j| j.state == JobState::Delayed && j.deadline_at.is_none())
-            .map(|j| j.tube_name.as_ref())
-            .collect();
-
         // New connections default to "use default" + "watch default", so always keep it
-        self.tubes.retain(|name, tube| {
-            name == "default" || !tube.is_idle() || held_tubes.contains(name.as_str())
-        });
+        self.tubes
+            .retain(|name, tube| name == "default" || !tube.is_idle());
 
         if now >= self.shrink_check_at {
             self.shrink_check_at = now + SHRINK_CHECK_INTERVAL;

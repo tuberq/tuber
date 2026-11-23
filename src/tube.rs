@@ -457,7 +457,9 @@ impl Tube {
     /// Reserved jobs live in `conn.reserved_jobs`, not in any tube
     /// structure, so `reserved_ct` is the only thing keeping a tube with
     /// in-flight jobs alive — without it, idle GC would delete the tube
-    /// and release/bury/TTR-expiry would re-enqueue into a void.
+    /// and release/bury/TTR-expiry would re-enqueue into a void. Held
+    /// `aft:` jobs are the same: they live on their group's waiting list,
+    /// and `held_ct` keeps the tube for group completion to promote into.
     ///
     /// An unexpired pause also holds the tube open. The pause lives
     /// nowhere but this struct, so reaping a drained-but-paused tube
@@ -475,6 +477,7 @@ impl Tube {
             && self.buried.is_empty()
             && self.waiters.is_empty()
             && self.stat.reserved_ct == 0
+            && self.stat.held_ct == 0
             && self.idempotency_keys.is_empty()
             && self.idempotency_cooldowns.is_empty()
             && self.using_ct == 0
