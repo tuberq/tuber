@@ -35,7 +35,7 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 | **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹; DB limits on PostgreSQL | DB limits | DB limits | Memory and disk alarms ¹² |
 | **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | Via OpenTelemetry ¹⁷ | Avg/min/max on the dashboard ⁸ | — | — |
 | **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | — | On the dashboard (v4.21+) ⁸ | Oldest only (v1.1+) ⁹ | — |
-| **Persistence** | WAL, ~100ms fsync | Optional binlog (`-b`), 50 ms fsync | Redis RDB/AOF | Redis RDB/AOF, or PostgreSQL | PostgreSQL | DB ⁶ | Durable queues |
+| **Persistence** | WAL; fsync every 100 ms, or before each reply | Optional binlog (`-b`), 50 ms fsync | Redis RDB/AOF | Redis RDB/AOF, or PostgreSQL | PostgreSQL | DB ⁶ | Durable queues |
 | **Infrastructure** | None (single binary) | None (single binary) | Redis 7+, Valkey or Dragonfly | Redis, Valkey or Dragonfly; PostgreSQL since v6 | PostgreSQL | DB ⁶ | Erlang runtime |
 | **High availability** | — (single node) | — (single node) | Via Redis Sentinel | Via Redis or PostgreSQL | Via PostgreSQL | Via the DB | Quorum queues (Raft) |
 | **Automatic retries** | Fixed delay, in the gem ¹⁴ | Client-side (Backburner) | Yes (25 over ~20 days) | Yes (opt-in `attempts`) | Via ActiveJob `retry_on` | Via ActiveJob `retry_on` | Delivery limit; delayed retry since 4.3 ¹⁵ |
@@ -494,7 +494,7 @@ tuber server [OPTIONS]
 | `-p`, `--port` | `TUBER_PORT` | `11300` | Listen port |
 | `-b`, `--binlog-dir` | `TUBER_BINLOG_DIR` | — | WAL + body-store directory (enables persistence) |
 | `-s`, `--max-storage-bytes` | `TUBER_MAX_STORAGE_BYTES` | — | Combined cap on WAL + body-store disk usage. **Mandatory** when `-b` is set. PUT returns `OUT_OF_STORAGE` when the projected footprint would exceed this; state changes (reserve/release/bury/kick/delete) always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `100g`). |
-| `-i`, `--sync-interval` | `TUBER_SYNC_INTERVAL` | `100ms` | How often the WAL and body store fsync to disk. Lower = less data loss on crash, more I/O. Accepts `ms`, `s`, `m`, `h`. |
+| `-i`, `--sync-interval` | `TUBER_SYNC_INTERVAL` | `100ms` | How often the WAL and body store fsync to disk. Lower = less data loss on crash, more I/O. `0` is strict mode: no reply goes out until what it reports is on disk. Accepts `ms`, `s`, `m`, `h`. See [Durability & fsync](#durability--fsync). |
 | `--wal-skip-corrupt` | `TUBER_WAL_SKIP_CORRUPT` | off | Start even when an older WAL or TOAST segment is damaged or a WAL segment can't be read, using what remains and keeping the segment as `<segment>.corrupt`. Once that copy is written the damage is cut away, so a later start doesn't need this again; if it can't be written (a full disk, say), the server still refuses, leaving the segment whole. Without this the server refuses to start, since replaying past a lost delete brings its job back. See [WAL format: corruption handling](docs/wal-format.md#corruption-handling). |
 | `--migrate-wal` | `TUBER_MIGRATE_WAL` | off | Opt in to upgrading a WAL written by an older tuber on startup. Without it the server refuses to start on one, since older versions can't read the files this one writes. Needed once: later starts find a current segment and don't ask again. |
 | `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `1m` | Max size of a single job body. **Bodies pass through RAM in full on both `put` and `reserve`** — see [Sizing `--max-job-size`](#sizing---max-job-size) before raising it. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
@@ -577,13 +577,18 @@ When persistence is enabled (`-b`), tuber writes job mutations to two append-onl
 - **WAL** — small metadata records (`FullJob`, `StateChange`) carrying a `BodyId` reference, not the body bytes themselves.
 - **Body store** — separate segment files holding the raw job payloads, addressed by `BodyId`.
 
-Both are fsynced every `--sync-interval` (default 100ms) as part of the server's internal tick — not on every write. The body store fsyncs *first*, then the WAL, so a crash mid-sync can leave orphan bodies (no WAL reference) but never dangling references; orphans are reclaimed automatically on the next replay.
+The body store always fsyncs *first*, then the WAL, so a crash mid-sync can leave orphan bodies (no WAL reference) but never dangling references; orphans are reclaimed automatically on the next replay. Large bodies don't slow down the WAL fsync: its records carry only a `BodyId`, so it flushes a constant ~100 bytes per record regardless of body size.
 
-- **At most one tick interval of data can be lost on a crash.** Jobs written since the last sync may not have made it to disk yet.
-- **fsync overhead is constant regardless of throughput.** Whether you're doing 10 jobs/sec or 100,000 jobs/sec, tuber calls fsync at the configured rate. On NVMe/SSD storage this adds negligible latency; on spinning disks it costs ~50–150ms/sec of I/O time.
-- **Large bodies don't slow down fsync.** Because the WAL records only carry a `BodyId`, the latency-critical WAL fsync flushes a constant ~100 bytes per record regardless of body size.
+`--sync-interval` decides whether a reply waits for the fsync:
 
-This is a different trade-off from databases like PostgreSQL or MySQL, which fsync on every transaction commit to guarantee durability of each acknowledged write (the "D" in ACID). Tuber's `INSERTED` response means the job is buffered but not necessarily fsynced — similar to PostgreSQL's `synchronous_commit = off` mode. For most queue workloads, losing a fraction of a second of jobs on a hard crash is acceptable, and the throughput benefit is significant.
+| `--sync-interval` | Replies are sent | A hard crash loses |
+|---|---|---|
+| `100ms` (default), or any value above `0` | at once; both stores fsync on that interval | up to one interval of acknowledged work |
+| `0` (strict) | after the fsync that covers what they report | nothing that was acknowledged |
+
+**Interval mode (the default).** Both stores are fsynced every `--sync-interval` as part of the server's internal tick, not on every write. `INSERTED` means the job is buffered but not necessarily on disk, as with PostgreSQL's `synchronous_commit = off`, and jobs written since the last sync can be lost on a hard crash. In exchange, fsync overhead is constant regardless of throughput: whether you're doing 10 jobs/sec or 100,000 jobs/sec, tuber calls fsync at the configured rate. On NVMe/SSD storage this adds negligible latency; on spinning disks it costs ~50–150ms/sec of I/O time. For most queue workloads, losing a fraction of a second of jobs on a hard crash is acceptable, and the throughput benefit is significant.
+
+**Strict mode (`--sync-interval 0`).** No reply goes out until what it reports is on disk: `INSERTED`, `DELETED`, `RELEASED` and the rest wait for the fsync that covers them, as with PostgreSQL's default `synchronous_commit = on`, and a worker is never handed a job whose put isn't on disk yet. Commands that arrive together from different connections share one fsync (group commit), so throughput grows with the number of connections sending at once. A single connection doesn't benefit: it handles one command at a time, so even pipelined puts wait for an fsync each. In strict mode, spread puts across connections rather than pipelining them down one. See [Durability and sync modes](docs/architecture.md#durability-and-sync-modes) for how the batching works.
 
 Without `-b`, all state is in-memory only and lost on restart.
 
