@@ -1,6 +1,6 @@
 [package]
 name = "tuber"
-version = "0.17.0-dev.2"
+version = "0.17.0-dev.3"
 edition = "2024"
 # ee/ is BUSL-1.1 (ee/LICENSE); everything else is MIT (LICENSE).
 license = "MIT AND BUSL-1.1"
