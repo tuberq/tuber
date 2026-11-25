@@ -259,6 +259,10 @@ pub struct Job {
     // Counters
     pub reserve_ct: u32,
     pub timeout_ct: u32,
+    /// Times the job was put back because the connection holding it closed.
+    /// In memory only: the WAL doesn't carry it, so it starts again at 0
+    /// after a restart.
+    pub disconnect_ct: u32,
     pub release_ct: u32,
     pub bury_ct: u32,
     pub kick_ct: u32,
@@ -305,6 +309,7 @@ impl Job {
             reserved_at: None,
             reserve_ct: 0,
             timeout_ct: 0,
+            disconnect_ct: 0,
             release_ct: 0,
             bury_ct: 0,
             kick_ct: 0,

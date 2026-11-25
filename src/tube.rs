@@ -26,6 +26,7 @@ pub struct TubeStats {
     // Throughput counters
     pub total_reserve_ct: u64,
     pub total_timeout_ct: u64,
+    pub total_disconnect_ct: u64,
     pub total_bury_ct: u64,
 
     // Processing time stats

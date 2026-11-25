@@ -341,6 +341,8 @@ struct GlobalStats {
     total_jobs_ct: u64,
     total_delete_ct: u64,
     timeout_ct: u64,
+    /// Jobs put back because the connection holding them closed.
+    disconnect_ct: u64,
     op_ct: [u64; 29],
     total_connections: u64,
     /// Number of times the tick-time drift detector observed a non-zero
@@ -1125,7 +1127,7 @@ impl ServerState {
                 }
             }
 
-            // Re-enqueue reserved jobs
+            // Re-enqueue reserved jobs, counting each as lost to a disconnect
             for job_id in conn.reserved_jobs {
                 self.release_concurrency_key(job_id);
                 let mut requeue = None;
@@ -1133,6 +1135,8 @@ impl ServerState {
                     Self::set_job_state(&mut self.concurrency_limits, job, JobState::Ready);
                     job.reserver_id = None;
                     job.deadline_at = None;
+                    job.disconnect_ct = job.disconnect_ct.saturating_add(1);
+                    self.stats.disconnect_ct += 1;
                     requeue = Some((job.tube_name.clone(), job.ready_key()));
                 }
                 if let Some((tube_name, key)) = requeue {
@@ -1141,6 +1145,7 @@ impl ServerState {
                         if let Some(job) = self.jobs.get(&job_id) {
                             tube.ready.insert(job);
                         }
+                        tube.stat.total_disconnect_ct += 1;
                         self.ready_ct += 1;
                         self.stats.reserved_ct = self.stats.reserved_ct.saturating_sub(1);
                         tube.stat.reserved_ct = tube.stat.reserved_ct.saturating_sub(1);
@@ -3307,6 +3312,7 @@ impl ServerState {
              file: {}\n\
              reserves: {}\n\
              timeouts: {}\n\
+             disconnects: {}\n\
              releases: {}\n\
              buries: {}\n\
              kicks: {}\n\
@@ -3328,6 +3334,7 @@ impl ServerState {
             job.wal_seq().unwrap_or(0),
             job.reserve_ct,
             job.timeout_ct,
+            job.disconnect_ct,
             job.release_ct,
             job.bury_ct,
             job.kick_ct,
@@ -3416,6 +3423,7 @@ impl ServerState {
              pause-time-left: {}\n\
              total-reserves: {}\n\
              total-timeouts: {}\n\
+             total-disconnects: {}\n\
              total-buries: {}\n\
              bury-rate: {:.6}\n\
              processing-time-ewma: {:.6}\n\
@@ -3460,6 +3468,7 @@ impl ServerState {
             pause_time_left,
             tube.stat.total_reserve_ct,
             tube.stat.total_timeout_ct,
+            tube.stat.total_disconnect_ct,
             tube.stat.total_bury_ct,
             bury_rate,
             tube.stat.processing_time_ewma,
@@ -3635,6 +3644,7 @@ impl ServerState {
              cmd-pause-tube: {}\n\
              cmd-reserve-mode: {}\n\
              job-timeouts: {}\n\
+             job-disconnects: {}\n\
              total-jobs: {}\n\
              max-job-size: {}\n\
              current-jobs-size: {}\n\
@@ -3725,6 +3735,7 @@ impl ServerState {
             self.stats.op_ct[OP_PAUSE_TUBE],
             self.stats.op_ct[OP_RESERVE_MODE],
             self.stats.timeout_ct,
+            self.stats.disconnect_ct,
             self.stats.total_jobs_ct,
             self.max_job_size,
             self.total_job_bytes,

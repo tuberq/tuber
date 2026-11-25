@@ -55,6 +55,7 @@ touches `cmd-touch`.
 | `uptime` | Seconds since server start |
 | `max-job-size` | Maximum job body size in bytes |
 | `job-timeouts` | Cumulative TTR expirations |
+| `job-disconnects` | Cumulative jobs put back because the connection holding them closed (including `quit`) |
 | `current-concurrency-keys` | Active concurrency keys |
 | `current-schedules` | Recurring schedule entries held, across all owners |
 | `current-schedules-size` | Memory those entries are charged against `--max-jobs-size`, beside `current-jobs-size` |
@@ -108,6 +109,7 @@ Returns per-tube statistics in YAML format.
 |---|---|
 | `total-reserves` | Cumulative reserve operations |
 | `total-timeouts` | Cumulative TTR timeouts |
+| `total-disconnects` | Cumulative jobs put back because the connection holding them closed |
 | `total-buries` | Cumulative bury operations |
 | `bury-rate` | Fraction of reserves that ended in a bury (`total-buries / total-reserves`, 0 if no reserves) |
 
@@ -193,6 +195,7 @@ Returns per-job statistics in YAML format.
 | `time-reserved` | Seconds this job has been reserved (0 if not reserved) |
 | `reserves` | Times this job has been reserved |
 | `timeouts` | Times this job has timed out (TTR expired) |
+| `disconnects` | Times this job was put back because the connection holding it closed (including `quit`). Not persisted: it starts again at 0 after a restart, where `timeouts` doesn't |
 | `releases` | Times this job has been released |
 | `buries` | Times this job has been buried |
 | `kicks` | Times this job has been kicked |
@@ -281,6 +284,7 @@ the queue port is public.
 |---|---|
 | `tuber_jobs_total` | Total jobs created |
 | `tuber_job_timeouts_total` | Total TTR timeouts |
+| `tuber_job_disconnects_total` | Total jobs put back because the connection holding them closed |
 | `tuber_connections_total` | Total connections |
 | `tuber_cmd_total{cmd="<name>"}` | Per-command counters |
 

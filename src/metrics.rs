@@ -423,6 +423,13 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     );
     prom_counter(
         &mut out,
+        "tuber_job_disconnects_total",
+        "Total jobs put back because the connection holding them closed",
+        &stats,
+        "job-disconnects",
+    );
+    prom_counter(
+        &mut out,
         "tuber_connections_total",
         "Total connections",
         &stats,

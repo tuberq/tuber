@@ -1463,6 +1463,7 @@ async fn test_stats_format_complete() {
         "cmd-list-tubes-watched:",
         "cmd-pause-tube:",
         "job-timeouts:",
+        "job-disconnects:",
         "total-jobs:",
         "max-job-size:",
         "current-tubes:",
@@ -5994,6 +5995,124 @@ async fn test_close_releases_tube_reserved_counter() {
         body.contains("current-jobs-reserved: 0"),
         "should have 0 reserved after disconnect, got: {}",
         body
+    );
+}
+
+/// One field of a YAML stats body, or None if it has no such field.
+fn stat_field(body: &str, key: &str) -> Option<String> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+        .map(str::to_string)
+}
+
+/// Poll `stats-job` until the job is in `state`. A disconnect is handled
+/// asynchronously, so the job comes back a moment after the client goes.
+async fn until_job_state(c: &mut TestConn, id: u64, state: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let now = job_state(c, id).await;
+        if now == state {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job {id} still {now}, not {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A job lost because its worker's connection closed is counted as a TTR
+/// expiry is: per job, per tube, server-wide, and in /metrics. A `quit`
+/// counts the same; a job the worker released before it went doesn't.
+#[tokio::test]
+async fn test_disconnect_counted_like_a_timeout() {
+    let srv = TestServer::start().await;
+    let mut prod = srv.connect().await;
+    prod.mustsend("use lost\r\n").await;
+    prod.ckresp("USING lost\r\n").await;
+    let held = prod.put_job(0, 0, 100, "a").await;
+    let released = prod.put_job(0, 0, 100, "b").await;
+
+    // A worker takes both, gives one back, and its connection drops.
+    let mut w1 = srv.connect().await;
+    w1.mustsend(&format!("reserve-job {held}\r\n")).await;
+    w1.ckresp(&format!("RESERVED {held} 1\r\n")).await;
+    w1.ckresp("a\r\n").await;
+    w1.mustsend(&format!("reserve-job {released}\r\n")).await;
+    w1.ckresp(&format!("RESERVED {released} 1\r\n")).await;
+    w1.ckresp("b\r\n").await;
+    w1.mustsend(&format!("release {released} 0 0\r\n")).await;
+    w1.ckresp("RELEASED\r\n").await;
+    drop(w1);
+    until_job_state(&mut prod, held, "ready").await;
+
+    // Another worker takes it again and quits.
+    let mut w2 = srv.connect().await;
+    w2.mustsend(&format!("reserve-job {held}\r\n")).await;
+    w2.ckresp(&format!("RESERVED {held} 1\r\n")).await;
+    w2.ckresp("a\r\n").await;
+    w2.mustsend("quit\r\n").await;
+    until_job_state(&mut prod, held, "ready").await;
+
+    prod.mustsend(&format!("stats-job {held}\r\n")).await;
+    let body = prod.read_ok_body().await;
+    assert_eq!(
+        stat_field(&body, "disconnects").as_deref(),
+        Some("2"),
+        "{body}"
+    );
+    assert_eq!(
+        stat_field(&body, "timeouts").as_deref(),
+        Some("0"),
+        "{body}"
+    );
+
+    prod.mustsend(&format!("stats-job {released}\r\n")).await;
+    let body = prod.read_ok_body().await;
+    assert_eq!(
+        stat_field(&body, "disconnects").as_deref(),
+        Some("0"),
+        "{body}"
+    );
+
+    prod.mustsend("stats-tube lost\r\n").await;
+    let body = prod.read_ok_body().await;
+    assert_eq!(
+        stat_field(&body, "total-disconnects").as_deref(),
+        Some("2"),
+        "{body}"
+    );
+    assert_eq!(
+        stat_field(&body, "total-timeouts").as_deref(),
+        Some("0"),
+        "{body}"
+    );
+
+    prod.mustsend("stats\r\n").await;
+    let body = prod.read_ok_body().await;
+    assert_eq!(
+        stat_field(&body, "job-disconnects").as_deref(),
+        Some("2"),
+        "{body}"
+    );
+
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mport = ml.local_addr().unwrap().port();
+    let baddr = format!("127.0.0.1:{}", srv.port);
+    tokio::spawn(async move {
+        tuber::metrics::serve_with_listener(ml, baddr).await.ok();
+    });
+    let mut s = TcpStream::connect(("127.0.0.1", mport)).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    let resp = String::from_utf8(resp).unwrap();
+    assert!(
+        resp.lines().any(|l| l == "tuber_job_disconnects_total 2"),
+        "{resp}"
     );
 }
 
